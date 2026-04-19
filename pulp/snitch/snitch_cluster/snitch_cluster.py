@@ -30,6 +30,8 @@ import gvsoc.runner
 import math
 from pulp.snitch.sequencer import Sequencer
 from pulp.snitch.hierarchical_cache import Hierarchical_cache
+from cache.insitu.insitu_cache_tile import InsituCacheTile
+from cache.insitu.insitu_cache_config import make_cachepool_512_config
 
 if os.environ.get('USE_GVRUN') is not None:
     from gvrun.attribute import Tree, Area, Value
@@ -46,7 +48,8 @@ if os.environ.get('USE_GVRUN') is None:
 
 
     class ClusterArch:
-        def __init__(self, properties, base, first_hartid, auto_fetch=False, boot_addr=0x0000_1000):
+        def __init__(self, properties, base, first_hartid, auto_fetch=False,
+                     boot_addr=0x0000_1000, use_insitu_cache=False, insitu_cache_cfg=None):
             self.nb_core = properties.nb_core_per_cluster
             self.base = base
             self.first_hartid = first_hartid
@@ -65,6 +68,12 @@ if os.environ.get('USE_GVRUN') is None:
             self.use_spatz = properties.use_spatz
             self.spatz_nb_lanes = properties.spatz_nb_lanes
             self.isa = properties.isa
+
+            # Optional InSitu cache between cores and TCDM (see
+            # prompt/insitu_cache_gvsoc_plan.md §5). If left False, the cluster uses the
+            # direct core↔TCDM path exactly as before.
+            self.use_insitu_cache = use_insitu_cache
+            self.insitu_cache_cfg = insitu_cache_cfg  # InsituCacheTileConfig or None
 
         class Tcdm:
             def __init__(self, base, nb_masters):
@@ -269,16 +278,41 @@ class SnitchCluster(gvsoc.systree.Component):
         for core_id in range(0, arch.nb_core):
             cores[core_id].o_BARRIER_REQ(cluster_registers.i_BARRIER_ACK(core_id))
 
+        # Optional InSitu L1 data cache between cores and TCDM. When disabled (default)
+        # this falls through to the legacy direct core↔TCDM path — no behavior change.
+        # See prompt/insitu_cache_gvsoc_plan.md §5.
+        insitu_cache = None
+        if arch.use_insitu_cache:
+            cache_cfg = arch.insitu_cache_cfg
+            if cache_cfg is None:
+                cache_cfg = make_cachepool_512_config()
+            # Sync topology fields to this cluster's actual layout.
+            cache_cfg.num_cores = arch.nb_core
+            cache_cfg.tcdm_ports_per_core = 1 + (arch.spatz_nb_lanes if arch.use_spatz else 0)
+            cache_cfg.interco.num_inputs = cache_cfg.num_tcdm_ports
+            cache_cfg.interco.num_outputs = cache_cfg.num_controllers
+            insitu_cache = InsituCacheTile(self, 'insitu_cache', config=cache_cfg)
+
         tcdm_port = 0
         for core_id in range(0, arch.nb_core):
             cores[core_id].o_DATA(cores_ico[core_id].i_INPUT())
-            cores_ico[core_id].o_MAP(tcdm.i_INPUT(tcdm_port), base=arch.tcdm.area.base,
-                size=arch.tcdm.area.size, rm_base=True)
+            if arch.use_insitu_cache:
+                # Cached TCDM access goes through the cache. We keep absolute addresses
+                # (rm_base=False) so the cache's refill/evict requests land in the correct
+                # range on the wide_axi fan-out (see binding below).
+                cores_ico[core_id].o_MAP(insitu_cache.i_INPUT(tcdm_port),
+                    base=arch.tcdm.area.base, size=arch.tcdm.area.size, rm_base=False)
+            else:
+                cores_ico[core_id].o_MAP(tcdm.i_INPUT(tcdm_port),
+                    base=arch.tcdm.area.base, size=arch.tcdm.area.size, rm_base=True)
             tcdm_port += 1
 
             if arch.use_spatz:
                 for port in range(0, arch.spatz_nb_lanes):
-                    cores[core_id].o_VLSU(port, tcdm.i_INPUT(tcdm_port))
+                    if arch.use_insitu_cache:
+                        cores[core_id].o_VLSU(port, insitu_cache.i_INPUT(tcdm_port))
+                    else:
+                        cores[core_id].o_VLSU(port, tcdm.i_INPUT(tcdm_port))
                     tcdm_port += 1
 
             cores_ico[core_id].o_MAP(narrow_axi.i_INPUT())
@@ -287,6 +321,13 @@ class SnitchCluster(gvsoc.systree.Component):
             # Icache
             cores[core_id].o_FLUSH_CACHE(icache.i_FLUSH())
             icache.o_FLUSH_ACK(cores[core_id].i_FLUSH_CACHE_ACK())
+
+        # Cache's L2 output → wide_axi. Existing wide_axi mapping already routes
+        # TCDM-range addresses to tcdm.i_DMA_INPUT, so misses land in the SPM as expected.
+        # Refills/evictions for out-of-TCDM addresses (future DDR workloads) follow the
+        # wide_axi map the user sets up at the SoC level.
+        if arch.use_insitu_cache:
+            insitu_cache.o_L2(wide_axi.i_INPUT())
 
 
         for core_id in range(0, arch.nb_core):

@@ -46,6 +46,10 @@ if os.environ.get('USE_GVRUN') is None:
             self.use_spatz               = spatz
             self.spatz_nb_lanes          = 4
             self.isa                     = 'rv32imfdcav' if spatz else 'rv32imfdca'
+            # InSitu L1 data cache between cores and TCDM (see
+            # prompt/insitu_cache_gvsoc_plan.md). Disabled by default — no perf impact on
+            # legacy runs.
+            self.use_insitu_cache        = False
 
 
         def declare_target_properties(self, target):
@@ -73,6 +77,11 @@ if os.environ.get('USE_GVRUN') is None:
 
             self.core_type = target.declare_user_property(
                 name='core_type', value=self.core_type, allowed_values=['accurate', 'fast'], description='Type of the snitch model'
+            )
+
+            self.use_insitu_cache = target.declare_user_property(
+                name='use_insitu_cache', value=self.use_insitu_cache, cast=bool,
+                description='Insert an InSitu L1 data cache between cores and the cluster TCDM'
             )
 
 
@@ -121,7 +130,8 @@ if os.environ.get('USE_GVRUN') is None:
                     self.clusters = []
                     for id in range(0, self.nb_cluster):
                         cluster_arch = ClusterArch(properties, self.get_cluster_base(id),
-                            current_hartid)
+                            current_hartid,
+                            use_insitu_cache=getattr(properties, 'use_insitu_cache', False))
                         self.clusters.append(cluster_arch)
                         current_hartid += self.clusters[id].nb_core
 
