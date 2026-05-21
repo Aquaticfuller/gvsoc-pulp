@@ -120,6 +120,21 @@ vp::IoReqStatus ClusterRegisters::core_req(vp::Block *__this, vp::IoReq *req, in
 
     _this->trace.msg("Received IO req (offset: 0x%llx, size: 0x%llx, is_write: %d)\n", offset, size, is_write);
 
+    // CachePool / Spatz cluster peripheral: CLUSTER_EOC_EXIT register (0x68).
+    // Software (snRuntime's `set_eoc()` in _snrt_exit) writes 1 here to signal
+    // end-of-computation. The RTL testbench drives $finish off this. Mirror it
+    // here so GVSoC runs of CachePool binaries can terminate cleanly.
+    if (is_write && offset == 0x68 && size >= 1 && data != nullptr && (data[0] & 0x1))
+    {
+        _this->trace.msg(vp::Trace::LEVEL_INFO,
+            "CLUSTER_EOC_EXIT write from core %d -> quitting simulation\n", id);
+        fprintf(stderr, "[EOC] Simulation exiting: cycles=%ld\n",
+                (long)_this->clock.get_cycles());
+        _this->time.get_engine()->quit(0);
+        req->inc_latency(1);
+        return vp::IO_REQ_OK;
+    }
+
     _this->regmap.access(offset, size, data, is_write);
 
     // Barrier insert 10 cycle stall even for last one to wake-up, seem the request go through AXI
@@ -148,6 +163,18 @@ vp::IoReqStatus ClusterRegisters::req(vp::Block *__this, vp::IoReq *req)
     _this->core_access = -1;
 
     _this->trace.msg("Received IO req (offset: 0x%llx, size: 0x%llx, is_write: %d)\n", offset, size, is_write);
+
+    // CLUSTER_EOC_EXIT (0x68): also handle when reached via the narrow AXI path
+    // (e.g. debug or remote writes). See comment in core_req() for rationale.
+    if (is_write && offset == 0x68 && size >= 1 && data != nullptr && (data[0] & 0x1))
+    {
+        _this->trace.msg(vp::Trace::LEVEL_INFO,
+            "CLUSTER_EOC_EXIT write -> quitting simulation\n");
+        fprintf(stderr, "[EOC] Simulation exiting: cycles=%ld\n",
+                (long)_this->clock.get_cycles());
+        _this->time.get_engine()->quit(0);
+        return vp::IO_REQ_OK;
+    }
 
     _this->regmap.access(offset, size, data, is_write);
 
