@@ -26,10 +26,13 @@ import interco.router as router
 import gvsoc.systree as st
 from pulp.mempool.l1_interconnect.l1_address_scrambler import L1AddressScrambler
 from pulp.teranoc.l1_interconnect.l1_noc_itf import L1_NocItf
+from pulp.light_redmule.light_redmule import LightRedmule
+from pulp.light_redmule.hwpe_interleaver import HWPEInterleaver
+from utils.common_cells import Or
 
 class TeranocTile(st.Component):
 
-    def __init__(self, parent, name, parser, arch, tile_id: int=0, group_id_x: int=0, group_id_y: int=0):
+    def __init__(self, parent, name, parser, arch, tile_id: int=0, group_id_x: int=0, group_id_y: int=0, has_redmule: bool=False):
         super().__init__(parent, name)
 
         [args, __] = parser.parse_known_args()
@@ -45,17 +48,45 @@ class TeranocTile(st.Component):
         ##########              Design Components             ##########
         ################################################################
 
-        # Snitch TCDM (L1 subsystem). Local ports take all in-tile masters
-        # (today only Snitch). Remote ports are wired below: port 0 is the
-        # intra-group neighbor; ports 1..N go to the NoC.
+        # Snitch TCDM (L1 subsystem). Local ports cover Snitch cores plus,
+        # when present, the HWPE sub-ports. Remote: port 0 = intra-group
+        # neighbor, 1..N = NoC.
         l1 = l1_subsystem.L1_subsystem(self, 'l1',
             tile_id=tile_id, group_id=group_id,
             nb_tiles_per_group=arch.nb_tiles_per_group, nb_groups=arch.nb_groups,
-            nb_local_ports=arch.nb_local_ports,
+            nb_local_ports=arch.nb_local_ports_for(has_redmule),
             nb_remote_ports=arch.nb_remote_ports,
-            size=arch.l1_per_tile_bytes, bandwidth=arch.l1_bank_width,
+            size=arch.l1_per_tile_bytes, bandwidth=4,
             nb_banks_per_tile=arch.nb_banks_per_tile,
             axi_data_width=arch.axi_data_width)
+
+        # Optional in-tile RedMule + HWPE interleaver.
+        if has_redmule:
+            redmule = LightRedmule(self, f'tile-{tile_id}-redmule',
+                tcdm_bank_width  = arch.l1_bank_width,
+                tcdm_bank_number = arch.redmule_bank_number,
+                elem_size        = arch.redmule.elem_size,
+                ce_height        = arch.redmule.ce_height,
+                ce_width         = arch.redmule.ce_width,
+                ce_pipe          = arch.redmule.ce_pipe,
+                queue_depth      = arch.redmule.queue_depth,
+            )
+            # Fans the wide TCDM request into l1_bank_width-byte sub-requests.
+            # offset_translation=False keeps the full system address so the
+            # L1's local_interleaver can route each to the right global bank.
+            hwpe_interleaver = HWPEInterleaver(self, f'tile-{tile_id}-hwpe_interleaver',
+                nb_master_ports=1, nb_banks=arch.redmule_bank_number,
+                bank_width=arch.l1_bank_width,
+                offset_translation=False)
+
+            # Per-sub-port address scramblers (as for the Snitch ports).
+            hwpe_addr_scrambler_list = []
+            for i in range(0, arch.redmule_bank_number):
+                hwpe_addr_scrambler_list.append(L1AddressScrambler(self,
+                    f'hwpe_addr_scrambler{i}',
+                    bypass=False, num_tiles=arch.nb_tiles_total,
+                    seq_mem_size_per_tile=512*arch.nb_snitch_per_tile, byte_offset=2,
+                    num_banks_per_tile=arch.nb_banks_per_tile))
 
         # L1 NoC Interface
         l1_noc_itf = L1_NocItf(self, 'l1_noc_itf', nb_req_ports=arch.nb_remote_ports_per_tile, nb_resp_ports=arch.nb_remote_ports_per_tile, \
@@ -110,6 +141,19 @@ class TeranocTile(st.Component):
             ico_list[i].add_mapping('l1', base=0x00000000, remove_offset=0x00000000, size=arch.l1_total_bytes)
             self.bind(ico_list[i], 'l1', l1, f'local_in_{i}')
 
+        # Optional in-tile RedMule wiring.
+        if has_redmule:
+            # core 0 → redmule MMIO config interface at 0x40020000+0x200.
+            ico_list[0].add_mapping('redmule_config', base=0x40020000, remove_offset=0x40020000, size=0x200)
+            self.bind(ico_list[0], 'redmule_config', redmule, 'input')
+
+            # redmule TCDM → interleaver → scrambler → L1 local port
+            # (mirrors the Snitch data → scrambler → ico → L1 path).
+            self.bind(redmule, 'tcdm', hwpe_interleaver, 'input')
+            for i in range(0, arch.redmule_bank_number):
+                self.bind(hwpe_interleaver, f'out_{i}', hwpe_addr_scrambler_list[i], 'input')
+                self.bind(hwpe_addr_scrambler_list[i], 'output', l1, f'local_in_{arch.nb_snitch_per_tile + i}')
+
         # Remote ports: index 0 is the intra-group neighbor; 1..N are the NoC.
         self.bind(self, 'loc_remt_slave_in', l1, 'remote_in_0')
         self.bind(l1, 'remote_out_0', self, 'loc_remt_master_out')
@@ -147,9 +191,18 @@ class TeranocTile(st.Component):
         # AXI -> Remote AXI port
         self.bind(axi_ico, 'output', self, 'axi_out')
 
-        # Sync barrier
-        for core_id in range(0, arch.nb_snitch_per_tile):
-            self.bind(self, f'barrier_ack_{core_id}', self.int_cores[core_id], 'barrier_ack')
+        # Sync barrier — when RedMule is present, core 0's barrier_ack is the
+        # OR of the tile barrier_ack_0 and redmule's done_irq.
+        if has_redmule:
+            for core_id in range(1, arch.nb_snitch_per_tile):
+                self.bind(self, f'barrier_ack_{core_id}', self.int_cores[core_id], 'barrier_ack')
+            redmule_irq = Or(self, f'tile-{tile_id}-redmule_irq', nb_input=2)
+            self.bind(self, 'barrier_ack_0', redmule_irq, 'input_0')
+            self.bind(redmule, 'done_irq',   redmule_irq, 'input_1')
+            self.bind(redmule_irq, 'output', self.int_cores[0], 'barrier_ack')
+        else:
+            for core_id in range(0, arch.nb_snitch_per_tile):
+                self.bind(self, f'barrier_ack_{core_id}', self.int_cores[core_id], 'barrier_ack')
 
         # Core Interconnections
         for core_id in range(0, arch.nb_snitch_per_tile):

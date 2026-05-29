@@ -42,11 +42,12 @@ class TeranocGroup(st.Component):
         self.tile_list = []
         for i in range(0, arch.nb_tiles_per_group):
             self.tile_list.append(TeranocTile(self, f'tile_{i}', parser=parser, arch=arch,
-                tile_id=i, group_id_x=group_id_x, group_id_y=group_id_y))
+                tile_id=i, group_id_x=group_id_x, group_id_y=group_id_y,
+                has_redmule=(i < arch.nb_redmule_tiles_per_group)))
 
         #Group local interconnect
         group_local_interleaver = Interleaver(self, 'group_local_interleaver', nb_slaves=arch.nb_tiles_per_group, nb_masters=arch.nb_tiles_per_group,
-            interleaving_bits=int(math.log2(arch.l1_bank_width*arch.nb_banks_per_tile)), offset_translation=False)
+            interleaving_bits=int(math.log2(4*arch.nb_banks_per_tile)), offset_translation=False)
 
         # L1 NoC Request Router
         l1_noc_req_routers = []
@@ -66,7 +67,7 @@ class TeranocGroup(st.Component):
 
         # DMA network(virtual, to emulate multiple backends)
         # DMA TCDM Interleaver
-        dma_tcdm_interleaver = Interleaver(self, 'dma_tcdm_interleaver', nb_slaves=arch.nb_tiles_per_group, nb_masters=1, interleaving_bits=int(math.log2(arch.nb_banks_per_tile*arch.l1_bank_width)), offset_translation=False)
+        dma_tcdm_interleaver = Interleaver(self, 'dma_tcdm_interleaver', nb_slaves=arch.nb_tiles_per_group, nb_masters=1, interleaving_bits=int(math.log2(arch.nb_banks_per_tile*4)), offset_translation=False)
 
         # Group-level AXI Interconnect
         # L2 cache rules

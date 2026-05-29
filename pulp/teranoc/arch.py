@@ -29,6 +29,22 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
+class RedmuleConfig:
+    # Systolic-array geometry (light_redmule swaps ce_height/ce_width internally).
+    ce_height:   int
+    ce_width:    int
+    ce_pipe:     int
+    elem_size:   int   # bytes per element (2 = FP16, 1 = INT8/FP8)
+    queue_depth: int   # max outstanding TCDM bursts
+
+    @property
+    def req_width(self) -> int:
+        # Wide TCDM request width in bytes; systolic depth is ce_pipe+1
+        # (matches light_redmule.cpp's LOCAL_BUFFER_W).
+        return self.ce_height * (self.ce_pipe + 1) * self.elem_size
+
+
+@dataclass(frozen=True)
 class TeranocConfig:
     # Primitives (every profile must specify all of these).
     nb_snitch_per_tile:       int
@@ -37,7 +53,7 @@ class TeranocConfig:
     nb_y_groups:              int
     bank_factor:              int
     l1_bank_bytes:            int
-    l1_bank_width:            int   # bytes per L1 bank access (drives all L1-path bandwidths)
+    l1_bank_width:            int   # bytes per L1 bank access (also the HWPE sub-port width)
     nb_remote_ports_per_tile: int
     axi_data_width:           int
     nb_axi_masters_per_group: int
@@ -47,6 +63,10 @@ class TeranocConfig:
     # ports within a batch are shuffled.
     l1_noc_remap_batch_size:  int
     l1_noc_remap_shuffle:     bool
+    # Optional in-tile HWPE; None = no RedMule. The first
+    # nb_redmule_tiles_per_group tiles per group get one.
+    redmule:                  'RedmuleConfig | None'
+    nb_redmule_tiles_per_group: int
 
     # ----- Derived -----
     @property
@@ -72,10 +92,24 @@ class TeranocConfig:
     def nb_axi_masters(self):
         return self.nb_axi_masters_per_group * self.nb_groups
     @property
-    def nb_local_ports(self):
-        # Local-side L1 ports per tile. Today this is just the Snitch cores;
-        # heterogeneous masters (HWPE sub-ports) will be added here later.
-        return self.nb_snitch_per_tile
+    def has_redmule(self):
+        return self.redmule is not None and self.nb_redmule_tiles_per_group > 0
+    @property
+    def redmule_bank_number(self):
+        # HWPE sub-ports the wide request fans into; also the fake bank count
+        # passed to light_redmule (unrelated to nb_banks_per_tile).
+        if self.redmule is None:
+            return 0
+        assert self.redmule.req_width % self.l1_bank_width == 0, \
+            "redmule.req_width must be a multiple of l1_bank_width"
+        return self.redmule.req_width // self.l1_bank_width
+    @property
+    def redmule_interface_bytes(self):
+        # Bytes redmule moves per cycle on its memory port.
+        return 0 if self.redmule is None else self.redmule.req_width
+    def nb_local_ports_for(self, has_redmule: bool) -> int:
+        # Snitch cores plus, with RedMule, the HWPE sub-ports.
+        return self.nb_snitch_per_tile + (self.redmule_bank_number if has_redmule else 0)
     @property
     def nb_remote_ports(self):
         # 1 intra-group neighbor port + N inter-group NoC ports.
@@ -97,6 +131,8 @@ TERANOC = TeranocConfig(
     nb_l2_banks              = 16,
     l1_noc_remap_batch_size  = 4,
     l1_noc_remap_shuffle     = True,
+    redmule                  = None,
+    nb_redmule_tiles_per_group = 0,
 )
 
 MEMPOOL_NOC = TeranocConfig(
@@ -114,6 +150,8 @@ MEMPOOL_NOC = TeranocConfig(
     nb_l2_banks              = 4,
     l1_noc_remap_batch_size  = 4,
     l1_noc_remap_shuffle     = True,
+    redmule                  = None,
+    nb_redmule_tiles_per_group = 0,
 )
 
 MINPOOL_NOC = TeranocConfig(
@@ -131,13 +169,67 @@ MINPOOL_NOC = TeranocConfig(
     nb_l2_banks              = 4,
     l1_noc_remap_batch_size  = 4,
     l1_noc_remap_shuffle     = True,
+    redmule                  = None,
+    nb_redmule_tiles_per_group = 0,
+)
+
+TENSORPOOL64_NOC = TeranocConfig(
+    nb_snitch_per_tile       = 4,
+    nb_tiles_per_group       = 4,
+    nb_x_groups              = 2,
+    nb_y_groups              = 2,
+    bank_factor              = 8,
+    l1_bank_bytes            = 2048,
+    l1_bank_width            = 4,
+    nb_remote_ports_per_tile = 2,
+    axi_data_width           = 64,
+    nb_axi_masters_per_group = 1,
+    l2_size                  = 0x400000,
+    nb_l2_banks              = 4,
+    l1_noc_remap_batch_size  = 4,
+    l1_noc_remap_shuffle     = True,
+    redmule                  = RedmuleConfig(
+        ce_height   = 16,
+        ce_width    = 16,
+        ce_pipe     = 3,
+        elem_size   = 2,
+        queue_depth = 128,
+    ),
+    nb_redmule_tiles_per_group = 1,
+)
+
+TENSORPOOL256_NOC = TeranocConfig(
+    nb_snitch_per_tile       = 4,
+    nb_tiles_per_group       = 4,
+    nb_x_groups              = 4,
+    nb_y_groups              = 4,
+    bank_factor              = 8,
+    l1_bank_bytes            = 2048,
+    l1_bank_width            = 4,
+    nb_remote_ports_per_tile = 2,
+    axi_data_width           = 64,
+    nb_axi_masters_per_group = 1,
+    l2_size                  = 0x400000,
+    nb_l2_banks              = 4,
+    l1_noc_remap_batch_size  = 4,
+    l1_noc_remap_shuffle     = True,
+    redmule                  = RedmuleConfig(
+        ce_height   = 8,
+        ce_width    = 32,
+        ce_pipe     = 3,
+        elem_size   = 2,
+        queue_depth = 128,
+    ),
+    nb_redmule_tiles_per_group = 1,
 )
 
 
 CONFIGS = {
-    'teranoc':     TERANOC,
-    'mempool_noc': MEMPOOL_NOC,
-    'minpool_noc': MINPOOL_NOC,
+    'teranoc':         TERANOC,
+    'mempool_noc':     MEMPOOL_NOC,
+    'minpool_noc':     MINPOOL_NOC,
+    'tensorpool64_noc': TENSORPOOL64_NOC,
+    'tensorpool256_noc': TENSORPOOL256_NOC,
 }
 
 DEFAULT_CONFIG = 'teranoc'
