@@ -108,6 +108,12 @@ private:
     std::vector<int64_t>            last_accept_cycle_; // [port] cycle prev access was accepted (-1 = none)
     std::vector<int>                outstanding_;       // [port] in-flight count
     std::map<vp::IoReq *, int>      req2idx_;           // resp -> global access idx
+    // A request occupies a per-port outstanding slot from t_issue until its response
+    // actually returns (t_resp), modelling the requester's NumSpatzOutstandingLoads=32
+    // budget (THROUGHPUT_EXPERIMENT.md §3). Keyed by completion cycle -> port. The slot
+    // is freed in fsm_handler when the cycle is reached, NOT inline at on_response — so
+    // the budget genuinely binds (max_outstanding can reach 32) instead of reading 1.
+    std::multimap<int64_t, int>     inflight_complete_;
 
     uint8_t  scratch_[64];          // shared data buffer (timing-only; values unused)
     size_t   total_responded_ = 0;
@@ -220,6 +226,7 @@ void InsituCacheCalibDriver::reset(bool active)
         total_responded_ = 0;
         cur_outstanding_ = 0;
         max_outstanding_ = 0;
+        inflight_complete_.clear();
         for (int p = 0; p < num_ports_; ++p) {
             cursor_[p] = 0;
             last_accept_cycle_[p] = -1;
@@ -297,8 +304,11 @@ void InsituCacheCalibDriver::on_response(vp::IoReq *req, int64_t now)
     a.t_resp = a.t_issue + full_lat;
     a.responded = true;
 
-    cur_outstanding_--;
-    outstanding_[a.port]--;
+    // Hold the outstanding slot until the response actually returns (t_resp), not now:
+    // for an inline-resolved miss/hit, on_response fires at the issue cycle but the data
+    // returns full_lat cycles later. Freeing the slot at t_resp is what makes the
+    // per-port 32-outstanding budget bind. (Decrement happens in fsm_handler.)
+    inflight_complete_.insert({a.t_resp, a.port});
     total_responded_++;
 
     this->trace_.msg(vp::Trace::LEVEL_DEBUG,
@@ -319,6 +329,16 @@ void InsituCacheCalibDriver::fsm_handler(vp::Block *__this, vp::ClockEvent *)
     const int64_t now = _this->clock.get_cycles();
 
     if (_this->finished_) return;
+
+    // Free outstanding slots whose response has now returned (t_resp <= now). This is the
+    // deferred counterpart to on_response — it makes the per-port outstanding budget bind.
+    while (!_this->inflight_complete_.empty() &&
+           _this->inflight_complete_.begin()->first <= now) {
+        const int port = _this->inflight_complete_.begin()->second;
+        _this->inflight_complete_.erase(_this->inflight_complete_.begin());
+        if (_this->outstanding_[port] > 0) _this->outstanding_[port]--;
+        if (_this->cur_outstanding_ > 0)   _this->cur_outstanding_--;
+    }
 
     // Offer on every port that is ready this cycle.
     for (int p = 0; p < _this->num_ports_; ++p) {

@@ -62,6 +62,7 @@ NUM_PORTS = 5
 
 # Refill beat width — 128b ⇒ BurstLength=4 for a 64B line (matches RTL RefillDataWidth).
 REFILL_BEAT_BYTES = 16
+CACHE_LINE_BYTES = 64   # wide-refill experiment: beat = line ⇒ BurstLength=1
 WORD_BYTES = 4
 
 
@@ -125,21 +126,44 @@ class InsituCacheCalib(st.Component):
         mem_latency = int(os.environ.get('INSITU_CALIB_MEMLAT', '50'))
         beat_gap = int(os.environ.get('INSITU_CALIB_BEATGAP', '0'))
         accept_every = int(os.environ.get('INSITU_CALIB_ACCEPTEVERY', '1'))
+        # Wide single-beat refill experiment (THROUGHPUT_EXPERIMENT.md): refill width =
+        # cache line ⇒ BurstLength=1, misses pipeline (no single-outstanding serialization),
+        # deep memory queue; the binding limit becomes the 32-outstanding requester budget.
+        wide_refill = int(os.environ.get('INSITU_CALIB_WIDE_REFILL', '0')) != 0
+        refill_beat = CACHE_LINE_BYTES if wide_refill else REFILL_BEAT_BYTES
 
         trace_file, trace_out, csv_out = _resolve_paths()
 
         # --- Cache tile: single controller, 5 ports, 64 KiB (matches RTL DUT). ---
         cache_cfg = make_cachepool_512_calib_config()
+        cache_cfg.controller.refill_beat_bytes = refill_beat   # single-beat in wide mode
+        if wide_refill:
+            # Single-beat removes the multi-beat tail, so the cold-miss overhead drops
+            # from +17 (BurstLength=4) to +13 (RTL bl1). The intrinsic model gives +11
+            # from the beat change alone; +2 here lands it on the RTL +13.
+            cache_cfg.controller.miss_penalty_cycles = 9
+            # Occupancy model — only in wide mode. Refill/writeback completions are
+            # serialized through the install pipeline at refill_drain_cycles apart, so
+            # per-access latency inflates under load and miss throughput is install-rate-
+            # bound (not the flat-latency plateau). The driver's outstanding budget +
+            # this rate reproduce the RTL wide-refill numbers. The spatz path keeps the
+            # default inline behaviour (defer_refills=False).
+            cache_cfg.controller.defer_refills = True
+            cache_cfg.controller.refill_drain_cycles = int(
+                os.environ.get('INSITU_CALIB_REFILL_DRAIN', '3'))
         cache_tile = InsituCacheTile(self, 'insitu_cache', config=cache_cfg)
 
-        # --- Fixed-latency serializing refill memory (twin of refill_mem_model.sv). ---
+        # --- Fixed-latency refill memory (twin of refill_mem_model.sv). ---
         mem = InsituCalibMem(self, 'l2', mem_latency=mem_latency, beat_gap=beat_gap,
                              accept_every=accept_every,
-                             refill_beat_bytes=REFILL_BEAT_BYTES, word_bytes=WORD_BYTES,
+                             refill_beat_bytes=refill_beat, word_bytes=WORD_BYTES,
                              fill_pattern=False,
                              # Dirty-victim writeback overlaps the refill on the shared
                              # port (RTL: no serial stall) — matches evict throughput.
-                             writeback_overlap=True)
+                             writeback_overlap=True,
+                             # Wide mode: refills pipeline (concurrent), deep queue.
+                             serialize_refills=(not wide_refill),
+                             max_outstanding=(64 if wide_refill else 8))
 
         # --- Trace-replay driver + per-access monitor. ---
         drv = InsituCacheCalibDriver(self, 'driver',

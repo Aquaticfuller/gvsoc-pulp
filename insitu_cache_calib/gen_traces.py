@@ -62,6 +62,12 @@ def main():
     #    serialization → throughput ≈ 1/(MemLatency+17). (RTL: 64 acc / 3530 cyc @ ML50.)
     w('cold_stream_1p', [f'0,R,0x{BASE + i*LINE:08x},4,0' for i in range(64)])
 
+    # 3b. Long cold-miss stream (512 distinct lines). In the wide-refill experiment config
+    #     (INSITU_CALIB_WIDE_REFILL=1) this approaches the sustained plateau set by the
+    #     32-outstanding requester budget (Little's law: ~32/(MemLatency+13) ≈ 0.5 @ML50),
+    #     past the fill/drain transient of the 64-line burst. (THROUGHPUT_EXPERIMENT.md §3.)
+    w('cold_stream_long', [f'0,R,0x{BASE + i*LINE:08x},4,0' for i in range(512)])
+
     # 4. Warm-hit stream, 1 port: preload 16 lines (cold), idle to let them land, then
     #    stream 64 re-reads (4 reads per line) — all hits. Measures the hit-throughput
     #    ceiling (RTL: 0.86 acc/cyc single-port). Preload + measured are one trace; the
