@@ -142,13 +142,16 @@ def main():
     w('coal_cold_4port', lines)
 
     # 10. Coalesced WARM, 4 ports: same as cold but the 32 lines are preloaded
-    #     resident first (via port 0), so every coalesced read hits. RTL: 3.28
-    #     acc/cyc, mem_rd=0. (GVSoC over-serializes via the interco — throughput
-    #     gap expected; mem_rd=0 should match.)
+    #     resident first, so every coalesced read hits. RTL: 3.28 acc/cyc, mem_rd=0.
+    #     The preload is issued on the SCALAR port (port 4), NOT a VLSU port, so all
+    #     four VLSU ports (0..3) enter the measured phase with no per-port preload
+    #     offset — they stay cycle-aligned, which is what lets the interco coalescer
+    #     merge all 4 same-line reads each cycle (port-0 preload used to lag port 0
+    #     by ~32 cyc, collapsing the merge to 3 ports).
     rgn = BASE + 0x50000
-    lines = [f'0,R,0x{rgn + it*LINE:08x},4,0' for it in range(ITERS)]   # preload
-    # ports 1..3 have no preload; push every measured port's first read past the
-    # global preload drain (~ITERS × (ML+overhead)) so all 32 lines are resident.
+    lines = [f'4,R,0x{rgn + it*LINE:08x},4,0' for it in range(ITERS)]   # preload via scalar port
+    # the VLSU ports have no preload; push every measured port's first read past the
+    # preload drain (~ITERS × (ML+overhead)) so all 32 lines are resident.
     WARMUP = 2500
     for it in range(ITERS):
         for p in range(4):
