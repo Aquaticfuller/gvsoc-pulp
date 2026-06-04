@@ -101,6 +101,21 @@ def main():
             lines.append(f'{p},R,0x{rgn + i*LINE:08x},4,0')
     w('warm_stream_4p', lines)
 
+    # 5b. Hit-pipeline injection-gap sweep (RTL bw_hit_gap{0,1,3,7}, single port, all hits).
+    #     Preload 16 lines resident, idle, then 64 hits each issued `gap` idle cycles after
+    #     the previous. RTL: the steady-state hit latency rises with the gap as the three
+    #     decoupling registers drain — gap0→7/7/10, gap1→8/8/10, gap3→10/10/10, gap7→10.
+    #     This is the verification of the streaming-hit warmth gradient. Read the tail (drop
+    #     the first/pipeline-fill access) for the steady-state per-access latency.
+    NSET = 16
+    for gap in (0, 1, 2, 3, 7):
+        lines = [f'0,R,0x{BASE + i*LINE:08x},4,0' for i in range(NSET)]   # cold preload
+        lines.append(f'0,R,0x{BASE:08x},4,1500')                          # idle so refills land
+        for r in range(64):
+            i = r % NSET
+            lines.append(f'0,R,0x{BASE + i*LINE:08x},4,{gap}')
+        w(f'bw_hit_gap{gap}', lines)
+
     # ---- New phases mirroring the RTL TB (CHARACTERIZATION.md, 2026-06-01) ----
 
     # 6. Isolated warm WRITE: preload a line resident, idle, then write it.
