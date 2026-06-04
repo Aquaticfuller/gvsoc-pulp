@@ -148,6 +148,13 @@ def main():
     #    par_coalescer merges them to 1 miss/line → mem_rd=32. The GVSoC model has
     #    no input coalescer, but the controller's MSHR merges secondary misses to a
     #    READ_PEND line → also 1 refill/line → mem_rd should land at 32.
+    #    NOTE: this trace is intentionally READ-ONLY into a fresh region, so on GVSoC every
+    #    miss lands in an INVALID way and there are NO dirty victims → mem_wr=0. The RTL
+    #    coal_cold reports mem_wr=32 only because its SHARED testbench pre-dirtied these sets
+    #    in earlier phases — a TB-history artifact, not cache behaviour. Do NOT "fix" the
+    #    mem_wr divergence by pre-dirtying here: doing so double-reserves the install pipe
+    #    (eviction+refill ≈9 cyc/line) and UNDERSHOOTS to ~0.31 thr / 169 lat. See
+    #    prompt/insitu_cache_calib_report.md §13.
     ITERS = 32
     rgn = BASE + 0x40000
     lines = []
