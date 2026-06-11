@@ -27,7 +27,7 @@ import gvsoc.systree as st
 from pulp.mempool.l1_interconnect.l1_address_scrambler import L1AddressScrambler
 from pulp.teranoc.l1_interconnect.l1_noc_itf import L1_NocItf
 from pulp.light_redmule.light_redmule import LightRedmule
-from pulp.light_redmule.hwpe_interleaver import HWPEInterleaver
+from pulp.teranoc.teranoc_hwpe_interleaver import TeranocHWPEInterleaver
 from utils.common_cells import Or
 
 class TeranocTile(st.Component):
@@ -74,7 +74,7 @@ class TeranocTile(st.Component):
             # Fans the wide TCDM request into l1_bank_width-byte sub-requests.
             # offset_translation=False keeps the full system address so the
             # L1's local_interleaver can route each to the right global bank.
-            hwpe_interleaver = HWPEInterleaver(self, f'tile-{tile_id}-hwpe_interleaver',
+            hwpe_interleaver = TeranocHWPEInterleaver(self, f'tile-{tile_id}-hwpe_interleaver',
                 nb_master_ports=1, nb_banks=arch.redmule_bank_number,
                 bank_width=arch.l1_bank_width,
                 offset_translation=False)
