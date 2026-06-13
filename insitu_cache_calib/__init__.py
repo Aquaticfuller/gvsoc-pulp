@@ -144,6 +144,17 @@ class InsituCacheCalib(st.Component):
         _cml = os.environ.get('INSITU_CALIB_COALESCE_MAX_LAT')
         if _cml is not None:
             cache_cfg.interco.coalesce_max_latency = int(_cml)
+        # Per-cycle output arbitration (real-kernel replay only). The synthetic phase traces
+        # inject at max rate and depend on accumulate-mode backpressure for their saturated
+        # throughput, so this defaults OFF. Real-kernel traces carry pre-throttled t_issue, for
+        # which accumulate double-counts the RTL backpressure (~+33 cy hit inflation) — enable
+        # per-cycle arbitration there. Optional INSITU_CALIB_OUTPUT_ACCEPT_WIDTH tunes the
+        # per-cycle accept bandwidth (default 1 = strict one-per-cycle).
+        if int(os.environ.get('INSITU_CALIB_PER_CYCLE_ARB', '0')) != 0:
+            cache_cfg.interco.per_cycle_output_arb = True
+            _oaw = os.environ.get('INSITU_CALIB_OUTPUT_ACCEPT_WIDTH')
+            if _oaw is not None:
+                cache_cfg.interco.output_accept_width = int(_oaw)
         if wide_refill:
             # Single-beat removes the multi-beat tail, so the cold-miss overhead drops
             # from +17 (BurstLength=4) to +13 (RTL bl1). The intrinsic model gives +11
