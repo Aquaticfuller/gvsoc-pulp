@@ -137,6 +137,13 @@ class InsituCacheCalib(st.Component):
         # --- Cache tile: single controller, 5 ports, 64 KiB (matches RTL DUT). ---
         cache_cfg = make_cachepool_512_calib_config()
         cache_cfg.controller.refill_beat_bytes = refill_beat   # single-beat in wide mode
+        # Alignment-investigation override (real-trace replay only): raise the coalescer's
+        # warm-hit gate so same-cycle same-line reads merge even while their line's refill is
+        # still in flight — the RTL par_coalescer merges unconditionally. Off by default so the
+        # committed synthetic-calib numbers are untouched.
+        _cml = os.environ.get('INSITU_CALIB_COALESCE_MAX_LAT')
+        if _cml is not None:
+            cache_cfg.interco.coalesce_max_latency = int(_cml)
         if wide_refill:
             # Single-beat removes the multi-beat tail, so the cold-miss overhead drops
             # from +17 (BurstLength=4) to +13 (RTL bl1). The intrinsic model gives +11
