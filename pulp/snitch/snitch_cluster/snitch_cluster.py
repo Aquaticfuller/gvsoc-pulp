@@ -289,6 +289,14 @@ class SnitchCluster(gvsoc.systree.Component):
             # Sync topology fields to this cluster's actual layout.
             cache_cfg.num_cores = arch.nb_core
             cache_cfg.tcdm_ports_per_core = 1 + (arch.spatz_nb_lanes if arch.use_spatz else 0)
+            # Phase-2 inc1: one cache controller per core (RTL NumL1CacheCtrl = NumCores), instead
+            # of the factory's fixed count. Default-off ⇒ num_controllers unchanged (today's
+            # topology). Requires power-of-two nb_core: the interco routes by
+            # (addr>>dynamic_offset)&(num_outputs-1), which assumes num_outputs is a power of two.
+            if cache_cfg.controllers_track_cores:
+                assert (arch.nb_core & (arch.nb_core - 1)) == 0, (
+                    f"controllers_track_cores requires power-of-two nb_core, got {arch.nb_core}")
+                cache_cfg.num_controllers = arch.nb_core
             cache_cfg.interco.num_inputs = cache_cfg.num_tcdm_ports
             cache_cfg.interco.num_outputs = cache_cfg.num_controllers
             # Closed-loop integration requirements (driver flags, not cache geometry — see
