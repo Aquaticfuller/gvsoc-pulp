@@ -291,6 +291,14 @@ class SnitchCluster(gvsoc.systree.Component):
             cache_cfg.tcdm_ports_per_core = 1 + (arch.spatz_nb_lanes if arch.use_spatz else 0)
             cache_cfg.interco.num_inputs = cache_cfg.num_tcdm_ports
             cache_cfg.interco.num_outputs = cache_cfg.num_controllers
+            # Closed-loop integration requirements (driver flags, not cache geometry — see
+            # insitu_cache_config.make_cachepool_512_config). The real core LSU (snitch v1 ISS,
+            # NB_OUTSTANDING off) only accepts a synchronous IO_REQ_OK, so misses must complete
+            # inline (inline_sync_miss); and write-back dirty data must reach backing memory so the
+            # ISS/HTIF backdoor reader sees it (functional_writethrough), else the program hangs.
+            # These force the data-carrying path; open-loop calib leaves them off (its default).
+            cache_cfg.controller.inline_sync_miss = True
+            cache_cfg.controller.functional_writethrough = True
             insitu_cache = InsituCacheTile(self, 'insitu_cache', config=cache_cfg)
 
         tcdm_port = 0
