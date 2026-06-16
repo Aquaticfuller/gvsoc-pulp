@@ -301,7 +301,16 @@ void InsituCacheCalibDriver::on_response(vp::IoReq *req, int64_t now)
     if (a.responded) return;
 
     const int64_t full_lat = (int64_t)req->get_full_latency();
-    a.t_resp = a.t_issue + full_lat;
+    // t_resp = the cycle the response is observed (`now`) PLUS any latency still carried on the req.
+    // Two slave conventions, both correct with this one formula:
+    //   - SYNCHRONOUS (IO_REQ_OK, e.g. InsituCacheController inline): on_response is called inline at
+    //     the issue cycle (now == t_issue) and the whole access latency is on the req → t_resp =
+    //     t_issue + full_lat. (unchanged)
+    //   - ASYNCHRONOUS (IO_REQ_PENDING + resp() later, e.g. the structural InsituCacheCore): resp_handler
+    //     fires at the real completion cycle and the latency is already realized in wall-clock (the core
+    //     does not inc_latency the user req, full_lat==0) → t_resp = now. Previously this used t_issue,
+    //     which collapsed every async response to ~t_issue and hid the emergent cache latency.
+    a.t_resp = now + full_lat;
     a.responded = true;
 
     // Hold the outstanding slot until the response actually returns (t_resp), not now:
