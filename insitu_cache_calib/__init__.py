@@ -136,6 +136,12 @@ class InsituCacheCalib(st.Component):
 
         # --- Cache tile: single controller, 5 ports, 64 KiB (matches RTL DUT). ---
         cache_cfg = make_cachepool_512_calib_config()
+        # Structural-core open-loop bring-up hook: run the per-cycle structural InsituCacheCore
+        # (Step 4) instead of the calibrated controller. Functional gate = data_err=0 on replay;
+        # cycle counts are uncalibrated (the structural timing-calibration phase tunes them). Off by
+        # default so the committed calib numbers (calibrated controller) are untouched.
+        if int(os.environ.get('INSITU_CALIB_STRUCTURAL_CORE', '0')) != 0:
+            cache_cfg.use_structural_core = True
         cache_cfg.controller.refill_beat_bytes = refill_beat   # single-beat in wide mode
         # Alignment-investigation override (real-trace replay only): raise the coalescer's
         # warm-hit gate so same-cycle same-line reads merge even while their line's refill is
