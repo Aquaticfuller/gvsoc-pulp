@@ -290,6 +290,9 @@ void L1_NocItf::noc_req_grant(vp::Block *__this, vp::IoReq *req, int id)
 {
     L1_NocItf *_this = (L1_NocItf *)__this;
     _this->noc_req_msts[id]->stalled = false;
+    // Perfetto NoC port-state lane: the NoC granted the stalled request; this
+    // source port leaves the STALLED state (back to idle/ready).
+    _this->trace.msg(vp::Trace::LEVEL_TRACE, "L1_NocItf: port %d state unstall\n", id);
     vp::IoReq *core_req = (vp::IoReq *)*req->arg_get(FlooNoc::REQ_BURST);
     core_req->resp_port->grant(core_req);
 
@@ -318,7 +321,7 @@ void L1_NocItf::noc_resp_grant(vp::Block *__this, vp::IoReq *req, int id)
 
 vp::IoReqStatus L1_NocItf::handle_core_req(vp::IoReq *req, int port)
 {
-    this->trace.msg(vp::Trace::LEVEL_TRACE, "L1_NocItf: core_req port: %d addr: 0x%x size: %d opcode: %d\n", port, req->get_addr(), req->get_size(), req->get_opcode());
+    this->trace.msg(vp::Trace::LEVEL_TRACE, "L1_NocItf: core_req port: %d addr: 0x%x size: %d opcode: %d req: %p\n", port, req->get_addr(), req->get_size(), req->get_opcode(), (void *)req);
 
     int64_t cycles = this->clock.get_cycles();
     if (noc_req_msts[port]->stalled || cycles < core_req_slvs[port]->next_burst_cycle || core_req_slvs[port]->denied_reqs.size() > 0)
@@ -349,6 +352,15 @@ vp::IoReqStatus L1_NocItf::handle_core_req(vp::IoReq *req, int port)
         // core_req_slvs[port]->stalled = true;
         noc_req_msts[port]->stalled = true;
         // noc_req_msts[port]->stalled_port = core_req_slvs[port];
+        // Perfetto NoC port-state lane: this source port (noc_req_msts[port]) is
+        // back-pressured by the NoC and cannot send until noc_req_grant().
+        this->trace.msg(vp::Trace::LEVEL_TRACE, "L1_NocItf: port %d state stall req: %p\n", port, (void *)req);
+    }
+    else
+    {
+        // Perfetto NoC port-state lane: one remote-TCDM transfer issued this cycle
+        // (read/write split, the RTL idle/stall/read/write vocabulary).
+        this->trace.msg(vp::Trace::LEVEL_TRACE, "L1_NocItf: port %d state %s req: %p\n", port, req->get_is_write() ? "write" : "read", (void *)req);
     }
     return retval;
 }
@@ -405,7 +417,7 @@ vp::IoReqStatus L1_NocItf::handle_noc_resp(vp::IoReq *req, int port)
 
     vp::IoReq *core_req = (vp::IoReq *)*req->arg_get(FlooNoc::REQ_BURST);
 
-    this->trace.msg(vp::Trace::LEVEL_TRACE, "L1_NocItf: noc_resp translate to core_resp addr: 0x%x size: %d opcode: %d\n", core_req->get_addr(), core_req->get_size(), core_req->get_opcode());
+    this->trace.msg(vp::Trace::LEVEL_TRACE, "L1_NocItf: noc_resp translate to core_resp addr: 0x%x size: %d opcode: %d req: %p\n", core_req->get_addr(), core_req->get_size(), core_req->get_opcode(), (void *)core_req);
 
     core_req->resp_port->resp(core_req);
     delete req;
@@ -449,10 +461,16 @@ void L1_NocItf::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                 // input->stalled = true;
                 output->stalled = true;
                 // output->stalled_port = input;
+                // Perfetto NoC port-state lane: a previously-queued request was
+                // re-issued and again back-pressured by the NoC -> STALLED.
+                _this->trace.msg(vp::Trace::LEVEL_TRACE, "L1_NocItf: port %d state stall req: %p\n", i, (void *)req);
             }
             else
             {
                 req->resp_port->grant(req);
+                // Perfetto NoC port-state lane: queued request re-issued and
+                // accepted this cycle -> one BUSY (read/write) transfer.
+                _this->trace.msg(vp::Trace::LEVEL_TRACE, "L1_NocItf: port %d state %s req: %p\n", i, req->get_is_write() ? "write" : "read", (void *)req);
                 _this->fsm_event.enqueue();
             }
         }

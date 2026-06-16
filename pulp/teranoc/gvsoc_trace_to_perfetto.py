@@ -60,8 +60,13 @@ lanes in flow order; group keeps its x,y coordinate; children ordered
 numerically so e.g. Tile 10 follows Tile 2):
 
   ``1 Core`` > ``Group X,Y`` > ``Tile N`` > ``Core C``  (insn slices + IPC counter)
-  ``2 NoC``  > ``Group X,Y`` > ``Tile N`` > ``Core C``  (remote-request slices, named by
-                                                         destination group)
+  ``2 NoC``  > ``Group X,Y`` > ``Tile N`` > ``Core C``  per-port handshake STATE
+                                                         slices (idle/stall/read/write)
+                                                         + ``outstanding`` / ``latency``
+                                                         counters
+  ``3 RedMulE`` > ``Group X,Y`` > ``Tile N``  > ``state`` run-length FSM lane
+                                              (PRELOAD/ROUTINE/STORING/FINISHED)
+                                              + ``w_out`` / ``compute_pending`` counters
 
 ``--elf`` adds function names via ``addr2line``.
 """
@@ -72,7 +77,7 @@ import argparse
 import re
 import subprocess
 import sys
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -100,16 +105,36 @@ _PC = re.compile(r"^(?:0x)?[0-9a-fA-F]{2,16}$")
 _MODES = frozenset("USHM")
 
 # l1_noc_itf tap (the L1 NoC): a local core (req port 0..3) issues a remote TCDM
-# request.  handle_core_req() logs 'core_req port: ...' on entry, then -- only on
-# acceptance -- 'core_req translate to noc_req dest_x/dest_y' as the very next
-# line (a denied req returns before it).  So a 'port' line immediately followed by
-# a 'dest' line is one ACCEPTED remote request from that core to that group.
-# (Pairing the response back for true round-trip latency needs a correlation id
-# threaded into the trace -- noc_resp carries neither the core nor an id; P2.)
+# request.  handle_core_req() logs 'core_req port: ... req: <ptr>' on entry, then --
+# only on acceptance -- 'core_req translate to noc_req dest_x/dest_y' as the very
+# next line (a denied req returns before it).  So a 'port' line immediately
+# followed by a 'dest' line is one ACCEPTED request from that core to that group.
+# The response returns to the SAME itf as 'noc_resp translate to core_resp ...
+# req: <ptr>' carrying the SAME core-IoReq pointer (threaded via FlooNoc REQ_BURST),
+# so we pair req<->resp by (tile, ptr) FIFO into a true round-trip [req .. resp].
 _NOC_CORE_REQ = re.compile(
-    r"L1_NocItf: core_req port: (\d+) addr: (0x[0-9a-fA-F]+) size: (\d+) opcode: (\d+)")
+    r"L1_NocItf: core_req port: (\d+) addr: (0x[0-9a-fA-F]+) size: (\d+) "
+    r"opcode: (\d+) req: (0x[0-9a-fA-F]+)")
 _NOC_REQ_DEST = re.compile(
     r"L1_NocItf: core_req translate to noc_req dest_x: (\d+) dest_y: (\d+)")
+_NOC_RESP_REQ = re.compile(
+    r"L1_NocItf: noc_resp translate to core_resp addr: 0x[0-9a-fA-F]+ "
+    r"size: \d+ opcode: \d+ req: (0x[0-9a-fA-F]+)")
+# l1_noc_itf per-port STATE markers (the RTL idle/stall/read/write port lane).
+# The SOURCE request master noc_req_msts[port] is in exactly one state per cycle:
+# read/write = a remote-TCDM transfer issued this cycle; stall = NoC back-pressure
+# until the matching unstall (grant).  Idle is the implicit gap.  Non-crossing.
+_NOC_STATE = re.compile(r"L1_NocItf: port (\d+) state (read|write|stall|unstall)")
+
+# LightRedmule tap: the FSM tags each line with its state -- [Preload], [Storing],
+# [FINISHED], [ACKNOWLEDGE], or [ROUTINE-ijk: i-j-k] (the GEMM tile being computed).
+# [Resp] lines carry the response backpressure counters (outstanding writes +
+# whether a compute is waiting on them).  States never overlap -> a run-length lane.
+_RM_ROUTINE = re.compile(r"\[LightRedmule\]\[ROUTINE-ijk: (\d+)-(\d+)-(\d+)\]")
+_RM_SIMPLE  = re.compile(r"\[LightRedmule\]\[(Preload|Storing|FINISHED|ACKNOWLEDGE)\]")
+_RM_RESP    = re.compile(
+    r"\[LightRedmule\]\[Resp\] slot=\d+ instr=\d+ "
+    r"\(w_out=(\d+), compute_pending=(\d+)\)")
 
 
 class Insn:
@@ -357,28 +382,122 @@ def emit_core(builder, uu, core, insns, a2l, window_ns, ny):
             n += 1
 
 
-def emit_noc(builder, uu, tile_path, by_port, ny):
-    """One l1_noc_itf instance -> under '2 NoC', a per-core lane of accepted
-    remote-TCDM requests, each named by its destination group ``->G<gid>`` (so
-    requests to the same group share a colour).  Each request spans the gap to
-    that core's next request (its remote-access cadence); the Snitch LSU blocks
-    on the access, so per-core requests are sequential and the slices never
-    overlap.  True round-trip latency (req..resp) arrives in P2 with a
-    correlation id in the trace."""
+def emit_noc(builder, uu, tile_path, ev, ny, period_ps):
+    """One l1_noc_itf instance -> under '2 NoC', per core-port (0..N): a per-port
+    handshake-STATE slice lane (the RTL ``idle/stall/read/write`` vocabulary) on the
+    ``Core <port>`` track itself, PLUS ``outstanding`` and ``latency`` counter
+    children -- mirroring the RTL flow, which keeps state slices and derived counters
+    on the same port track.
+
+    State (from the source master noc_req_msts[port]): ``read``/``write`` = one
+    1-cycle remote-TCDM transfer issued this cycle; ``stall`` = a span from a NoC
+    back-pressure to its grant; idle = the implicit gap.  A source port is in exactly
+    ONE state per cycle, so these slices NEVER cross -- unlike the deeply out-of-order
+    [req..resp] round-trip spans (tens in flight), which is why the round-trip view is
+    rendered as the counters, not as slices.  Req/resp are paired by the core-IoReq
+    pointer (threaded via REQ_BURST) per ptr in FIFO order for the counters."""
     tokens = split_hier(tile_path)                  # [group_X_Y, tile_N]
     tile_track = ensure_hierarchy(builder, uu, tokens, ny,
                                   root_name="2 NoC", root_key="noc")
-    for port in sorted(by_port):
-        ct = add_track(builder, uu.get(("noc", *tokens, port)),
-                       f"Core {port}", parent=tile_track, order_rank=port)
-        reqs = sorted(by_port[port])                 # (t_ps, cyc, addr, size, op, dx, dy)
-        for k, (t_ps, cyc, addr, size, op, dx, dy) in enumerate(reqs):
-            gid = dx * ny + dy
-            emit_slice_begin(builder, _ps_to_ns(t_ps), ct, f"→G{gid}",
-                             annos=[("addr", addr), ("size", size), ("opcode", op),
-                                    ("dest", f"G{gid} ({dx},{dy})"), ("cycle", cyc)])
-            nxt = reqs[k + 1][0] if k + 1 < len(reqs) else t_ps
-            emit_slice_end(builder, _ps_to_ns(nxt), ct)
+    resps = defaultdict(deque)                       # ptr -> FIFO queue of (t_ps, cyc)
+    for ptr, t_ps, cyc in sorted(ev["resp"], key=lambda r: r[1]):
+        resps[ptr].append((t_ps, cyc))
+    # per core-port: (req_t_ps, req_cyc, resp_t_ps, resp_cyc, paired)
+    per_core: Dict[int, list] = defaultdict(list)
+    for ptr, rt_ps, rcyc, port, addr, size, op, dx, dy in sorted(
+            ev["req"], key=lambda r: r[1]):
+        q = resps.get(ptr)
+        if q:
+            st_ps, scyc, paired = (*q.popleft(), True)
+        else:
+            st_ps, scyc, paired = rt_ps, rcyc, False     # resp past trace window
+        per_core[port].append((rt_ps, rcyc, st_ps, scyc, paired))
+    ports = sorted(set(per_core) | {p for p, *_ in ev["state"]})
+    for port in ports:
+        lane = add_track(builder, uu.get(("noc", *tokens, port)),
+                         f"Core {port}", parent=tile_track, order_rank=port)
+        # Per-port handshake-state slices on the lane track (idle dropped = gap).
+        # busy (read/write) = 1-cycle transfers (coalesced when abutting); stall =
+        # span to the matching grant.  Merge into ONE start-sorted pass so adjacent
+        # busy/stall slices sharing a boundary ns don't mis-nest.
+        marks = sorted((cyc, tps, kind)
+                       for p, cyc, tps, kind in ev["state"] if p == port)
+        spans = []                                   # (start_ps, end_ps, name)
+        busy = [(c, t, k) for c, t, k in marks if k in ("read", "write")]
+        i = 0
+        while i < len(busy):
+            c0, t0, nm = busy[i]
+            end = c0 + 1
+            j = i + 1
+            while j < len(busy) and busy[j][2] == nm and busy[j][0] == end:
+                end = busy[j][0] + 1
+                j += 1
+            spans.append((t0, t0 + (end - c0) * period_ps, nm))
+            i = j
+        unstalls = sorted(t for c, t, k in marks if k == "unstall")
+        ui = 0
+        for st_ps in sorted(t for c, t, k in marks if k == "stall"):
+            while ui < len(unstalls) and unstalls[ui] < st_ps:
+                ui += 1
+            en_ps = unstalls[ui] if ui < len(unstalls) else st_ps + period_ps
+            spans.append((st_ps, en_ps, "stall"))
+            ui += 1
+        for s_ps, e_ps, nm in sorted(spans):
+            emit_slice_begin(builder, _ps_to_ns(s_ps), lane, nm, annos=[("state", nm)])
+            emit_slice_end(builder, _ps_to_ns(max(e_ps, s_ps + period_ps)), lane)
+        out_uuid = add_track(builder, uu.get(("noc_out", *tokens, port)),
+                             "outstanding", parent=lane, counter=True, order_rank=0)
+        lat_uuid = add_track(builder, uu.get(("noc_lat", *tokens, port)),
+                             "latency", parent=lane, counter=True, order_rank=1)
+        # outstanding: +1 at issue, -1 at completion; +1 before -1 at a shared ts.
+        deltas = []
+        for rt_ps, rcyc, st_ps, scyc, paired in per_core[port]:
+            deltas.append((rt_ps, 0))                    # 0 sorts before 1 -> +1 first
+            if paired:
+                deltas.append((st_ps, 1))
+        deltas.sort()
+        cur = 0
+        for ts_ps, kind in deltas:
+            cur += 1 if kind == 0 else -1
+            emit_counter(builder, _ps_to_ns(ts_ps), out_uuid, cur)
+        # latency: round-trip cycles, sampled when each response lands.
+        for rt_ps, rcyc, st_ps, scyc, paired in sorted(
+                (r for r in per_core[port] if r[4]), key=lambda r: r[2]):
+            emit_counter(builder, _ps_to_ns(st_ps), lat_uuid, scyc - rcyc)
+
+
+def emit_redmule(builder, uu, rm_path, ev, ny):
+    """One LightRedmule instance -> under '3 RedMulE': a run-length FSM ``state``
+    lane (PRELOAD/ROUTINE/STORING/FINISHED, ROUTINE annotated with the i-j-k GEMM
+    tile) plus ``w_out`` (outstanding writes) and ``compute_pending`` counters from
+    the [Resp] line.  Only one FSM state is live at a time, so the lane never
+    crosses; the counters expose when compute stalls waiting on stores to drain."""
+    tokens = split_hier(rm_path)                    # [group_X_Y, tile_N]
+    tile_track = ensure_hierarchy(builder, uu, tokens, ny,
+                                  root_name="3 RedMulE", root_key="redmule")
+    lane = add_track(builder, uu.get(("rm", *tokens)), "state",
+                     parent=tile_track, order_rank=0)
+    wout_uuid = add_track(builder, uu.get(("rm_wout", *tokens)), "w_out",
+                          parent=tile_track, counter=True, order_rank=1)
+    cp_uuid = add_track(builder, uu.get(("rm_cp", *tokens)), "compute_pending",
+                        parent=tile_track, counter=True, order_rank=2)
+    # Coalesce consecutive same-state lines into runs; each run's end is the next
+    # run's start (the last run ends at the final state line).
+    states = sorted(ev["state"])                     # (t_ps, label, ijk)
+    runs = []                                        # [label, ijk, start_ps, end_ps]
+    for t_ps, label, ijk in states:
+        if runs and runs[-1][0] == label and runs[-1][1] == ijk:
+            continue
+        runs.append([label, ijk, t_ps, t_ps])
+    for i, run in enumerate(runs):
+        run[3] = runs[i + 1][2] if i + 1 < len(runs) else states[-1][0]
+    for label, ijk, s_ps, e_ps in runs:
+        emit_slice_begin(builder, _ps_to_ns(s_ps), lane, label,
+                         annos=[("ijk", ijk)] if ijk else None)
+        emit_slice_end(builder, _ps_to_ns(max(e_ps, s_ps + 1)), lane)
+    for t_ps, wout, cp in sorted(ev["resp"]):
+        emit_counter(builder, _ps_to_ns(t_ps), wout_uuid, wout)
+        emit_counter(builder, _ps_to_ns(t_ps), cp_uuid, cp)
 
 
 def main() -> int:
@@ -405,12 +524,23 @@ def main() -> int:
             return 2
 
     by_core: Dict[str, List[Insn]] = defaultdict(list)
-    # noc[tile_path][core_port] = [(t_ps, cyc, addr, size, opcode, dest_x, dest_y)]
-    noc: Dict[str, Dict[int, list]] = defaultdict(lambda: defaultdict(list))
+    # noc[tile_path] = {"req":   [(ptr, t_ps, cyc, core_port, addr, size, op, dx, dy)],
+    #                   "resp":  [(ptr, t_ps, cyc)],
+    #                   "state": [(port, cyc, t_ps, kind)]  kind=read|write|stall|unstall}
+    noc: Dict[str, Dict[str, list]] = defaultdict(
+        lambda: {"req": [], "resp": [], "state": []})
+    cyc_ps_lo = cyc_ps_hi = None    # (cyc, t_ps) extrema -> ps-per-cycle period
+    # rm[redmule_path] = {"state": [(t_ps, label, ijk_or_None)],
+    #                     "resp":  [(t_ps, w_out, compute_pending)]}
+    rm: Dict[str, Dict[str, list]] = defaultdict(lambda: {"state": [], "resp": []})
 
     for p in args.trace:
         pending = None          # last 'core_req port' line, awaiting its 'dest' line
         for t_ps, cyc, brk, rest in iter_records(p, args.max_lines):
+            if cyc_ps_lo is None or cyc < cyc_ps_lo[0]:
+                cyc_ps_lo = (cyc, t_ps)
+            if cyc_ps_hi is None or cyc > cyc_ps_hi[0]:
+                cyc_ps_hi = (cyc, t_ps)
             leaf = trace_leaf(brk)
             if leaf == "insn":
                 body = parse_insn_body(rest)
@@ -419,25 +549,47 @@ def main() -> int:
                     core = brk[:-len("/insn")]
                     by_core[core].append(Insn(t_ps, cyc, core, mode, pc, disasm))
                 continue
+            if "redmule" in brk:
+                m = _RM_ROUTINE.search(rest)
+                if m:
+                    rm[brk]["state"].append(
+                        (t_ps, "ROUTINE", f"{m.group(1)}-{m.group(2)}-{m.group(3)}"))
+                    continue
+                m = _RM_SIMPLE.search(rest)
+                if m:
+                    rm[brk]["state"].append((t_ps, m.group(1).upper(), None))
+                    continue
+                m = _RM_RESP.search(rest)
+                if m:
+                    rm[brk]["resp"].append((t_ps, int(m.group(1)), int(m.group(2))))
+                continue
             if "l1_noc_itf" not in brk:
                 continue
             m = _NOC_CORE_REQ.search(rest)
             if m:
                 # a new 'port' line drops any unconsumed pending (it was denied)
                 pending = (brk, int(m.group(1)), m.group(2), int(m.group(3)),
-                           int(m.group(4)), t_ps, cyc)
+                           int(m.group(4)), m.group(5), t_ps, cyc)
                 continue
             m = _NOC_REQ_DEST.search(rest)
             if m and pending:
-                b, port, addr, size, op, pt_ps, pcyc = pending
-                noc[b][port].append((pt_ps, pcyc, addr, size, op,
-                                     int(m.group(1)), int(m.group(2))))
+                b, port, addr, size, op, ptr, pt_ps, pcyc = pending
+                noc[b]["req"].append((ptr, pt_ps, pcyc, port, addr, size, op,
+                                      int(m.group(1)), int(m.group(2))))
                 pending = None
+                continue
+            m = _NOC_RESP_REQ.search(rest)
+            if m:
+                noc[brk]["resp"].append((m.group(1), t_ps, cyc))
+                continue
+            m = _NOC_STATE.search(rest)
+            if m:
+                noc[brk]["state"].append((int(m.group(1)), cyc, t_ps, m.group(2)))
 
-    if not by_core and not noc:
-        print("ERROR: no insn or l1_noc_itf lines parsed -- check the --trace regex "
-              "(need .*/insn and/or .*l1_noc_itf/trace, with --trace-level=7)",
-              file=sys.stderr)
+    if not by_core and not noc and not rm:
+        print("ERROR: no insn, l1_noc_itf or redmule lines parsed -- check the "
+              "--trace regex (need .*/insn, .*l1_noc_itf/trace and/or "
+              ".*redmule/trace, with --trace-level=7)", file=sys.stderr)
         return 1
 
     a2l = Addr2Line(args.elf)
@@ -447,26 +599,39 @@ def main() -> int:
     ny = args.ny
     if ny is None:
         ys = [int(re.findall(r"\d+", t)[1])
-              for path in list(by_core) + list(noc) for t in split_hier(path)
+              for path in list(by_core) + list(noc) + list(rm)
+              for t in split_hier(path)
               if t.startswith("group_") and len(re.findall(r"\d+", t)) >= 2]
         ny = max(ys) + 1 if ys else 1
+
+    # ps-per-cycle, for the 1-cycle width of the NoC busy-state slices.
+    period_ps = 1000.0
+    if cyc_ps_lo and cyc_ps_hi and cyc_ps_hi[0] != cyc_ps_lo[0]:
+        period_ps = (cyc_ps_hi[1] - cyc_ps_lo[1]) / (cyc_ps_hi[0] - cyc_ps_lo[0])
 
     builder = TraceProtoBuilder()
     uu = Uuids()
     for core in sorted(by_core):
         emit_core(builder, uu, core, by_core[core], a2l, args.window_ns, ny)
     for tile_path in sorted(noc):
-        emit_noc(builder, uu, tile_path, noc[tile_path], ny)
+        emit_noc(builder, uu, tile_path, noc[tile_path], ny, period_ps)
+    for rm_path in sorted(rm):
+        emit_redmule(builder, uu, rm_path, rm[rm_path], ny)
 
     out = args.output or (args.trace[0] + ".perfetto-trace")
     with open(out, "wb") as f:
         f.write(builder.serialize())
 
     n_insn = sum(len(v) for v in by_core.values())
-    n_noc = sum(len(rl) for bp in noc.values() for rl in bp.values())
+    n_req = sum(len(ev["req"]) for ev in noc.values())
+    n_resp = sum(len(ev["resp"]) for ev in noc.values())
+    n_noc_state = sum(len(ev["state"]) for ev in noc.values())
+    n_rm_state = sum(len(ev["state"]) for ev in rm.values())
     print(f"cores: {len(by_core)}  instructions: {n_insn}  "
-          f"noc-itf: {len(noc)}  noc-reqs: {n_noc}  tracks: {uu._n}  "
-          f"ny={ny}{'' if args.ny is not None else ' (inferred)'}")
+          f"noc-itf: {len(noc)}  noc-reqs: {n_req}  noc-resps: {n_resp}  "
+          f"noc-state: {n_noc_state}  period_ps: {period_ps:.0f}  "
+          f"redmule: {len(rm)}  rm-state-lines: {n_rm_state}  "
+          f"tracks: {uu._n}  ny={ny}{'' if args.ny is not None else ' (inferred)'}")
     print(f"wrote {out}  (open at https://ui.perfetto.dev)")
     return 0
 
