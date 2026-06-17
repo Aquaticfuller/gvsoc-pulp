@@ -67,6 +67,9 @@ numerically so e.g. Tile 10 follows Tile 2):
   ``3 RedMulE`` > ``Group X,Y`` > ``Tile N``  > ``state`` run-length FSM lane
                                               (PRELOAD/ROUTINE/STORING/FINISHED)
                                               + ``w_out`` / ``compute_pending`` counters
+  ``4 TCDM`` > ``Group X,Y`` > ``Tile N`` > ``Bank K``  per-bank access STATE slices
+                                              (idle/read/write) + ``accesses`` per-window
+                                              utilization counter
 
 ``--elf`` adds function names via ``addr2line``.
 """
@@ -125,6 +128,14 @@ _NOC_RESP_REQ = re.compile(
 # read/write = a remote-TCDM transfer issued this cycle; stall = NoC back-pressure
 # until the matching unstall (grant).  Idle is the implicit gap.  Non-crossing.
 _NOC_STATE = re.compile(r"L1_NocItf: port (\d+) state (read|write|stall|unstall)")
+
+# TCDM L1 bank tap (generic Memory model, instance .../tile_N/l1/tcdm_bankK): the
+# model logs one line per serviced access.  A bank is single-port (latency 1) so it
+# services one access at a time -> a per-bank read/write run-length lane never crosses.
+_BANK = re.compile(
+    r"Memory access \(offset: (0x[0-9a-fA-F]+), size: (0x[0-9a-fA-F]+), "
+    r"is_write: (\d+)")
+_BANK_ID = re.compile(r"tcdm_bank(\d+)")
 
 # LightRedmule tap: the FSM tags each line with its state -- [Preload], [Storing],
 # [FINISHED], [ACKNOWLEDGE], or [ROUTINE-ijk: i-j-k] (the GEMM tile being computed).
@@ -466,6 +477,66 @@ def emit_noc(builder, uu, tile_path, ev, ny, period_ps):
             emit_counter(builder, _ps_to_ns(st_ps), lat_uuid, scyc - rcyc)
 
 
+def emit_bank(builder, uu, bank_path, accesses, ny, period_ps, window_ns):
+    """One TCDM L1 Memory bank -> under '4 TCDM' > Group > Tile > 'Bank K': a per-bank
+    access STATE lane (idle/read/write) + an ``accesses`` per-window utilization counter.
+
+    A bank is single-port (latency 1), so it services one access at a time and the
+    state is one-at-a-time -> non-crossing.  We coalesce by CYCLE (not per access): a
+    cycle with any access is busy [c, c+1], named ``read``/``write`` (or ``rw`` if a
+    conflict put both on one cycle), abutting same-named cycles merged into a run.
+    Coalescing by cycle keeps the lane non-crossing even if the arbiter ever lets two
+    accesses land on the bank the same cycle (the conflict shows up in the counter)."""
+    tokens = split_hier(bank_path)                  # [group_X_Y, tile_N]
+    m = _BANK_ID.search(bank_path)
+    bank_id = int(m.group(1)) if m else 0
+    tile_track = ensure_hierarchy(builder, uu, tokens, ny,
+                                  root_name="4 TCDM", root_key="tcdm")
+    lane = add_track(builder, uu.get(("tcdm", *tokens, bank_id)),
+                     f"Bank {bank_id}", parent=tile_track, order_rank=bank_id)
+    # Per cycle: earliest t_ps + the set of access kinds seen that cycle.
+    by_cyc: Dict[int, list] = {}
+    for cyc, t_ps, addr, size, isw in accesses:
+        nm = "write" if isw else "read"
+        if cyc not in by_cyc:
+            by_cyc[cyc] = [t_ps, set()]
+        by_cyc[cyc][0] = min(by_cyc[cyc][0], t_ps)
+        by_cyc[cyc][1].add(nm)
+    cyc_state = []                                   # (cyc, t_ps, name)
+    for cyc in sorted(by_cyc):
+        t_ps, kinds = by_cyc[cyc]
+        cyc_state.append((cyc, t_ps, "rw" if len(kinds) > 1 else next(iter(kinds))))
+    # Coalesce abutting same-named cycles into one busy slice (idle = gap).
+    i = 0
+    while i < len(cyc_state):
+        c0, t0, nm = cyc_state[i]
+        end = c0 + 1
+        j = i + 1
+        while j < len(cyc_state) and cyc_state[j][2] == nm and cyc_state[j][0] == end:
+            end = cyc_state[j][0] + 1
+            j += 1
+        emit_slice_begin(builder, _ps_to_ns(t0), lane, nm, annos=[("state", nm)])
+        emit_slice_end(builder, _ps_to_ns(t0 + (end - c0) * period_ps), lane)
+        i = j
+    # accesses-per-window utilization counter (bank hotspot signal).
+    rate_uuid = add_track(builder, uu.get(("tcdm_rate", *tokens, bank_id)),
+                          "accesses", parent=lane, counter=True, order_rank=0)
+    if accesses:
+        win_ps = window_ns * 1000.0
+        ts = sorted(t_ps for _, t_ps, *_ in accesses)
+        w0 = ts[0]
+        w_end = w0 + win_ps
+        n = 0
+        for t_ps in ts:
+            if t_ps >= w_end:
+                emit_counter(builder, _ps_to_ns(w0), rate_uuid, n)
+                while t_ps >= w_end:
+                    w0, w_end = w_end, w_end + win_ps
+                n = 0
+            n += 1
+        emit_counter(builder, _ps_to_ns(w0), rate_uuid, n)
+
+
 def emit_redmule(builder, uu, rm_path, ev, ny):
     """One LightRedmule instance -> under '3 RedMulE': a run-length FSM ``state``
     lane (PRELOAD/ROUTINE/STORING/FINISHED, ROUTINE annotated with the i-j-k GEMM
@@ -533,6 +604,8 @@ def main() -> int:
     # rm[redmule_path] = {"state": [(t_ps, label, ijk_or_None)],
     #                     "resp":  [(t_ps, w_out, compute_pending)]}
     rm: Dict[str, Dict[str, list]] = defaultdict(lambda: {"state": [], "resp": []})
+    # banks[bank_path] = [(cyc, t_ps, addr, size, is_write)]  one serviced access each
+    banks: Dict[str, list] = defaultdict(list)
 
     for p in args.trace:
         pending = None          # last 'core_req port' line, awaiting its 'dest' line
@@ -563,6 +636,12 @@ def main() -> int:
                 if m:
                     rm[brk]["resp"].append((t_ps, int(m.group(1)), int(m.group(2))))
                 continue
+            if "tcdm_bank" in brk:
+                m = _BANK.search(rest)
+                if m:
+                    banks[brk].append((cyc, t_ps, m.group(1),
+                                       int(m.group(2), 16), int(m.group(3))))
+                continue
             if "l1_noc_itf" not in brk:
                 continue
             m = _NOC_CORE_REQ.search(rest)
@@ -586,10 +665,10 @@ def main() -> int:
             if m:
                 noc[brk]["state"].append((int(m.group(1)), cyc, t_ps, m.group(2)))
 
-    if not by_core and not noc and not rm:
-        print("ERROR: no insn, l1_noc_itf or redmule lines parsed -- check the "
-              "--trace regex (need .*/insn, .*l1_noc_itf/trace and/or "
-              ".*redmule/trace, with --trace-level=7)", file=sys.stderr)
+    if not by_core and not noc and not rm and not banks:
+        print("ERROR: no insn, l1_noc_itf, redmule or tcdm_bank lines parsed -- check "
+              "the --trace regex (need .*/insn, .*l1_noc_itf/trace, .*redmule/trace "
+              "and/or .*tcdm_bank.*, with --trace-level=7)", file=sys.stderr)
         return 1
 
     a2l = Addr2Line(args.elf)
@@ -599,7 +678,7 @@ def main() -> int:
     ny = args.ny
     if ny is None:
         ys = [int(re.findall(r"\d+", t)[1])
-              for path in list(by_core) + list(noc) + list(rm)
+              for path in list(by_core) + list(noc) + list(rm) + list(banks)
               for t in split_hier(path)
               if t.startswith("group_") and len(re.findall(r"\d+", t)) >= 2]
         ny = max(ys) + 1 if ys else 1
@@ -617,6 +696,9 @@ def main() -> int:
         emit_noc(builder, uu, tile_path, noc[tile_path], ny, period_ps)
     for rm_path in sorted(rm):
         emit_redmule(builder, uu, rm_path, rm[rm_path], ny)
+    for bank_path in sorted(banks):
+        emit_bank(builder, uu, bank_path, banks[bank_path], ny, period_ps,
+                  args.window_ns)
 
     out = args.output or (args.trace[0] + ".perfetto-trace")
     with open(out, "wb") as f:
@@ -627,9 +709,11 @@ def main() -> int:
     n_resp = sum(len(ev["resp"]) for ev in noc.values())
     n_noc_state = sum(len(ev["state"]) for ev in noc.values())
     n_rm_state = sum(len(ev["state"]) for ev in rm.values())
+    n_bank_acc = sum(len(v) for v in banks.values())
     print(f"cores: {len(by_core)}  instructions: {n_insn}  "
           f"noc-itf: {len(noc)}  noc-reqs: {n_req}  noc-resps: {n_resp}  "
           f"noc-state: {n_noc_state}  period_ps: {period_ps:.0f}  "
+          f"banks: {len(banks)}  bank-accesses: {n_bank_acc}  "
           f"redmule: {len(rm)}  rm-state-lines: {n_rm_state}  "
           f"tracks: {uu._n}  ny={ny}{'' if args.ny is not None else ' (inferred)'}")
     print(f"wrote {out}  (open at https://ui.perfetto.dev)")
