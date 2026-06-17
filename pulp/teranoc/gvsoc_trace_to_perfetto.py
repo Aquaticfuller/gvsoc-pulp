@@ -71,6 +71,10 @@ numerically so e.g. Tile 10 follows Tile 2):
                                               (idle/read/write) + ``accesses`` per-window
                                               utilization counter
 
+With ``--flows``, each ``2 NoC`` port also gets a ``packets`` child lane of instant
+req/resp markers connected by click-to-follow flow arrows (one flow per round-trip,
+req<->resp paired by IoReq pointer).
+
 ``--elf`` adds function names via ``addr2line``.
 """
 
@@ -274,7 +278,23 @@ def add_track(builder, uuid, name, parent=None, counter=False,
     return uuid
 
 
-def emit_slice_begin(builder, ts_ns, track_uuid, name, annos=None):
+def _emit_flow_annos(ev, annos, flow_id, terminating):
+    """Shared tail for slice-begin / instant events: attach the flow id (to
+    ``flow_ids`` to start/continue a chain, or ``terminating_flow_ids`` ONLY on the
+    last hop -- never both, else Perfetto's FlowTracker draws a self-loop) and the
+    debug annotations."""
+    if flow_id is not None:
+        (ev.terminating_flow_ids if terminating else ev.flow_ids).append(flow_id)
+    for k, v in (annos or []):
+        if v is None or v == "":
+            continue
+        da = ev.debug_annotations.add()
+        da.name = k
+        da.string_value = str(v)
+
+
+def emit_slice_begin(builder, ts_ns, track_uuid, name, annos=None,
+                     flow_id=None, terminating=False):
     pkt = builder.add_packet()
     pkt.timestamp = int(ts_ns)
     pkt.trusted_packet_sequence_id = SEQ
@@ -282,12 +302,22 @@ def emit_slice_begin(builder, ts_ns, track_uuid, name, annos=None):
     ev.type = TrackEvent.TYPE_SLICE_BEGIN
     ev.track_uuid = track_uuid
     ev.name = name
-    for k, v in (annos or []):
-        if v is None or v == "":
-            continue
-        da = ev.debug_annotations.add()
-        da.name = k
-        da.string_value = str(v)
+    _emit_flow_annos(ev, annos, flow_id, terminating)
+
+
+def emit_instant(builder, ts_ns, track_uuid, name, annos=None,
+                 flow_id=None, terminating=False):
+    """A zero-duration marker (TYPE_INSTANT) -- used for transaction-flow endpoints.
+    Instants cannot overlap/cross (no duration), so many concurrent in-flight remote
+    accesses render cleanly and the flow ARROW (not a span) carries the round-trip."""
+    pkt = builder.add_packet()
+    pkt.timestamp = int(ts_ns)
+    pkt.trusted_packet_sequence_id = SEQ
+    ev = pkt.track_event
+    ev.type = TrackEvent.TYPE_INSTANT
+    ev.track_uuid = track_uuid
+    ev.name = name
+    _emit_flow_annos(ev, annos, flow_id, terminating)
 
 
 def emit_slice_end(builder, ts_ns, track_uuid):
@@ -393,7 +423,7 @@ def emit_core(builder, uu, core, insns, a2l, window_ns, ny):
             n += 1
 
 
-def emit_noc(builder, uu, tile_path, ev, ny, period_ps):
+def emit_noc(builder, uu, tile_path, ev, ny, period_ps, flows=False):
     """One l1_noc_itf instance -> under '2 NoC', per core-port (0..N): a per-port
     handshake-STATE slice lane (the RTL ``idle/stall/read/write`` vocabulary) on the
     ``Core <port>`` track itself, PLUS ``outstanding`` and ``latency`` counter
@@ -413,16 +443,24 @@ def emit_noc(builder, uu, tile_path, ev, ny, period_ps):
     resps = defaultdict(deque)                       # ptr -> FIFO queue of (t_ps, cyc)
     for ptr, t_ps, cyc in sorted(ev["resp"], key=lambda r: r[1]):
         resps[ptr].append((t_ps, cyc))
-    # per core-port: (req_t_ps, req_cyc, resp_t_ps, resp_cyc, paired)
+    # per core-port: (req_t_ps, req_cyc, resp_t_ps, resp_cyc, paired, addr, dx, dy)
     per_core: Dict[int, list] = defaultdict(list)
     for ptr, rt_ps, rcyc, port, addr, size, op, dx, dy in sorted(
             ev["req"], key=lambda r: r[1]):
         q = resps.get(ptr)
+        # Zero-slack guard (RTL SKILL section 4): a response can never precede its own
+        # request, so drop any earlier same-pointer resp before pairing.  Such an orphan
+        # appears when the capture missed a request (e.g. an fsm-reissued, NoC-stalled
+        # one) but kept its response; since the IoReq* is pooled/reused, an unguarded
+        # FIFO could otherwise bind THIS request to that neighbour's response.
+        if q:
+            while q and q[0][0] < rt_ps:
+                q.popleft()
         if q:
             st_ps, scyc, paired = (*q.popleft(), True)
         else:
             st_ps, scyc, paired = rt_ps, rcyc, False     # resp past trace window
-        per_core[port].append((rt_ps, rcyc, st_ps, scyc, paired))
+        per_core[port].append((rt_ps, rcyc, st_ps, scyc, paired, addr, dx, dy))
     ports = sorted(set(per_core) | {p for p, *_ in ev["state"]})
     for port in ports:
         lane = add_track(builder, uu.get(("noc", *tokens, port)),
@@ -462,7 +500,7 @@ def emit_noc(builder, uu, tile_path, ev, ny, period_ps):
                              "latency", parent=lane, counter=True, order_rank=1)
         # outstanding: +1 at issue, -1 at completion; +1 before -1 at a shared ts.
         deltas = []
-        for rt_ps, rcyc, st_ps, scyc, paired in per_core[port]:
+        for rt_ps, rcyc, st_ps, scyc, paired, *_ in per_core[port]:
             deltas.append((rt_ps, 0))                    # 0 sorts before 1 -> +1 first
             if paired:
                 deltas.append((st_ps, 1))
@@ -472,9 +510,30 @@ def emit_noc(builder, uu, tile_path, ev, ny, period_ps):
             cur += 1 if kind == 0 else -1
             emit_counter(builder, _ps_to_ns(ts_ps), out_uuid, cur)
         # latency: round-trip cycles, sampled when each response lands.
-        for rt_ps, rcyc, st_ps, scyc, paired in sorted(
+        for rt_ps, rcyc, st_ps, scyc, paired, *_ in sorted(
                 (r for r in per_core[port] if r[4]), key=lambda r: r[2]):
             emit_counter(builder, _ps_to_ns(st_ps), lat_uuid, scyc - rcyc)
+        # --flows: a 'packets' child lane of instant req/resp markers, one flow per
+        # paired (req,resp).  Instants can't cross (no duration); the round-trip is the
+        # flow ARROW.  No buffer/sort needed (RTL gotcha 5): each flow id is unique to a
+        # single 2-endpoint flow and the req instant is emitted before its resp instant
+        # in one loop iteration, so insertion order == causal order even at a shared ts.
+        if flows:
+            pkt_lane = add_track(builder, uu.get(("noc_pkt", *tokens, port)),
+                                 "packets", parent=lane, order_rank=2)
+            for rt_ps, rcyc, st_ps, scyc, paired, addr, dx, dy in per_core[port]:
+                gid = dx * ny + dy
+                fid = uu.get(("flow", *tokens, port, rcyc)) if paired else None
+                emit_instant(builder, _ps_to_ns(rt_ps), pkt_lane, f"req->G{gid}",
+                             annos=[("addr", addr), ("dest", f"G{gid} ({dx},{dy})"),
+                                    ("req_cyc", rcyc),
+                                    ("lat_cyc", scyc - rcyc if paired else None)],
+                             flow_id=fid)
+                if paired:
+                    emit_instant(builder, _ps_to_ns(st_ps), pkt_lane, "resp",
+                                 annos=[("addr", addr), ("lat_cyc", scyc - rcyc),
+                                        ("resp_cyc", scyc)],
+                                 flow_id=fid, terminating=True)
 
 
 def emit_bank(builder, uu, bank_path, accesses, ny, period_ps, window_ns):
@@ -587,6 +646,10 @@ def main() -> int:
                          "pass it explicitly for a partial trace")
     ap.add_argument("--max-lines", type=int, default=None,
                     help="cap input lines per file (debug)")
+    ap.add_argument("--flows", action="store_true",
+                    help="emit NoC transaction flows: per-port 'packets' lane of "
+                         "instant req/resp markers connected by click-to-follow arrows "
+                         "(req<->resp paired by IoReq pointer)")
     args = ap.parse_args()
 
     for p in args.trace:
@@ -693,7 +756,7 @@ def main() -> int:
     for core in sorted(by_core):
         emit_core(builder, uu, core, by_core[core], a2l, args.window_ns, ny)
     for tile_path in sorted(noc):
-        emit_noc(builder, uu, tile_path, noc[tile_path], ny, period_ps)
+        emit_noc(builder, uu, tile_path, noc[tile_path], ny, period_ps, args.flows)
     for rm_path in sorted(rm):
         emit_redmule(builder, uu, rm_path, rm[rm_path], ny)
     for bank_path in sorted(banks):
@@ -714,6 +777,7 @@ def main() -> int:
           f"noc-itf: {len(noc)}  noc-reqs: {n_req}  noc-resps: {n_resp}  "
           f"noc-state: {n_noc_state}  period_ps: {period_ps:.0f}  "
           f"banks: {len(banks)}  bank-accesses: {n_bank_acc}  "
+          f"flows: {'on' if args.flows else 'off'}  "
           f"redmule: {len(rm)}  rm-state-lines: {n_rm_state}  "
           f"tracks: {uu._n}  ny={ny}{'' if args.ny is not None else ' (inferred)'}")
     print(f"wrote {out}  (open at https://ui.perfetto.dev)")
