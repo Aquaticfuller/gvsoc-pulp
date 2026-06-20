@@ -29,6 +29,22 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
+class SnitchCoreConfig:
+    isa:             str
+    zfinx:           bool
+    lsu_outstanding: int   # max outstanding scalar LSU requests
+
+
+@dataclass(frozen=True)
+class SnitchVectorConfig:
+    # Spatz-style vector unit folded into every SnitchMempool core.
+    vlen:             int   # RISCV VLEN in bits
+    nb_lanes:         int   # also the number of VLSU memory ports per core
+    lane_width:       int   # bytes per vector lane
+    vlsu_outstanding: int   # max outstanding VLSU requests per port
+
+
+@dataclass(frozen=True)
 class RedmuleConfig:
     # Systolic-array geometry (light_redmule swaps ce_height/ce_width internally).
     ce_height:   int
@@ -63,6 +79,10 @@ class TeranocConfig:
     # ports within a batch are shuffled.
     l1_noc_remap_batch_size:  int
     l1_noc_remap_shuffle:     bool
+    # SnitchMempool scalar core parameters, used with or without vector.
+    snitch:                   'SnitchCoreConfig'
+    # Optional per-Snitch vector unit. None = scalar SnitchMempool.
+    vector:                   'SnitchVectorConfig | None'
     # Optional in-tile HWPE; None = no RedMule. The first
     # nb_redmule_tiles_per_group tiles per group get one.
     redmule:                  'RedmuleConfig | None'
@@ -92,6 +112,28 @@ class TeranocConfig:
     def nb_axi_masters(self):
         return self.nb_axi_masters_per_group * self.nb_groups
     @property
+    def has_vector(self):
+        return self.vector is not None
+    @property
+    def vlsu_ports_per_core(self):
+        return 0 if self.vector is None else self.vector.nb_lanes
+    @property
+    def local_ports_per_snitch(self):
+        # Per-core local port block: scalar LSU, then that core's VLSU ports.
+        return 1 + self.vlsu_ports_per_core
+    def lsu_local_port_id(self, core_id: int) -> int:
+        return core_id * self.local_ports_per_snitch
+    def vlsu_local_port_id(self, core_id: int, port_id: int) -> int:
+        return self.lsu_local_port_id(core_id) + 1 + port_id
+    @property
+    def nb_vlsu_ports_per_tile(self):
+        return self.nb_snitch_per_tile * self.vlsu_ports_per_core
+    @property
+    def redmule_local_port_base(self):
+        return self.nb_snitch_per_tile * self.local_ports_per_snitch
+    def redmule_local_port_id(self, port_id: int) -> int:
+        return self.redmule_local_port_base + port_id
+    @property
     def has_redmule(self):
         return self.redmule is not None and self.nb_redmule_tiles_per_group > 0
     @property
@@ -108,12 +150,33 @@ class TeranocConfig:
         # Bytes redmule moves per cycle on its memory port.
         return 0 if self.redmule is None else self.redmule.req_width
     def nb_local_ports_for(self, has_redmule: bool) -> int:
-        # Snitch cores plus, with RedMule, the HWPE sub-ports.
-        return self.nb_snitch_per_tile + (self.redmule_bank_number if has_redmule else 0)
+        # Snitch data ports, optional VLSU ports, plus optional HWPE sub-ports.
+        return self.redmule_local_port_base + (
+            self.redmule_bank_number if has_redmule else 0)
     @property
     def nb_remote_ports(self):
         # 1 intra-group neighbor port + N inter-group NoC ports.
         return 1 + self.nb_remote_ports_per_tile
+
+
+SNITCHMEMPOOL_SCALAR = SnitchCoreConfig(
+    isa             = 'rv32imaf',
+    zfinx           = True,
+    lsu_outstanding = 8,
+)
+
+SNITCHMEMPOOL_VECTOR_CORE = SnitchCoreConfig(
+    isa             = 'rv32imafdcv',
+    zfinx           = True,
+    lsu_outstanding = 8,
+)
+
+SNITCHMEMPOOL_VECTOR = SnitchVectorConfig(
+    vlen             = 512,
+    nb_lanes         = 4,
+    lane_width       = 8,
+    vlsu_outstanding = 8,
+)
 
 
 TERANOC = TeranocConfig(
@@ -131,6 +194,8 @@ TERANOC = TeranocConfig(
     nb_l2_banks              = 16,
     l1_noc_remap_batch_size  = 4,
     l1_noc_remap_shuffle     = True,
+    snitch                  = SNITCHMEMPOOL_SCALAR,
+    vector                   = None,
     redmule                  = None,
     nb_redmule_tiles_per_group = 0,
 )
@@ -150,6 +215,8 @@ MEMPOOL_NOC = TeranocConfig(
     nb_l2_banks              = 4,
     l1_noc_remap_batch_size  = 4,
     l1_noc_remap_shuffle     = True,
+    snitch                  = SNITCHMEMPOOL_SCALAR,
+    vector                   = None,
     redmule                  = None,
     nb_redmule_tiles_per_group = 0,
 )
@@ -169,6 +236,8 @@ MINPOOL_NOC = TeranocConfig(
     nb_l2_banks              = 4,
     l1_noc_remap_batch_size  = 4,
     l1_noc_remap_shuffle     = True,
+    snitch                  = SNITCHMEMPOOL_SCALAR,
+    vector                   = None,
     redmule                  = None,
     nb_redmule_tiles_per_group = 0,
 )
@@ -188,6 +257,8 @@ TENSORPOOL64_NOC = TeranocConfig(
     nb_l2_banks              = 4,
     l1_noc_remap_batch_size  = 4,
     l1_noc_remap_shuffle     = True,
+    snitch                  = SNITCHMEMPOOL_SCALAR,
+    vector                   = None,
     redmule                  = RedmuleConfig(
         ce_height   = 16,
         ce_width    = 16,
@@ -213,6 +284,8 @@ TENSORPOOL256_NOC = TeranocConfig(
     nb_l2_banks              = 4,
     l1_noc_remap_batch_size  = 4,
     l1_noc_remap_shuffle     = True,
+    snitch                  = SNITCHMEMPOOL_SCALAR,
+    vector                   = None,
     redmule                  = RedmuleConfig(
         ce_height   = 8,
         ce_width    = 32,
@@ -223,6 +296,27 @@ TENSORPOOL256_NOC = TeranocConfig(
     nb_redmule_tiles_per_group = 1,
 )
 
+MINPOOL_VECTOR_NOC = TeranocConfig(
+    nb_snitch_per_tile       = 4,
+    nb_tiles_per_group       = 1,
+    nb_x_groups              = 2,
+    nb_y_groups              = 2,
+    bank_factor              = 4,
+    l1_bank_bytes            = 1024,
+    l1_bank_width            = 4,
+    nb_remote_ports_per_tile = 2,
+    axi_data_width           = 32,
+    nb_axi_masters_per_group = 1,
+    l2_size                  = 0x400000,
+    nb_l2_banks              = 4,
+    l1_noc_remap_batch_size  = 4,
+    l1_noc_remap_shuffle     = True,
+    snitch                  = SNITCHMEMPOOL_VECTOR_CORE,
+    vector                   = SNITCHMEMPOOL_VECTOR,
+    redmule                  = None,
+    nb_redmule_tiles_per_group = 0,
+)
+
 
 CONFIGS = {
     'teranoc':         TERANOC,
@@ -230,6 +324,7 @@ CONFIGS = {
     'minpool_noc':     MINPOOL_NOC,
     'tensorpool64_noc': TENSORPOOL64_NOC,
     'tensorpool256_noc': TENSORPOOL256_NOC,
+    'minpool_vector_noc': MINPOOL_VECTOR_NOC,
 }
 
 DEFAULT_CONFIG = 'teranoc'

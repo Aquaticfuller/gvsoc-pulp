@@ -28,7 +28,9 @@ from gvsoc.signature import IoV2SingleReq
 
 class SnitchMempoolConfig(RiscvConfig):
     nb_outstanding: int = cfg_field(default=1, dump=True,
-        desc="Max outstanding LSU requests.")
+        desc="Max outstanding scalar LSU requests.")
+    vlsu_nb_outstanding: int = cfg_field(default=8, dump=True,
+        desc="Max outstanding VLSU requests per vector memory port.")
     zfinx: bool = cfg_field(default=True, dump=True,
         desc="Single-precision FP on the integer register file (Zfinx).")
     lsu_v2: bool = cfg_field(default=False, dump=True,
@@ -87,9 +89,9 @@ class SnitchMempool(RiscvCommon):
 
         if isa_instance is None:
             if config.vector:
-                extensions = [Xdma(), Xf16(), Xf16alt(), Xf8(), XfvecSnitch(), Xfaux()]
+                extensions = [Xf16(), Xf8(), XfvecSnitch(), Xfaux()]
             else:
-                extensions = [Xf16(), Xf16alt(), Xf8(), XfvecSnitch(), Xfaux(),
+                extensions = [Xf16(), Xf8(), XfvecSnitch(), Xfaux(),
                               PulpV2(hwloop=False, elw=False)]
             isa_instance = cpu.iss.isa_gen.isa_riscv_gen.RiscvIsa(
                 'snitch_mempool_' + cache_key, config.isa, extensions=extensions)
@@ -114,7 +116,8 @@ class SnitchMempool(RiscvCommon):
         if config.vector:
             self._lsu_v2 = config.lsu_v2
             pulp.ara.ara_v2.attach(self, config.vlen, nb_lanes=config.nb_lanes,
-                use_spatz=True, lane_width=config.lane_width, vlsu_v2=config.lsu_v2)
+                use_spatz=True, lane_width=config.lane_width,
+                vlsu_v2=config.lsu_v2, nb_outstanding_reqs=config.vlsu_nb_outstanding)
 
     def o_VLSU(self, port: int, itf: gvsoc.systree.SlaveItf):
         self.itf_bind(f'vlsu_{port}', itf,
