@@ -60,10 +60,10 @@ class TeranocGroup(st.Component):
             l1_noc_resp_routers.append(L1NocEndpointRouter(self, f'l1_noc_resp_router_{i}', req_mode=False, nb_tiles_per_group=arch.nb_tiles_per_group, num_banks_per_tile=arch.nb_banks_per_tile, byte_offset=2))
 
         # L1 NoC Request Router Remapper
-        l1_noc_req_remapper = L1NocRouterRemapper(self, 'l1_noc_req_remapper', nb_ports=arch.nb_remote_ports_per_group, remap_batch_size=arch.l1_noc_remap_batch_size, shuffle=arch.l1_noc_remap_shuffle)
+        l1_noc_req_remapper = L1NocRouterRemapper(self, 'l1_noc_req_remapper', nb_ports=arch.nb_remote_ports_per_group, remap_batch_size=arch.l1_noc_req_remap_batch_size, shuffle=arch.l1_noc_remap_shuffle)
 
         # L1 NoC Response Router Remapper
-        l1_noc_resp_remapper = L1NocRouterRemapper(self, 'l1_noc_resp_remapper', nb_ports=arch.nb_remote_ports_per_group, remap_batch_size=arch.l1_noc_remap_batch_size, shuffle=arch.l1_noc_remap_shuffle)
+        l1_noc_resp_remapper = L1NocRouterRemapper(self, 'l1_noc_resp_remapper', nb_ports=arch.nb_remote_ports_per_group, remap_batch_size=arch.l1_noc_resp_remap_batch_size, shuffle=arch.l1_noc_remap_shuffle)
 
         # DMA network(virtual, to emulate multiple backends)
         # DMA TCDM Interleaver

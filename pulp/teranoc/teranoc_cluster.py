@@ -51,7 +51,7 @@ class TeranocCluster(st.Component):
         for i in range(0, arch.nb_x_groups):
             for j in range(0, arch.nb_y_groups):
                 for k in range(0, arch.nb_axi_masters_per_group):
-                    l2_addr_scrambler_list.append(L2AddressScrambler(self, f'l2_addr_scrambler_{i}_{j}_{k}', bypass=False, l2_base_addr=0x80000000, l2_size=arch.l2_size, nb_banks=arch.nb_l2_banks, bank_width=arch.axi_data_width, interleave=16))
+                    l2_addr_scrambler_list.append(L2AddressScrambler(self, f'l2_addr_scrambler_{i}_{j}_{k}', bypass=False, l2_base_addr=0x80000000, l2_size=arch.l2_size, nb_banks=arch.nb_l2_banks, bank_width=arch.axi_data_width, interleave=arch.l2_axi_interleave))
 
         ################################################################
         ##########               Design Bindings              ##########

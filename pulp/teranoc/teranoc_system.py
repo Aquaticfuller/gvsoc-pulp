@@ -138,10 +138,15 @@ class TeranocSystem(st.Component):
         self.loader = loader
 
         # L2 loader converter
-        l2_loader_converter = Converter(self, 'l2_loader_converter', output_width=axi_data_width*16, output_align=axi_data_width*16)
+        l2_loader_converter = Converter(self, 'l2_loader_converter',
+            output_width=axi_data_width*arch.l2_axi_interleave,
+            output_align=axi_data_width*arch.l2_axi_interleave)
 
         # L2 loader address scrambler
-        l2_loader_scrambler = L2AddressScrambler(self, 'l2_loader_scrambler', bypass=False, l2_base_addr=0x0, l2_size=arch.l2_size, nb_banks=arch.nb_l2_banks, bank_width=axi_data_width, interleave=16)
+        l2_loader_scrambler = L2AddressScrambler(self, 'l2_loader_scrambler',
+            bypass=False, l2_base_addr=0x0, l2_size=arch.l2_size,
+            nb_banks=arch.nb_l2_banks, bank_width=axi_data_width,
+            interleave=arch.l2_axi_interleave)
 
         #Dummy Memory
         dummy_mem = memory.Memory(self, 'dummy_mem', atomics=True, size=0x400000)
