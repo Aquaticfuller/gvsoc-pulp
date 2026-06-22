@@ -341,6 +341,17 @@ class SnitchCluster(gvsoc.systree.Component):
                 cache_cfg.interco.dynamic_offset = int(math.log2(cache_cfg.controller.cache_line_bytes))
             insitu_cache = InsituCacheTile(self, 'insitu_cache', config=cache_cfg)
 
+        # Per-core-private SPM (CachePool: the snrt crt0 sets the SAME sp VA for every hart — the per-hart
+        # stack offset is commented out — because the CachePool SPM/TCDM at TCDMStartAddr is per-core-private.
+        # A single shared TCDM corrupts once >1 core runs concurrently. When arch.private_spm is set, give
+        # each core its OWN memory for the TCDM range (default off → the shared TCDM, unchanged for spatz).
+        private_spm = getattr(arch, 'private_spm', False)
+        spms = []
+        if private_spm:
+            for c in range(0, arch.nb_core):
+                spms.append(memory.Memory(self, f'spm_{c}', size=arch.tcdm.area.size,
+                    atomics=True, width_log2=2))
+
         tcdm_port = 0
         for core_id in range(0, arch.nb_core):
             cores[core_id].o_DATA(cores_ico[core_id].i_INPUT())
@@ -350,6 +361,9 @@ class SnitchCluster(gvsoc.systree.Component):
                 # range on the wide_axi fan-out (see binding below).
                 cores_ico[core_id].o_MAP(insitu_cache.i_INPUT(tcdm_port),
                     base=arch.tcdm.area.base, size=arch.tcdm.area.size, rm_base=False)
+            elif private_spm:
+                cores_ico[core_id].o_MAP(spms[core_id].i_INPUT(),
+                    base=arch.tcdm.area.base, size=arch.tcdm.area.size, rm_base=True)
             else:
                 cores_ico[core_id].o_MAP(tcdm.i_INPUT(tcdm_port),
                     base=arch.tcdm.area.base, size=arch.tcdm.area.size, rm_base=True)

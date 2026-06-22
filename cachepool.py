@@ -55,7 +55,13 @@ UART_SIZE      = 0x0000_1000
 UNCACHED_BASE  = 0xA000_0000      # UNCACHED_REGION / L1D_ADDR default / .pdcp_src (common.ld)
 UNCACHED_SIZE  = 0x1000_0000      # up to 0xB0000000 (below the SPM at 0xBFFFF800)
 BOOT_CONTROL   = PERIPH_BASE + 0x20   # CLUSTER_BOOT_CONTROL — bootrom reads the entry here
-NB_CORE        = 4
+
+# Core count, selectable via env (MINIMAL=4 / FULL=16). The bootrom BOOTDATA core_count/tile_count must
+# match nb_core, so we pick the matching prebuilt bootrom blob (patched from the RTL bootrom.bin).
+NB_CORE        = int(os.environ.get('CACHEPOOL_NB_CORE', '4'))
+NB_TILE        = 4 if NB_CORE == 16 else 1
+BOOTROM_FILE   = 'pulp/cachepool/bootrom_cachepool_16.bin' if NB_CORE == 16 \
+                 else 'pulp/cachepool/bootrom_cachepool.bin'
 
 
 def _make_arch(target):
@@ -76,6 +82,9 @@ def _make_arch(target):
     # Let the cluster peripheral accept the CachePool register block (L1D-config / EOC@0x24) so the
     # unmodified snrt binaries don't fault; the barrier@0x10 / boot-control@0x20 already match the regmap.
     cluster.cachepool_periph = True
+    # Per-core-private SPM: the snrt crt0 gives every hart the same stack VA in the 2 KiB SPM (the RTL SPM
+    # is per-core-private). A shared SPM corrupts once >1 core runs — essential at 16 cores.
+    cluster.private_spm = True
     return cluster
 
 
@@ -94,7 +103,7 @@ class CachePoolSoc(gvsoc.systree.Component):
 
         # --- components ---
         rom = memory.memory.Memory(self, 'rom', size=BOOTROM_SIZE,
-            stim_file=self.get_file_path('pulp/cachepool/bootrom_cachepool.bin'))
+            stim_file=self.get_file_path(BOOTROM_FILE))
         narrow_axi = router.Router(self, 'narrow_axi', bandwidth=8)
         wide_axi   = router.Router(self, 'wide_axi', bandwidth=64)
         uart       = CachePoolUart(self, 'uart')
