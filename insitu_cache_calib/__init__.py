@@ -193,7 +193,21 @@ class InsituCacheCalib(st.Component):
             cache_cfg.controller.defer_refills = True
             cache_cfg.controller.refill_drain_cycles = int(
                 os.environ.get('INSITU_CALIB_REFILL_DRAIN', '3'))
-        cache_tile = InsituCacheTile(self, 'insitu_cache', config=cache_cfg)
+        # A5: multi-tile GROUP mode — build N structural tiles + per-port-class remote xbars, and drive
+        # tile 0's 5 ports; addresses whose TileID field selects another tile route cross-tile (shared L1).
+        if int(os.environ.get('INSITU_CALIB_GROUP', '0')) != 0:
+            import math
+            from cache.insitu.insitu_cache_group import InsituCacheGroup
+            cache_cfg.structural_tile = True
+            cache_cfg.use_structural_core = True
+            cache_cfg.num_tiles = int(os.environ.get('INSITU_CALIB_GROUP_TILES', '2'))
+            cache_cfg.num_remote_port_core = 1
+            cache_cfg.num_cores = 1            # 1 core/tile (the calib drives tile 0's 5 lanes)
+            cache_cfg.num_controllers = 1      # 1 bank/tile → TileID = addr[dynamic_offset +: log2(num_tiles)]
+            cache_cfg.interco.dynamic_offset = int(math.log2(cache_cfg.controller.cache_line_bytes))
+            cache_tile = InsituCacheGroup(self, 'insitu_cache', config=cache_cfg)
+        else:
+            cache_tile = InsituCacheTile(self, 'insitu_cache', config=cache_cfg)
 
         # --- Fixed-latency refill memory (twin of refill_mem_model.sv). ---
         mem = InsituCalibMem(self, 'l2', mem_latency=mem_latency, beat_gap=beat_gap,
