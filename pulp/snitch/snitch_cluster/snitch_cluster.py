@@ -50,7 +50,7 @@ if os.environ.get('USE_GVRUN') is None:
     class ClusterArch:
         def __init__(self, properties, base, first_hartid, auto_fetch=False,
                      boot_addr=0x0000_1000, use_insitu_cache=False, insitu_cache_cfg=None,
-                     use_structural_insitu_cache=False):
+                     use_structural_insitu_cache=False, use_cachepool_group=False):
             self.nb_core = properties.nb_core_per_cluster
             self.base = base
             self.first_hartid = first_hartid
@@ -76,6 +76,7 @@ if os.environ.get('USE_GVRUN') is None:
             self.use_insitu_cache = use_insitu_cache
             self.insitu_cache_cfg = insitu_cache_cfg  # InsituCacheTileConfig or None
             self.use_structural_insitu_cache = use_structural_insitu_cache
+            self.use_cachepool_group = use_cachepool_group
 
         class Tcdm:
             def __init__(self, base, nb_masters):
@@ -284,7 +285,21 @@ class SnitchCluster(gvsoc.systree.Component):
         # this falls through to the legacy direct core↔TCDM path — no behavior change.
         # See prompt/insitu_cache_gvsoc_plan.md §5.
         insitu_cache = None
-        if arch.use_insitu_cache:
+        if arch.use_insitu_cache and getattr(arch, 'use_cachepool_group', False):
+            # Multi-tile InsituCacheGroup (RTL cachepool_fpu_512: 4 tiles × 4 cores, shared L1 across
+            # tiles via the remote xbars). Same i_INPUT(port)/o_L2 facade as the tile, so the binding
+            # loop below is unchanged (core c lane j → port c*5+j → tile c//4, local core c%4, lane j).
+            from cache.insitu.insitu_cache_config import make_cachepool_fpu_512_config
+            from cache.insitu.insitu_cache_group import InsituCacheGroup
+            cache_cfg = make_cachepool_fpu_512_config()   # per-tile config (num_tiles=4, 4 cores/tile)
+            assert arch.nb_core == cache_cfg.num_tiles * cache_cfg.num_cores, (
+                f"use_cachepool_group needs nb_core = num_tiles*cores_per_tile = "
+                f"{cache_cfg.num_tiles * cache_cfg.num_cores}, got soc/cluster/nb_core={arch.nb_core}")
+            cache_cfg.tcdm_ports_per_core = 1 + (arch.spatz_nb_lanes if arch.use_spatz else 0)
+            cache_cfg.controller.inline_sync_miss = True       # synchronous-slave (VLSU requires OK)
+            cache_cfg.controller.functional_writethrough = True
+            insitu_cache = InsituCacheGroup(self, 'insitu_cache', config=cache_cfg)
+        elif arch.use_insitu_cache:
             cache_cfg = arch.insitu_cache_cfg
             if cache_cfg is None:
                 cache_cfg = make_cachepool_512_config()

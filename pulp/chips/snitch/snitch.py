@@ -53,6 +53,9 @@ if os.environ.get('USE_GVRUN') is None:
             # Use the RTL-faithful STRUCTURAL tile (5 per-port-class xbars + per-core cells + sync-slave
             # core) instead of the flat calibrated tile. Default off (keeps the validated flat path).
             self.use_structural_insitu_cache = False
+            # Build the multi-tile InsituCacheGroup (RTL cachepool_fpu_512: 4 tiles × 4 cores) instead of a
+            # single tile. Requires use_structural_insitu_cache=True + soc/cluster/nb_core = num_tiles*4.
+            self.use_cachepool_group = False
 
 
         def declare_target_properties(self, target):
@@ -90,6 +93,11 @@ if os.environ.get('USE_GVRUN') is None:
             self.use_structural_insitu_cache = target.declare_user_property(
                 name='use_structural_insitu_cache', value=self.use_structural_insitu_cache, cast=bool,
                 description='Use the RTL-faithful structural InSitu tile (per-port-class xbars + cells)'
+            )
+
+            self.use_cachepool_group = target.declare_user_property(
+                name='use_cachepool_group', value=self.use_cachepool_group, cast=bool,
+                description='Build the multi-tile InsituCacheGroup (cachepool_fpu_512: 4 tiles x 4 cores)'
             )
 
 
@@ -140,7 +148,8 @@ if os.environ.get('USE_GVRUN') is None:
                         cluster_arch = ClusterArch(properties, self.get_cluster_base(id),
                             current_hartid,
                             use_insitu_cache=getattr(properties, 'use_insitu_cache', False),
-                            use_structural_insitu_cache=getattr(properties, 'use_structural_insitu_cache', False))
+                            use_structural_insitu_cache=getattr(properties, 'use_structural_insitu_cache', False),
+                            use_cachepool_group=getattr(properties, 'use_cachepool_group', False))
                         self.clusters.append(cluster_arch)
                         current_hartid += self.clusters[id].nb_core
 
