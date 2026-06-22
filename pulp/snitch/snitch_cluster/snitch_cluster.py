@@ -240,7 +240,8 @@ class SnitchCluster(gvsoc.systree.Component):
         # Cluster peripherals
         if arch.use_spatz:
             cluster_registers = pulp.snitch.snitch_cluster.spatz.cluster_registers.ClusterRegisters(
-                self, 'cluster_registers', nb_cores=arch.nb_core, boot_addr=entry)
+                self, 'cluster_registers', nb_cores=arch.nb_core, boot_addr=entry,
+                cachepool=getattr(arch, 'cachepool_periph', False))
         else:
             cluster_registers = pulp.snitch.snitch_cluster.cluster_registers.ClusterRegisters(
                 self, 'cluster_registers', nb_cores=arch.nb_core, boot_addr=entry)
