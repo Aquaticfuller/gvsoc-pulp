@@ -50,6 +50,9 @@ if os.environ.get('USE_GVRUN') is None:
             # prompt/insitu_cache_gvsoc_plan.md). Disabled by default — no perf impact on
             # legacy runs.
             self.use_insitu_cache        = False
+            # Use the RTL-faithful STRUCTURAL tile (5 per-port-class xbars + per-core cells + sync-slave
+            # core) instead of the flat calibrated tile. Default off (keeps the validated flat path).
+            self.use_structural_insitu_cache = False
 
 
         def declare_target_properties(self, target):
@@ -82,6 +85,11 @@ if os.environ.get('USE_GVRUN') is None:
             self.use_insitu_cache = target.declare_user_property(
                 name='use_insitu_cache', value=self.use_insitu_cache, cast=bool,
                 description='Insert an InSitu L1 data cache between cores and the cluster TCDM'
+            )
+
+            self.use_structural_insitu_cache = target.declare_user_property(
+                name='use_structural_insitu_cache', value=self.use_structural_insitu_cache, cast=bool,
+                description='Use the RTL-faithful structural InSitu tile (per-port-class xbars + cells)'
             )
 
 
@@ -131,7 +139,8 @@ if os.environ.get('USE_GVRUN') is None:
                     for id in range(0, self.nb_cluster):
                         cluster_arch = ClusterArch(properties, self.get_cluster_base(id),
                             current_hartid,
-                            use_insitu_cache=getattr(properties, 'use_insitu_cache', False))
+                            use_insitu_cache=getattr(properties, 'use_insitu_cache', False),
+                            use_structural_insitu_cache=getattr(properties, 'use_structural_insitu_cache', False))
                         self.clusters.append(cluster_arch)
                         current_hartid += self.clusters[id].nb_core
 
