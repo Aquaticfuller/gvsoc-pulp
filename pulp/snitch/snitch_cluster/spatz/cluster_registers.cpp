@@ -214,11 +214,13 @@ bool ClusterRegisters::cachepool_access(uint64_t offset, int size, uint8_t *data
         }
         return true;
     }
-    // L1D-config block (0x28..0x4c): RW scratch. FLUSH_STATUS (0x3c) always reads 0 (l1d_wait spins on it
-    // until 0). The structural cache is not yet wired to these (FULL-path); functionally benign for boot.
-    if (offset >= 0x28 && offset <= 0x4c)
+    // CachePool peripheral block not in the spatz regmap: ICACHE_PREFETCH(0x14)/SPATZ_STATUS(0x18)/
+    // SPATZ_CYCLE(0x1c) + L1D-config(0x28..0x4c). RW scratch; FLUSH_STATUS(0x3c) always reads 0 (l1d_wait
+    // spins until 0). 0x20 (boot-control) is left to the regmap. The structural cache is not yet wired to
+    // these (FULL-path); functionally benign (SPATZ_CYCLE feeds only a cosmetic perf print).
+    if (offset >= 0x14 && offset <= 0x4c && offset != 0x20)
     {
-        int idx = (int)((offset - 0x28) / 4);
+        int idx = (int)((offset - 0x14) / 4);
         int n = size < 4 ? (int)size : 4;
         if (is_write)
         {
