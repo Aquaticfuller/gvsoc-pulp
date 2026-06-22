@@ -71,7 +71,14 @@ def _make_arch(target):
     props.declare_target_properties(target)
     props.nb_core_per_cluster = NB_CORE   # keep MINIMAL fixed at 4 (bootrom BOOTDATA core_count=4)
 
-    cluster = ClusterArch(props, SPM_BASE, 0, use_insitu_cache=False)
+    # Opt-in: route the cores' CACHED-DRAM accesses through the structural InSitu cache (the project's
+    # whole point). Default off → cores hit DRAM directly (the validated functional path). With the cache:
+    # 16-core → the 4-tile InsituCacheGroup; 4-core → a single structural tile. SPM stays per-tile/direct.
+    use_cache = int(os.environ.get('CACHEPOOL_USE_CACHE', '0')) != 0
+    cluster = ClusterArch(props, SPM_BASE, 0,
+        use_insitu_cache=use_cache,
+        use_structural_insitu_cache=use_cache,
+        use_cachepool_group=(use_cache and NB_CORE == 16))
     # Rebase the cluster local memory to the 2 KiB SPM (adjacent to the peripheral) and the peripheral
     # to 0xC0000000 (the snitch default would put TCDM=128 KiB and peripheral=base+0x20000).
     cluster.tcdm.area = Area(SPM_BASE, SPM_SIZE)
@@ -88,6 +95,11 @@ def _make_arch(target):
     # 4 per-tile SPMs. (A single shared SPM collides 16 stacks; fully per-core breaks shared l1alloc.)
     cluster.private_spm = True
     cluster.spm_num_groups = NB_TILE
+    if use_cache:
+        # The cache fronts the RTL cached PMA [0x80000000, 0x84000000) (64 MiB, where the benchmark data
+        # lives); the SPM (stack) + uncached DRAM + peripheral/UART stay direct. Refills route DRAM-range
+        # via the cluster wide_axi → o_WIDE_SOC → the SoC DRAM (the TCDM range is the only local map).
+        cluster.cache_region = Area(DRAM_BASE, 0x0400_0000)
     return cluster
 
 

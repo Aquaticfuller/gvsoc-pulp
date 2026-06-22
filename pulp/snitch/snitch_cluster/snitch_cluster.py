@@ -357,10 +357,22 @@ class SnitchCluster(gvsoc.systree.Component):
                 spms.append(memory.Memory(self, f'spm_{g}', size=arch.tcdm.area.size,
                     atomics=True, width_log2=2))
 
+        # CachePool: the cache fronts a CACHED DRAM region (where the benchmark data lives), not the
+        # TCDM/SPM — the SPM (stack) stays direct (per-tile). When arch.cache_region is set, the scalar
+        # routes [SPM→per-tile SPM, cache_region→cache, rest→SoC]; default (spatz) = cache over the TCDM.
+        cache_region = getattr(arch, 'cache_region', None)
+
         tcdm_port = 0
         for core_id in range(0, arch.nb_core):
             cores[core_id].o_DATA(cores_ico[core_id].i_INPUT())
-            if arch.use_insitu_cache:
+            if arch.use_insitu_cache and cache_region is not None:
+                # SPM (stack) → per-tile private SPM; cached DRAM region → cache (absolute addrs so the
+                # cache's refill/evict land in DRAM via the wide_axi → o_WIDE_SOC fan-out); rest → SoC.
+                cores_ico[core_id].o_MAP(spms[core_id // cores_per_spm].i_INPUT(),
+                    base=arch.tcdm.area.base, size=arch.tcdm.area.size, rm_base=True)
+                cores_ico[core_id].o_MAP(insitu_cache.i_INPUT(tcdm_port),
+                    base=cache_region.base, size=cache_region.size, rm_base=False)
+            elif arch.use_insitu_cache:
                 # Cached TCDM access goes through the cache. We keep absolute addresses
                 # (rm_base=False) so the cache's refill/evict requests land in the correct
                 # range on the wide_axi fan-out (see binding below).
