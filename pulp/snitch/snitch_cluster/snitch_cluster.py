@@ -49,7 +49,8 @@ if os.environ.get('USE_GVRUN') is None:
 
     class ClusterArch:
         def __init__(self, properties, base, first_hartid, auto_fetch=False,
-                     boot_addr=0x0000_1000, use_insitu_cache=False, insitu_cache_cfg=None):
+                     boot_addr=0x0000_1000, use_insitu_cache=False, insitu_cache_cfg=None,
+                     use_structural_insitu_cache=False):
             self.nb_core = properties.nb_core_per_cluster
             self.base = base
             self.first_hartid = first_hartid
@@ -74,6 +75,7 @@ if os.environ.get('USE_GVRUN') is None:
             # direct core↔TCDM path exactly as before.
             self.use_insitu_cache = use_insitu_cache
             self.insitu_cache_cfg = insitu_cache_cfg  # InsituCacheTileConfig or None
+            self.use_structural_insitu_cache = use_structural_insitu_cache
 
         class Tcdm:
             def __init__(self, base, nb_masters):
@@ -307,6 +309,20 @@ class SnitchCluster(gvsoc.systree.Component):
             # These force the data-carrying path; open-loop calib leaves them off (its default).
             cache_cfg.controller.inline_sync_miss = True
             cache_cfg.controller.functional_writethrough = True
+            # Opt-in RTL-faithful STRUCTURAL tile (5 per-port-class xbars + per-core cells + the
+            # synchronous-slave core). Needs num_controllers == num_cores (the per-core-cell binding) →
+            # controllers_track_cores; line-granular routing (dynamic_offset = log2(line)) so an access
+            # never spans the bank-interleave granule (the structural xbar routes a whole access to one
+            # bank, unlike the flat interco which splits). cell_coalescer OFF (can't batch under sequential
+            # sync delivery), amo_lane OFF (no atomics in the bring-up). Default off → the flat tile.
+            if getattr(arch, 'use_structural_insitu_cache', False):
+                cache_cfg.structural_tile = True
+                cache_cfg.cell_coalescer = False
+                cache_cfg.amo_lane = False
+                cache_cfg.controllers_track_cores = True
+                cache_cfg.num_controllers = arch.nb_core
+                import math
+                cache_cfg.interco.dynamic_offset = int(math.log2(cache_cfg.controller.cache_line_bytes))
             insitu_cache = InsituCacheTile(self, 'insitu_cache', config=cache_cfg)
 
         tcdm_port = 0
