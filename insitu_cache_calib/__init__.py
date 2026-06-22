@@ -142,6 +142,14 @@ class InsituCacheCalib(st.Component):
         # default so the committed calib numbers (calibrated controller) are untouched.
         if int(os.environ.get('INSITU_CALIB_STRUCTURAL_CORE', '0')) != 0:
             cache_cfg.use_structural_core = True
+        # Structural-TILE open-loop bring-up hook: build the RTL-faithful tile (5 per-port-class xbars +
+        # per-core multi-lane cells) and force num_controllers=N banks so the 5 driver ports (one core's
+        # 5 lanes) route ACROSS banks by address — exercising the shared-L1 per-port-class routing +
+        # end-to-end data correctness. Off by default (the committed calib numbers use the flat tile).
+        if int(os.environ.get('INSITU_CALIB_STRUCTURAL_TILE', '0')) != 0:
+            cache_cfg.structural_tile = True
+            cache_cfg.use_structural_core = True
+            cache_cfg.num_controllers = int(os.environ.get('INSITU_CALIB_STRUCT_BANKS', '4'))
         cache_cfg.controller.refill_beat_bytes = refill_beat   # single-beat in wide mode
         # Alignment-investigation override (real-trace replay only): raise the coalescer's
         # warm-hit gate so same-cycle same-line reads merge even while their line's refill is
