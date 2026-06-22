@@ -150,6 +150,9 @@ class InsituCacheCalib(st.Component):
             cache_cfg.structural_tile = True
             cache_cfg.use_structural_core = True
             cache_cfg.num_controllers = int(os.environ.get('INSITU_CALIB_STRUCT_BANKS', '4'))
+            # A2: insert the structural per-cell par_coalescer (4 VLSU lanes merge; scalar bypasses).
+            if int(os.environ.get('INSITU_CALIB_CELL_COALESCER', '0')) != 0:
+                cache_cfg.cell_coalescer = True
         cache_cfg.controller.refill_beat_bytes = refill_beat   # single-beat in wide mode
         # Alignment-investigation override (real-trace replay only): raise the coalescer's
         # warm-hit gate so same-cycle same-line reads merge even while their line's refill is
