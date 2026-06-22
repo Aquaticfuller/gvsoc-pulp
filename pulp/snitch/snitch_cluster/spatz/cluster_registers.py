@@ -21,14 +21,18 @@ import regmap.regmap_c_header
 
 class ClusterRegisters(gvsoc.systree.Component):
 
-    def __init__(self, parent, name, boot_addr=0, nb_cores=1, binary=None):
+    def __init__(self, parent, name, boot_addr=0, nb_cores=1, binary=None, cachepool=False):
         super(ClusterRegisters, self).__init__(parent, name)
 
         self.add_sources(['pulp/snitch/snitch_cluster/spatz/cluster_registers.cpp'])
 
         self.add_properties({
             'boot_addr': boot_addr,
-            'nb_cores': nb_cores
+            'nb_cores': nb_cores,
+            # CachePool mode: also accept the CachePool peripheral register block (L1D-config 0x28..0x4c
+            # as RW scratch, FLUSH_STATUS 0x3c reads 0, EOC 0x24 -> quit) so the unmodified snrt CachePool
+            # binaries don't fault on "invalid register". Default off -> the spatz regmap is unchanged.
+            'cachepool': cachepool,
         })
 
     def gen(self, builddir, installdir):

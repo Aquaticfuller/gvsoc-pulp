@@ -43,8 +43,13 @@ private:
     void cl_clint_set_req(uint64_t reg_offset, int size, uint8_t *value, bool is_write);
     void cl_clint_clear_req(uint64_t reg_offset, int size, uint8_t *value, bool is_write);
     void hw_barrier_req(uint64_t reg_offset, int size, uint8_t *value, bool is_write);
+    // CachePool-mode interception of the CachePool peripheral register block (offsets absent from the
+    // spatz regmap). Returns true if handled (quit / scratch RW); false to fall through to the regmap.
+    bool cachepool_access(uint64_t offset, int size, uint8_t *data, bool is_write);
 
     vp::Trace     trace;
+    bool          cachepool_mode = false;
+    uint32_t      cp_l1d[16] = {0};   // CachePool L1D-config block (0x28..0x4c) RW scratch
 
     vp_regmap_cluster_periph regmap;
 
@@ -74,6 +79,8 @@ ClusterRegisters::ClusterRegisters(vp::ComponentConf &config)
 
     this->bootaddr = this->get_js_config()->get("boot_addr")->get_int();
     this->nb_cores = this->get_js_config()->get("nb_cores")->get_int();
+    auto cp = this->get_js_config()->get("cachepool");
+    this->cachepool_mode = (cp != NULL) && cp->get_bool();
 
     this->in.set_req_meth(&ClusterRegisters::req);
     this->new_slave_port("input", &this->in);
@@ -135,6 +142,13 @@ vp::IoReqStatus ClusterRegisters::core_req(vp::Block *__this, vp::IoReq *req, in
         return vp::IO_REQ_OK;
     }
 
+    // CachePool register block (L1D-config / EOC@0x24) not present in the spatz regmap.
+    if (_this->cachepool_mode && _this->cachepool_access(offset, size, data, is_write))
+    {
+        req->inc_latency(1);
+        return vp::IO_REQ_OK;
+    }
+
     _this->regmap.access(offset, size, data, is_write);
 
     // Barrier insert 10 cycle stall even for last one to wake-up, seem the request go through AXI
@@ -176,9 +190,48 @@ vp::IoReqStatus ClusterRegisters::req(vp::Block *__this, vp::IoReq *req)
         return vp::IO_REQ_OK;
     }
 
+    if (_this->cachepool_mode && _this->cachepool_access(offset, size, data, is_write))
+    {
+        return vp::IO_REQ_OK;
+    }
+
     _this->regmap.access(offset, size, data, is_write);
 
     return vp::IO_REQ_OK;
+}
+
+bool ClusterRegisters::cachepool_access(uint64_t offset, int size, uint8_t *data, bool is_write)
+{
+    // CLUSTER_EOC_EXIT (0x24): write with bit0 set -> end of computation; quit with retval = bits[3:1].
+    if (offset == 0x24)
+    {
+        if (is_write && data != NULL && (data[0] & 0x1))
+        {
+            int retval = (data[0] >> 1) & 0x7;
+            fprintf(stderr, "[EOC] Simulation exiting: retval=%d cycles=%ld\n",
+                    retval, (long)this->clock.get_cycles());
+            this->time.get_engine()->quit(retval);
+        }
+        return true;
+    }
+    // L1D-config block (0x28..0x4c): RW scratch. FLUSH_STATUS (0x3c) always reads 0 (l1d_wait spins on it
+    // until 0). The structural cache is not yet wired to these (FULL-path); functionally benign for boot.
+    if (offset >= 0x28 && offset <= 0x4c)
+    {
+        int idx = (int)((offset - 0x28) / 4);
+        int n = size < 4 ? (int)size : 4;
+        if (is_write)
+        {
+            if (data != NULL) memcpy(&this->cp_l1d[idx], data, n);
+        }
+        else if (data != NULL)
+        {
+            uint32_t v = (offset == 0x3c) ? 0 : this->cp_l1d[idx];
+            memcpy(data, &v, n);
+        }
+        return true;
+    }
+    return false;
 }
 
 void ClusterRegisters::barrier_sync(vp::Block *__this, bool value, int id)
