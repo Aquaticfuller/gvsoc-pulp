@@ -156,6 +156,10 @@ class InsituCacheCalib(st.Component):
             # A3: insert the AMO/LR-SC shim on the scalar lane of each cell.
             if int(os.environ.get('INSITU_CALIB_AMO_LANE', '0')) != 0:
                 cache_cfg.amo_lane = True
+            # A4: synchronous-slave mode (the core resolves in-call + returns IO_REQ_OK). Validates the
+            # closed-loop sync path on the (light) calib build before the heavy spatz build.
+            if int(os.environ.get('INSITU_CALIB_INLINE_SYNC', '0')) != 0:
+                cache_cfg.controller.inline_sync_miss = True
         cache_cfg.controller.refill_beat_bytes = refill_beat   # single-beat in wide mode
         # Alignment-investigation override (real-trace replay only): raise the coalescer's
         # warm-hit gate so same-cycle same-line reads merge even while their line's refill is
