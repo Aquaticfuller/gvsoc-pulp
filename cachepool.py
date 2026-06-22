@@ -82,9 +82,12 @@ def _make_arch(target):
     # Let the cluster peripheral accept the CachePool register block (L1D-config / EOC@0x24) so the
     # unmodified snrt binaries don't fault; the barrier@0x10 / boot-control@0x20 already match the regmap.
     cluster.cachepool_periph = True
-    # Per-core-private SPM: the snrt crt0 gives every hart the same stack VA in the 2 KiB SPM (the RTL SPM
-    # is per-core-private). A shared SPM corrupts once >1 core runs — essential at 16 cores.
+    # Per-TILE-shared SPM (the CachePool organization): the snrt crt0 gives every hart the same stack VA in
+    # the 2 KiB SPM, and l1alloc shares it within a tile, so cores in a tile share one SPM and the tiles have
+    # separate SPMs. 1 group (4-core) = one shared SPM (the passing MINIMAL case); NB_TILE groups (16-core) =
+    # 4 per-tile SPMs. (A single shared SPM collides 16 stacks; fully per-core breaks shared l1alloc.)
     cluster.private_spm = True
+    cluster.spm_num_groups = NB_TILE
     return cluster
 
 

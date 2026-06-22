@@ -346,10 +346,15 @@ class SnitchCluster(gvsoc.systree.Component):
         # A single shared TCDM corrupts once >1 core runs concurrently. When arch.private_spm is set, give
         # each core its OWN memory for the TCDM range (default off → the shared TCDM, unchanged for spatz).
         private_spm = getattr(arch, 'private_spm', False)
+        # Number of independent SPM instances. 1 = one shared SPM (16 stacks collide); nb_core = per-core
+        # (breaks shared l1alloc); num_tiles = per-tile (cores in a tile share one SPM — the CachePool
+        # organization). Default = nb_core (per-core) when private_spm and unset.
+        spm_groups = getattr(arch, 'spm_num_groups', arch.nb_core) if private_spm else 0
+        cores_per_spm = (arch.nb_core // spm_groups) if spm_groups else 1
         spms = []
         if private_spm:
-            for c in range(0, arch.nb_core):
-                spms.append(memory.Memory(self, f'spm_{c}', size=arch.tcdm.area.size,
+            for g in range(0, spm_groups):
+                spms.append(memory.Memory(self, f'spm_{g}', size=arch.tcdm.area.size,
                     atomics=True, width_log2=2))
 
         tcdm_port = 0
@@ -362,7 +367,7 @@ class SnitchCluster(gvsoc.systree.Component):
                 cores_ico[core_id].o_MAP(insitu_cache.i_INPUT(tcdm_port),
                     base=arch.tcdm.area.base, size=arch.tcdm.area.size, rm_base=False)
             elif private_spm:
-                cores_ico[core_id].o_MAP(spms[core_id].i_INPUT(),
+                cores_ico[core_id].o_MAP(spms[core_id // cores_per_spm].i_INPUT(),
                     base=arch.tcdm.area.base, size=arch.tcdm.area.size, rm_base=True)
             else:
                 cores_ico[core_id].o_MAP(tcdm.i_INPUT(tcdm_port),
