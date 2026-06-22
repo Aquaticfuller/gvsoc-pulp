@@ -153,6 +153,9 @@ class InsituCacheCalib(st.Component):
             # A2: insert the structural per-cell par_coalescer (4 VLSU lanes merge; scalar bypasses).
             if int(os.environ.get('INSITU_CALIB_CELL_COALESCER', '0')) != 0:
                 cache_cfg.cell_coalescer = True
+            # A3: insert the AMO/LR-SC shim on the scalar lane of each cell.
+            if int(os.environ.get('INSITU_CALIB_AMO_LANE', '0')) != 0:
+                cache_cfg.amo_lane = True
         cache_cfg.controller.refill_beat_bytes = refill_beat   # single-beat in wide mode
         # Alignment-investigation override (real-trace replay only): raise the coalescer's
         # warm-hit gate so same-cycle same-line reads merge even while their line's refill is
