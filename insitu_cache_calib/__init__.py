@@ -193,18 +193,14 @@ class InsituCacheCalib(st.Component):
             cache_cfg.controller.defer_refills = True
             cache_cfg.controller.refill_drain_cycles = int(
                 os.environ.get('INSITU_CALIB_REFILL_DRAIN', '3'))
-        # A5: multi-tile GROUP mode — build N structural tiles + per-port-class remote xbars, and drive
-        # tile 0's 5 ports; addresses whose TileID field selects another tile route cross-tile (shared L1).
+        # A5: multi-tile GROUP mode — build the RTL cachepool_fpu_512 group (4 tiles × 4 cores,
+        # num_remote_ports_per_tile=2) and drive tile-0/core-0's 5 ports; addresses whose TileID field
+        # selects another tile route cross-tile (shared L1). Matches config/cachepool_fpu_512.mk.
         if int(os.environ.get('INSITU_CALIB_GROUP', '0')) != 0:
-            import math
+            from cache.insitu.insitu_cache_config import make_cachepool_fpu_512_config
             from cache.insitu.insitu_cache_group import InsituCacheGroup
-            cache_cfg.structural_tile = True
-            cache_cfg.use_structural_core = True
-            cache_cfg.num_tiles = int(os.environ.get('INSITU_CALIB_GROUP_TILES', '2'))
-            cache_cfg.num_remote_port_core = 1
-            cache_cfg.num_cores = 1            # 1 core/tile (the calib drives tile 0's 5 lanes)
-            cache_cfg.num_controllers = 1      # 1 bank/tile → TileID = addr[dynamic_offset +: log2(num_tiles)]
-            cache_cfg.interco.dynamic_offset = int(math.log2(cache_cfg.controller.cache_line_bytes))
+            cache_cfg = make_cachepool_fpu_512_config()
+            cache_cfg.controller.refill_beat_bytes = refill_beat
             cache_tile = InsituCacheGroup(self, 'insitu_cache', config=cache_cfg)
         else:
             cache_tile = InsituCacheTile(self, 'insitu_cache', config=cache_cfg)
