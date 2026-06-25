@@ -75,10 +75,11 @@ def _make_arch(target):
     # 4-lane concurrency effect vs the sync-slave single-outstanding assumption.
     props.spatz_nb_lanes = int(os.environ.get('CACHEPOOL_VLSU_LANES', '4'))
 
-    # Opt-in: route the cores' CACHED-DRAM accesses through the structural InSitu cache (the project's
-    # whole point). Default off → cores hit DRAM directly (the validated functional path). With the cache:
-    # 16-core → the 4-tile InsituCacheGroup; 4-core → a single structural tile. SPM stays per-tile/direct.
-    use_cache = int(os.environ.get('CACHEPOOL_USE_CACHE', '0')) != 0
+    # Route the cores' CACHED-DRAM accesses through the structural InSitu cache (the project's whole point)
+    # — the "complete" CachePool model. DEFAULT ON. With the cache: 16-core → the 4-tile InsituCacheGroup;
+    # 4-core → a single structural tile. SPM stays per-tile/direct. Set CACHEPOOL_USE_CACHE=0 to bypass the
+    # cache (cores hit DRAM directly — the faster functional path, used to A/B the known with-cache bug).
+    use_cache = int(os.environ.get('CACHEPOOL_USE_CACHE', '1')) != 0
     cluster = ClusterArch(props, SPM_BASE, 0,
         use_insitu_cache=use_cache,
         use_structural_insitu_cache=use_cache,
