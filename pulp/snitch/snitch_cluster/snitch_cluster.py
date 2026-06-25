@@ -330,11 +330,15 @@ class SnitchCluster(gvsoc.systree.Component):
             # controllers_track_cores; line-granular routing (dynamic_offset = log2(line)) so an access
             # never spans the bank-interleave granule (the structural xbar routes a whole access to one
             # bank, unlike the flat interco which splits). cell_coalescer OFF (can't batch under sequential
-            # sync delivery), amo_lane OFF (no atomics in the bring-up). Default off → the flat tile.
+            # sync delivery). amo_lane ON: the scalar lane (n_ppc-1) carries the core's atomics (snrt_mutex =
+            # amoswap on a cached lock word); without the LR/SC-AMO shim a cached atomic is a plain write and
+            # the cross-core mutex provides no mutual exclusion (1 core OK, 2+ cores → overlapping prints /
+            # data races). The shim sits on lane n_ppc-1, so the scalar MUST be wired to that lane (see the
+            # cache_region port assignment below). Default off → the flat tile.
             if getattr(arch, 'use_structural_insitu_cache', False):
                 cache_cfg.structural_tile = True
                 cache_cfg.cell_coalescer = False
-                cache_cfg.amo_lane = False
+                cache_cfg.amo_lane = True
                 cache_cfg.controllers_track_cores = True
                 cache_cfg.num_controllers = arch.nb_core
                 import math
@@ -368,9 +372,14 @@ class SnitchCluster(gvsoc.systree.Component):
             if arch.use_insitu_cache and cache_region is not None:
                 # SPM (stack) → per-tile private SPM; cached DRAM region → cache (absolute addrs so the
                 # cache's refill/evict land in DRAM via the wide_axi → o_WIDE_SOC fan-out); rest → SoC.
+                # SCALAR → tile lane n_ppc-1 (the AMO/LR-SC shim lane). The tile maps i_INPUT(p)→lane p%n_ppc,
+                # so the scalar uses port core*n_ppc+(n_ppc-1); the VLSU lanes take 0..n_ppc-2 (below). This is
+                # the RTL ordering (scalar = last lane) and is required for the structural-cache AMO shim to
+                # mediate the scalar's atomics. n_ppc = 1 scalar + spatz_nb_lanes.
+                n_ppc = 1 + (arch.spatz_nb_lanes if arch.use_spatz else 0)
                 cores_ico[core_id].o_MAP(spms[core_id // cores_per_spm].i_INPUT(),
                     base=arch.tcdm.area.base, size=arch.tcdm.area.size, rm_base=True)
-                cores_ico[core_id].o_MAP(insitu_cache.i_INPUT(tcdm_port),
+                cores_ico[core_id].o_MAP(insitu_cache.i_INPUT(core_id * n_ppc + (n_ppc - 1)),
                     base=cache_region.base, size=cache_region.size, rm_base=False)
             elif arch.use_insitu_cache:
                 # Cached TCDM access goes through the cache. We keep absolute addresses
@@ -396,7 +405,8 @@ class SnitchCluster(gvsoc.systree.Component):
                         vico = router.Router(self, f'pe{core_id}_vlsu{port}_ico',
                             bandwidth=arch.tcdm.bank_width)
                         cores[core_id].o_VLSU(port, vico.i_INPUT())
-                        vico.o_MAP(insitu_cache.i_INPUT(tcdm_port),
+                        # VLSU lane `port` → tile lane `port` (0..n_ppc-2); the scalar took lane n_ppc-1 above.
+                        vico.o_MAP(insitu_cache.i_INPUT(core_id * (1 + arch.spatz_nb_lanes) + port),
                             base=cache_region.base, size=cache_region.size, rm_base=False)
                         vico.o_MAP(spms[core_id // cores_per_spm].i_INPUT(),
                             base=arch.tcdm.area.base, size=arch.tcdm.area.size, rm_base=True)
