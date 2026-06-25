@@ -70,6 +70,10 @@ def _make_arch(target):
     props.nb_core_per_cluster = NB_CORE
     props.declare_target_properties(target)
     props.nb_core_per_cluster = NB_CORE   # keep MINIMAL fixed at 4 (bootrom BOOTDATA core_count=4)
+    # DEBUG knob: number of Spatz VLSU memory-access lanes (default 4). Setting CACHEPOOL_VLSU_LANES=1
+    # serializes the VLSU's memory accesses — used to isolate whether the cache-data bug under eviction is a
+    # 4-lane concurrency effect vs the sync-slave single-outstanding assumption.
+    props.spatz_nb_lanes = int(os.environ.get('CACHEPOOL_VLSU_LANES', '4'))
 
     # Opt-in: route the cores' CACHED-DRAM accesses through the structural InSitu cache (the project's
     # whole point). Default off → cores hit DRAM directly (the validated functional path). With the cache:

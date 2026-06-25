@@ -388,7 +388,20 @@ class SnitchCluster(gvsoc.systree.Component):
 
             if arch.use_spatz:
                 for port in range(0, arch.spatz_nb_lanes):
-                    if arch.use_insitu_cache:
+                    if arch.use_insitu_cache and cache_region is not None:
+                        # Address-route the VLSU lane like the scalar: only the cached-DRAM region goes
+                        # through the cache (its per-lane port); the SPM and the UNCACHED region (e.g. the
+                        # 0xA0000000 input arrays) bypass it. Without this the VLSU's huge uncached loads were
+                        # wrongly cached, creating input-size-proportional eviction pressure (the M32768 bug).
+                        vico = router.Router(self, f'pe{core_id}_vlsu{port}_ico',
+                            bandwidth=arch.tcdm.bank_width)
+                        cores[core_id].o_VLSU(port, vico.i_INPUT())
+                        vico.o_MAP(insitu_cache.i_INPUT(tcdm_port),
+                            base=cache_region.base, size=cache_region.size, rm_base=False)
+                        vico.o_MAP(spms[core_id // cores_per_spm].i_INPUT(),
+                            base=arch.tcdm.area.base, size=arch.tcdm.area.size, rm_base=True)
+                        vico.o_MAP(narrow_axi.i_INPUT())   # default: uncached (0xA0000000) + rest -> SoC
+                    elif arch.use_insitu_cache:
                         cores[core_id].o_VLSU(port, insitu_cache.i_INPUT(tcdm_port))
                     else:
                         cores[core_id].o_VLSU(port, tcdm.i_INPUT(tcdm_port))
