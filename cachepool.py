@@ -56,12 +56,38 @@ UNCACHED_BASE  = 0xA000_0000      # UNCACHED_REGION / L1D_ADDR default / .pdcp_s
 UNCACHED_SIZE  = 0x1000_0000      # up to 0xB0000000 (below the SPM at 0xBFFFF800)
 BOOT_CONTROL   = PERIPH_BASE + 0x20   # CLUSTER_BOOT_CONTROL — bootrom reads the entry here
 
-# Core count, selectable via env (MINIMAL=4 / FULL=16). The bootrom BOOTDATA core_count/tile_count must
-# match nb_core, so we pick the matching prebuilt bootrom blob (patched from the RTL bootrom.bin).
-NB_CORE        = int(os.environ.get('CACHEPOOL_NB_CORE', '4'))
-NB_TILE        = 4 if NB_CORE == 16 else 1
-BOOTROM_FILE   = 'pulp/cachepool/bootrom_cachepool_16.bin' if NB_CORE == 16 \
-                 else 'pulp/cachepool/bootrom_cachepool.bin'
+# Configurable topology. Explicit knobs (override): CACHEPOOL_NB_TILE, CACHEPOOL_CORES_PER_TILE,
+# CACHEPOOL_BANKS_PER_TILE (cache banks/cells per tile; power-of-two for the address routing; default =
+# cores/tile). Backward-compat: with only CACHEPOOL_NB_CORE set, 16 → 4 tiles × 4 cores (the RTL CachePool),
+# else 1 tile × NB_CORE. NB_CORE is derived = NB_TILE * CORES_PER_TILE.
+def _topology():
+    if any(k in os.environ for k in ('CACHEPOOL_NB_TILE', 'CACHEPOOL_CORES_PER_TILE', 'CACHEPOOL_BANKS_PER_TILE')):
+        nt  = int(os.environ.get('CACHEPOOL_NB_TILE', '1'))
+        cpt = int(os.environ.get('CACHEPOOL_CORES_PER_TILE', '4'))
+    else:
+        nc = int(os.environ.get('CACHEPOOL_NB_CORE', '4'))
+        nt, cpt = (4, 4) if nc == 16 else (1, nc)
+    bpt = int(os.environ.get('CACHEPOOL_BANKS_PER_TILE', str(cpt)))
+    return nt, cpt, bpt
+
+NB_TILE, CORES_PER_TILE, BANKS_PER_TILE = _topology()
+NB_CORE        = NB_TILE * CORES_PER_TILE
+# Base bootrom (RTL, self-contained). Its BOOTDATA core_count(@0x44)/tile_count(@0x68) are PATCHED at
+# load time to (NB_CORE / NB_TILE) — see _patch_bootrom — so any topology works from the one blob.
+BOOTROM_FILE   = 'pulp/cachepool/bootrom_cachepool.bin'
+
+
+def _patch_bootrom(base_path):
+    """Patch the base bootrom's BOOTDATA core_count(@0x44) + tile_count(@0x68) to match the topology,
+    writing a per-config temp blob and returning its path."""
+    import struct, tempfile
+    data = bytearray(open(base_path, 'rb').read())
+    struct.pack_into('<I', data, 0x44, NB_CORE)   # BOOTDATA core_count
+    struct.pack_into('<I', data, 0x68, NB_TILE)   # BOOTDATA tile_count
+    out = os.path.join(tempfile.gettempdir(), f'cachepool_bootrom_{NB_CORE}c_{NB_TILE}t.bin')
+    with open(out, 'wb') as f:
+        f.write(data)
+    return out
 
 
 def _make_arch(target):
@@ -83,7 +109,12 @@ def _make_arch(target):
     cluster = ClusterArch(props, SPM_BASE, 0,
         use_insitu_cache=use_cache,
         use_structural_insitu_cache=use_cache,
-        use_cachepool_group=(use_cache and NB_CORE == 16))
+        use_cachepool_group=(use_cache and NB_TILE > 1))
+    # Configurable topology, read by SnitchCluster when building the cache (group when >1 tile, else a
+    # single structural tile). banks_per_tile = cache cells per tile (power-of-two; may differ from cores).
+    cluster.cachepool_num_tiles = NB_TILE
+    cluster.cachepool_cores_per_tile = CORES_PER_TILE
+    cluster.cachepool_banks_per_tile = BANKS_PER_TILE
     # Rebase the cluster local memory to the 2 KiB SPM (adjacent to the peripheral) and the peripheral
     # to 0xC0000000 (the snitch default would put TCDM=128 KiB and peripheral=base+0x20000).
     cluster.tcdm.area = Area(SPM_BASE, SPM_SIZE)
@@ -123,7 +154,7 @@ class CachePoolSoc(gvsoc.systree.Component):
 
         # --- components ---
         rom = memory.memory.Memory(self, 'rom', size=BOOTROM_SIZE,
-            stim_file=self.get_file_path(BOOTROM_FILE))
+            stim_file=_patch_bootrom(self.get_file_path(BOOTROM_FILE)))
         narrow_axi = router.Router(self, 'narrow_axi', bandwidth=8)
         wide_axi   = router.Router(self, 'wide_axi', bandwidth=64)
         uart       = CachePoolUart(self, 'uart')

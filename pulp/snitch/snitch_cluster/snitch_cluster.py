@@ -292,13 +292,23 @@ class SnitchCluster(gvsoc.systree.Component):
             # loop below is unchanged (core c lane j → port c*5+j → tile c//4, local core c%4, lane j).
             from cache.insitu.insitu_cache_config import make_cachepool_fpu_512_config
             from cache.insitu.insitu_cache_group import InsituCacheGroup
-            cache_cfg = make_cachepool_fpu_512_config()   # per-tile config (num_tiles=4, 4 cores/tile)
+            cache_cfg = make_cachepool_fpu_512_config()   # base geometry/latencies; topology overridden below
+            # Configurable topology (cachepool.py): num_tiles / cores-per-tile / banks-per-tile.
+            cache_cfg.num_tiles       = getattr(arch, 'cachepool_num_tiles', cache_cfg.num_tiles)
+            cache_cfg.num_cores       = getattr(arch, 'cachepool_cores_per_tile', cache_cfg.num_cores)
+            cache_cfg.num_controllers = getattr(arch, 'cachepool_banks_per_tile', cache_cfg.num_controllers)
             assert arch.nb_core == cache_cfg.num_tiles * cache_cfg.num_cores, (
                 f"use_cachepool_group needs nb_core = num_tiles*cores_per_tile = "
                 f"{cache_cfg.num_tiles * cache_cfg.num_cores}, got soc/cluster/nb_core={arch.nb_core}")
             cache_cfg.tcdm_ports_per_core = 1 + (arch.spatz_nb_lanes if arch.use_spatz else 0)
+            cache_cfg.interco.num_inputs  = cache_cfg.num_cores * cache_cfg.tcdm_ports_per_core
+            cache_cfg.interco.num_outputs = cache_cfg.num_controllers
+            cache_cfg.structural_tile = True
+            cache_cfg.amo_lane = True       # cross-core atomic mutex (scalar re-laned to n_ppc-1 below)
             cache_cfg.controller.inline_sync_miss = True       # synchronous-slave (VLSU requires OK)
             cache_cfg.controller.functional_writethrough = True
+            import math
+            cache_cfg.interco.dynamic_offset = int(math.log2(cache_cfg.controller.cache_line_bytes))
             insitu_cache = InsituCacheGroup(self, 'insitu_cache', config=cache_cfg)
         elif arch.use_insitu_cache:
             cache_cfg = arch.insitu_cache_cfg
@@ -339,8 +349,15 @@ class SnitchCluster(gvsoc.systree.Component):
                 cache_cfg.structural_tile = True
                 cache_cfg.cell_coalescer = False
                 cache_cfg.amo_lane = True
-                cache_cfg.controllers_track_cores = True
-                cache_cfg.num_controllers = arch.nb_core
+                # Cache banks (cells) for this single tile = cachepool_banks_per_tile (power-of-two for the
+                # address-bit routing; default = nb_core, i.e. one cell per core). When banks==cores this is
+                # the per-core-cell binding (controllers_track_cores); banks!=cores is a genuine N-core→M-bank
+                # shared tile. interco.num_outputs MUST track num_controllers (else the xbar under-routes).
+                banks = getattr(arch, 'cachepool_banks_per_tile', arch.nb_core)
+                assert (banks & (banks - 1)) == 0, f"banks_per_tile must be power-of-two, got {banks}"
+                cache_cfg.num_controllers = banks
+                cache_cfg.controllers_track_cores = (banks == arch.nb_core)
+                cache_cfg.interco.num_outputs = banks
                 import math
                 cache_cfg.interco.dynamic_offset = int(math.log2(cache_cfg.controller.cache_line_bytes))
             insitu_cache = InsituCacheTile(self, 'insitu_cache', config=cache_cfg)
