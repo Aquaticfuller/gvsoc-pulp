@@ -131,7 +131,7 @@ class TeranocSystem(st.Component):
 
         # DMA
         dma = MemPoolDmaTop(self, 'dma', loc_base=0x0, loc_size=0x400000, burst_size=4*nb_banks_per_group, tcdm_width=4*nb_banks_per_group,
-                            nb_groups=arch.nb_groups, nb_dmas_per_group=1, be_width=4*nb_banks_per_group)
+                            nb_groups=arch.nb_groups, nb_dmas_per_group=1, be_width=4*nb_banks_per_group, transfer_queue_size=16)
 
         # Binary Loader
         loader = utils.loader.loader.ElfLoader(self, 'loader', binary=binary, entry=0x80000000)
