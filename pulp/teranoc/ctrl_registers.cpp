@@ -67,6 +67,7 @@ CtrlRegisters::CtrlRegisters(vp::ComponentConf &config)
 void CtrlRegisters::wakeup_event_handler(vp::Block *__this, vp::ClockEvent *event) {
     CtrlRegisters *_this = (CtrlRegisters *)__this;
     _this->barrier_ack_itf.sync(true);
+    _this->barrier_ack_itf.sync(false);
     _this->trace.msg("Control registers wake up signal work and write %d to barrier ack output\n", 1);
 }
 
