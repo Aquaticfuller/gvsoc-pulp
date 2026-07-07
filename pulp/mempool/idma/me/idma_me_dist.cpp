@@ -147,12 +147,20 @@ void IDmaMeDist::ack_transfer(IdmaTransfer *transfer)
     this->trace.msg(vp::Trace::LEVEL_TRACE, "Remaining bursts for transfer (transfer: %p, nb_bursts: %d)\n",
         transfer->parent, transfer->parent->nb_bursts);
 
-    // And terminate the transfer if all bursts have been sent and no more burst is pending
-    if (transfer->parent->bursts_sent && transfer->parent->nb_bursts == 0)
+    // Retire completed transfers strictly in enqueue (FIFO) order. Every transfer pushes
+    // exactly one burst (real or zero-size placeholder) into EVERY per-region queue, so the
+    // queues stay head-aligned. A younger transfer whose real bursts land on disjoint / faster
+    // backend regions can reach nb_bursts==0 before an older one; retiring it out of order would
+    // pop the older transfer's burst off the other region queues and trip the completion-mismatch
+    // check below. Instead, drain from the head only while the head transfer is fully done, so acks
+    // propagate upstream in order (which is what the stacked dist levels and the frontend expect).
+    while (!this->transfer_queue.empty() && !this->transfer_queue[0].empty())
     {
-        // Keep the parent in a local since the loop below frees all the bursts of this
-        // transfer, including the one we received, making transfer->parent a dangling read.
-        IdmaTransfer *parent = transfer->parent;
+        IdmaTransfer *parent = this->transfer_queue[0].front()->parent;
+        if (!(parent->bursts_sent && parent->nb_bursts == 0))
+        {
+            break;
+        }
         this->trace.msg(vp::Trace::LEVEL_TRACE, "Finished transfer (transfer: %p)\n", parent);
         for (auto &queue: this->transfer_queue) {
             if (queue.empty() || queue.front()->parent != parent) {
