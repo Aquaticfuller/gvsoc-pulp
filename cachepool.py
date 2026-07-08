@@ -44,17 +44,18 @@ from devices.uart.cachepool_uart import CachePoolUart
 # CachePool memory map (RTL cachepool_pkg.sv / common.ld).
 BOOTROM_BASE   = 0x0000_1000
 BOOTROM_SIZE   = 0x0001_0000
-DRAM_BASE      = 0x8000_0000
-DRAM_SIZE      = 0x2000_0000      # 0x80000000..0xA0000000
-SPM_BASE       = 0xBFFF_F800      # tcdm_start (bootrom BOOTDATA)
-SPM_SIZE       = 0x0000_0800      # tcdm_size = 2 KiB
-PERIPH_BASE    = 0xC000_0000      # tcdm_start + tcdm_size
-PERIPH_SIZE    = 0x0001_0000
-UART_BASE      = 0xC001_0000      # fake_uart
-UART_SIZE      = 0x0000_1000
-UNCACHED_BASE  = 0xA000_0000      # UNCACHED_REGION / L1D_ADDR default / .pdcp_src (common.ld)
-UNCACHED_SIZE  = 0x1000_0000      # up to 0xB0000000 (below the SPM at 0xBFFFF800)
-BOOT_CONTROL   = PERIPH_BASE + 0x20   # CLUSTER_BOOT_CONTROL — bootrom reads the entry here
+DRAM_BASE        = 0x8000_0000
+UNCACHED_BASE    = 0xA000_0000    # uncached DRAM sub-region start (common.ld UNCACHED_REGION)
+SPM_BASE         = 0xBFFF_F800    # tcdm_start — bottom of per-core private SPM window
+PERIPH_BASE      = 0xC000_0000    # tcdm_end (fixed by RTL memory map)
+DRAM_SIZE        = PERIPH_BASE - DRAM_BASE      # 1 GiB total DRAM (RTL cachepool_pkg.sv)
+DRAM_CACHED_SIZE = UNCACHED_BASE - DRAM_BASE    # 512 MiB — region the cache fronts
+UNCACHED_SIZE    = SPM_BASE - UNCACHED_BASE     # ~512 MiB — bypasses cache, goes direct to mem
+SPM_SIZE         = 0x0000_0800    # 2 KiB — virtual window each core sees (physically private per core)
+PERIPH_SIZE      = 0x0001_0000
+UART_BASE        = 0xC001_0000    # fake_uart
+UART_SIZE        = 0x0000_1000
+BOOT_CONTROL     = PERIPH_BASE + 0x20   # CLUSTER_BOOT_CONTROL — bootrom reads the entry here
 
 # Configurable topology. Explicit knobs (override): CACHEPOOL_NB_TILE, CACHEPOOL_CORES_PER_TILE,
 # CACHEPOOL_BANKS_PER_TILE (cache banks/cells per tile; power-of-two for the address routing; default =
@@ -130,12 +131,11 @@ def _make_arch(target):
     # separate SPMs. 1 group (4-core) = one shared SPM (the passing MINIMAL case); NB_TILE groups (16-core) =
     # 4 per-tile SPMs. (A single shared SPM collides 16 stacks; fully per-core breaks shared l1alloc.)
     cluster.private_spm = True
-    cluster.spm_num_groups = NB_TILE
+    cluster.spm_num_groups = NB_CORE
     if use_cache:
-        # The cache fronts the RTL cached PMA [0x80000000, 0x84000000) (64 MiB, where the benchmark data
-        # lives); the SPM (stack) + uncached DRAM + peripheral/UART stay direct. Refills route DRAM-range
-        # via the cluster wide_axi → o_WIDE_SOC → the SoC DRAM (the TCDM range is the only local map).
-        cluster.cache_region = Area(DRAM_BASE, 0x0400_0000)
+        # Cache fronts the cached DRAM PMA [DRAM_BASE, UNCACHED_BASE). Uncached/SPM/peripheral stay direct.
+        # Refills route via cluster wide_axi → o_WIDE_SOC → SoC DRAM.
+        cluster.cache_region = Area(DRAM_BASE, DRAM_CACHED_SIZE)
     return cluster
 
 
@@ -165,15 +165,15 @@ class CachePoolSoc(gvsoc.systree.Component):
         loader = utils.loader.loader.ElfLoader(self, 'loader', binary=binary, entry_addr=BOOT_CONTROL)
 
         # --- bindings ---
-        # DRAM (cores reach it via cores_ico→narrow_axi; the cache fronting DRAM is FULL-path).
-        wide_axi.o_MAP(self.i_HBM(), base=DRAM_BASE, size=DRAM_SIZE, rm_base=True, latency=0)
-        narrow_axi.o_MAP(wide_axi.i_INPUT(), base=DRAM_BASE, size=DRAM_SIZE, rm_base=False)
+        # Cached DRAM [DRAM_BASE, UNCACHED_BASE): cache refills reach HBM via wide_axi.
+        wide_axi.o_MAP(self.i_HBM(), base=DRAM_BASE, size=DRAM_CACHED_SIZE, rm_base=True, latency=0)
+        narrow_axi.o_MAP(wide_axi.i_INPUT(), base=DRAM_BASE, size=DRAM_CACHED_SIZE, rm_base=False)
         # Bootrom.
         wide_axi.o_MAP(rom.i_INPUT(),   base=BOOTROM_BASE, size=BOOTROM_SIZE, rm_base=True)
         narrow_axi.o_MAP(rom.i_INPUT(), base=BOOTROM_BASE, size=BOOTROM_SIZE, rm_base=True)
         # Fake UART (snrt printf → stdout).
         narrow_axi.o_MAP(uart.i_INPUT(), base=UART_BASE, size=UART_SIZE, rm_base=True)
-        # Uncached region (.pdcp / L1D_ADDR default) — plain RW memory above DRAM.
+        # Uncached DRAM [UNCACHED_BASE, SPM_BASE): bypasses the cache, goes directly to memory.
         wide_axi.o_MAP(uncached.i_INPUT(),   base=UNCACHED_BASE, size=UNCACHED_SIZE, rm_base=True)
         narrow_axi.o_MAP(uncached.i_INPUT(), base=UNCACHED_BASE, size=UNCACHED_SIZE, rm_base=True)
         # Cluster: SoC accesses to the SPM + peripheral range (loader entry write, the bootrom's
@@ -239,7 +239,7 @@ class CachePoolBoard(gvsoc.systree.Component):
         clock = Clock_domain(self, 'clock', frequency=10000000)
         cluster_arch = _make_arch(self)
         chip = CachePoolChip(self, 'chip', parser, cluster_arch, binary, debug_binaries)
-        mem = memory.memory.Memory(self, 'mem', size=DRAM_SIZE, atomics=True, width_log2=2)
+        mem = memory.memory.Memory(self, 'mem', size=DRAM_CACHED_SIZE, atomics=True, width_log2=2)
 
         self.bind(clock, 'out', chip, 'clock')
         self.bind(clock, 'out', mem, 'clock')

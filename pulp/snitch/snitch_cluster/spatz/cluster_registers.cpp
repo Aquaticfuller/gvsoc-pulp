@@ -202,25 +202,32 @@ vp::IoReqStatus ClusterRegisters::req(vp::Block *__this, vp::IoReq *req)
 
 bool ClusterRegisters::cachepool_access(uint64_t offset, int size, uint8_t *data, bool is_write)
 {
-    // CLUSTER_EOC_EXIT (0x24): write with bit0 set -> end of computation; quit with retval = bits[3:1].
-    if (offset == 0x24)
+    // CachePool-specific peripheral registers not present in the standard Spatz regmap.
+    // Layout from ManyRVData software/snRuntime/include/spatz_cluster_peripheral.h:
+    //   0x58  SPATZ_CYCLE           — RW scratch (perf cycle counter, cosmetic)
+    //   0x60  CLUSTER_BOOT_CONTROL  — RW scratch (entry point; loader writes here at boot)
+    //   0x68  CLUSTER_EOC_EXIT      — handled before this call in core_req()/req()
+    //   0x70  CFG_L1D_SPM           — RW scratch (SPM size; future: wire to cache)
+    //   0x78  CFG_L1D_INSN          — RW scratch (flush/invalidate insn; future: wire to cache)
+    //   0x80  L1D_SPM_COMMIT        — RW scratch
+    //   0x88  L1D_INSN_COMMIT       — RW scratch
+    //   0x90  L1D_FLUSH_STATUS      — reads 0 (flush done/not-busy); l1d_wait() spins until 0
+    //   0x98  XBAR_OFFSET           — RW scratch (dynamic_offset; future: wire to crossbar)
+    //   0xa0  XBAR_OFFSET_COMMIT    — RW scratch
+    // Perf counter block (0x00–0x2F): PERF_COUNTER_ENABLE_x (0x00/0x08), HART_SELECT_x (0x10/0x18),
+    // PERF_COUNTER_x (0x20/0x28). The hjson regwidth=64 so each is 8 bytes; software may do 32-bit
+    // sub-accesses (e.g. upper half at 0x2c = PERF_COUNTER_1+4). The regmap only matches the 8-byte-
+    // aligned base offset and fires a force_warning (→ exit(1) under --werror) for any mid-register
+    // access. Intercept all of 0x00–0x2F here as scratch (reads return 0, writes ignored). Safe
+    // because CL_CLINT (0x30/0x38) and HW_BARRIER (0x40) are above this range and still fall through.
+    if (offset < 0x30)
     {
-        if (is_write && data != NULL && (data[0] & 0x1))
-        {
-            int retval = (data[0] >> 1) & 0x7;
-            fprintf(stderr, "[EOC] Simulation exiting: retval=%d cycles=%ld\n",
-                    retval, (long)this->clock.get_cycles());
-            this->time.get_engine()->quit(retval);
-        }
+        if (!is_write && data != nullptr) memset(data, 0, size);
         return true;
     }
-    // CachePool peripheral block not in the spatz regmap: ICACHE_PREFETCH(0x14)/SPATZ_STATUS(0x18)/
-    // SPATZ_CYCLE(0x1c) + L1D-config(0x28..0x4c). RW scratch; FLUSH_STATUS(0x3c) always reads 0 (l1d_wait
-    // spins until 0). 0x20 (boot-control) is left to the regmap. The structural cache is not yet wired to
-    // these (FULL-path); functionally benign (SPATZ_CYCLE feeds only a cosmetic perf print).
-    if (offset >= 0x14 && offset <= 0x4c && offset != 0x20)
+    if (offset >= 0x58 && offset <= 0xa4)
     {
-        int idx = (int)((offset - 0x14) / 4);
+        int idx = (int)((offset - 0x58) / 4);
         int n = size < 4 ? (int)size : 4;
         if (is_write)
         {
@@ -228,7 +235,8 @@ bool ClusterRegisters::cachepool_access(uint64_t offset, int size, uint8_t *data
         }
         else if (data != NULL)
         {
-            uint32_t v = (offset == 0x3c) ? 0 : this->cp_l1d[idx];
+            // L1D_FLUSH_STATUS always reads 0 so l1d_wait() exits immediately
+            uint32_t v = (offset == 0x90) ? 0 : this->cp_l1d[idx];
             memcpy(data, &v, n);
         }
         return true;

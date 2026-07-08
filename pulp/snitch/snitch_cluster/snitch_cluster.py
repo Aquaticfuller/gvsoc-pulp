@@ -367,9 +367,11 @@ class SnitchCluster(gvsoc.systree.Component):
         # A single shared TCDM corrupts once >1 core runs concurrently. When arch.private_spm is set, give
         # each core its OWN memory for the TCDM range (default off → the shared TCDM, unchanged for spatz).
         private_spm = getattr(arch, 'private_spm', False)
-        # Number of independent SPM instances. 1 = one shared SPM (16 stacks collide); nb_core = per-core
-        # (breaks shared l1alloc); num_tiles = per-tile (cores in a tile share one SPM — the CachePool
-        # organization). Default = nb_core (per-core) when private_spm and unset.
+        # Number of independent SPM instances. 1 = one shared SPM (all stacks collide at same VA);
+        # nb_core = per-core (CachePool correct: crt0 comments out per-hart sp offset, so ALL cores
+        # compute the same spm_end-team-tls VA — shared SPM means _snrt_core_idx races and the last
+        # writer wins; per-core SPM isolates TLS so each hart's core-idx is private).
+        # Default = nb_core (per-core) when private_spm and unset.
         spm_groups = getattr(arch, 'spm_num_groups', arch.nb_core) if private_spm else 0
         cores_per_spm = (arch.nb_core // spm_groups) if spm_groups else 1
         spms = []
