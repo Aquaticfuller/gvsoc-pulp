@@ -34,7 +34,7 @@ import math
 import gvsoc.systree as st
 from interco.router import Router
 from pulp.cachepool_v2.cachepool_v2_group import CachepoolV2Group
-import pulp.teranoc.l1_noc as l1_noc
+import pulp.cachepool_v2.cachepool_v2_l1_noc as l1_noc
 
 
 class CachepoolV2Cluster(st.Component):
