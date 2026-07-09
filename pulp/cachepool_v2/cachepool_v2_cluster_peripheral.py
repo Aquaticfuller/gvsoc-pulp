@@ -24,6 +24,7 @@ import gvsoc.systree
 class CachepoolV2ClusterPeripheral(gvsoc.systree.Component):
 
     def __init__(self, parent: gvsoc.systree.Component, name: str,
+                 num_cores: int,
                  wakeup_latency: int = 15,
                  boot_wakeup_latency: int = 2000):
         super().__init__(parent, name)
@@ -31,6 +32,7 @@ class CachepoolV2ClusterPeripheral(gvsoc.systree.Component):
         self.add_sources(['pulp/cachepool_v2/cachepool_v2_cluster_peripheral.cpp'])
 
         self.add_properties({
+            'num_cores':           num_cores,
             'wakeup_latency':      wakeup_latency,
             'boot_wakeup_latency': boot_wakeup_latency,
         })

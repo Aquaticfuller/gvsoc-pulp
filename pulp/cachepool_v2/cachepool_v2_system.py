@@ -112,7 +112,8 @@ class CachepoolV2SoC(st.Component):
                               nb_masters=nb_axi_masters,
                               port_bandwidth=axi_data_width // 4)
 
-        peripheral = CachepoolV2ClusterPeripheral(self, 'peripheral', wakeup_latency=15)
+        peripheral = CachepoolV2ClusterPeripheral(self, 'peripheral',
+                                                   num_cores=total_cores, wakeup_latency=15)
         uart       = ns16550.Ns16550(self, 'uart')
 
         # ELF loader — entry=0x1000: all cores boot from the ROM (bootrom flow).
