@@ -42,15 +42,23 @@ class Hierarchical_Interco(gvsoc.systree.Component):
                  cache_line_width: int=64, cache_size: int=8192, nb_cache_sets: int=2):
         super(Hierarchical_Interco, self).__init__(parent, name)
 
-        nb_sets = 2
-        nb_lines = cache_size / (cache_line_width * nb_sets)
+        # The Cache sub-block is only meaningful when enable_cache=True (some cache_rules
+        # route traffic to it). When disabled (the CachePool v2 case: enable_cache=False,
+        # cache_rules=[]), the filter never routes anything to it at runtime, so skip
+        # constructing it entirely — its constructor is fragile at small/degenerate
+        # elaboration sizes (segfaults in trace-event setup) and there is no point paying
+        # that risk for a sub-block that carries no traffic.
+        cache = None
+        if enable_cache:
+            nb_sets = 2
+            nb_lines = cache_size / (cache_line_width * nb_sets)
 
-        nb_sets_bits = int(math.log2(nb_lines))
-        nb_ways_bits = int(math.log2(nb_sets))
-        line_size_bits = int(math.log2(cache_line_width))
+            nb_sets_bits = int(math.log2(nb_lines))
+            nb_ways_bits = int(math.log2(nb_sets))
+            line_size_bits = int(math.log2(cache_line_width))
 
-        cache = Cache(self, 'cache', nb_sets_bits=nb_sets_bits, nb_ways_bits=nb_ways_bits,
-                      line_size_bits=line_size_bits, enabled=enable_cache, cache_v2=True)
+            cache = Cache(self, 'cache', nb_sets_bits=nb_sets_bits, nb_ways_bits=nb_ways_bits,
+                          line_size_bits=line_size_bits, enabled=enable_cache, cache_v2=True)
 
         input_itf = Router(self, 'input_itf', bandwidth=bandwidth, latency=2 if synchronous else 1, synchronous=synchronous, max_input_pending_size=bandwidth)
         for i in range(1, nb_slaves):
@@ -69,7 +77,8 @@ class Hierarchical_Interco(gvsoc.systree.Component):
             self.bind(input_itf, 'output', input_link_ctrl, 'input')
             self.bind(input_link_ctrl, 'output', filter, 'input')
 
-        self.bind(filter, 'cache', cache, 'input')
+        if cache is not None:
+            self.bind(filter, 'cache', cache, 'input')
+            self.bind(cache, 'refill', self, 'output')
         self.bind(filter, 'bypass', self, 'output')
-        self.bind(cache, 'refill', self, 'output')
         self.bind(self, 'rocache_cfg', filter, 'config')
