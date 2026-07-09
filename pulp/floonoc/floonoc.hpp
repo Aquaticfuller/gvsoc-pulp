@@ -57,6 +57,13 @@ public:
     int y;
     // Offset to be removed when request is forwarded
     uint64_t remove_offset;
+    // If non-zero, this entry also matches any address obtained by adding a multiple of
+    // `period` to an address within [base, base+size). Needed when the address bits used
+    // for routing (e.g. a group ID) sit *below* other bits (e.g. a cacheline tag) that the
+    // NoC doesn't otherwise interpret: incrementing those upper bits by 1 shifts the address
+    // by exactly `period`, but the request still belongs to the same target — without this,
+    // any such address would silently find no entry (see cachepool_v2 §13.2.3/§13.2.4).
+    uint64_t period = 0;
 };
 
 

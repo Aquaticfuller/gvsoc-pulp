@@ -74,8 +74,10 @@ class FlooNoc2dMeshNarrowWide(gvsoc.systree.Component):
         self.add_property('dim_y', dim_y)
         self.add_property('router_input_queue_size', router_input_queue_size)
 
-    def __add_mapping(self, name: str, base: int, size: int, x: int, y: int, remove_offset:int =0):
-        self.get_property('mappings')[name] =  {'base': base, 'size': size, 'x': x, 'y': y, 'remove_offset':remove_offset}
+    def __add_mapping(self, name: str, base: int, size: int, x: int, y: int, remove_offset:int =0,
+            period: int =0):
+        self.get_property('mappings')[name] =  {'base': base, 'size': size, 'x': x, 'y': y,
+            'remove_offset':remove_offset, 'period': period}
 
     def add_router(self, x: int, y: int):
         """Instantiate a router in the grid.
@@ -105,7 +107,8 @@ class FlooNoc2dMeshNarrowWide(gvsoc.systree.Component):
         self.get_property('network_interfaces').append([x, y])
 
     def o_NARROW_MAP(self, itf: gvsoc.systree.SlaveItf, base: int, size: int,
-            x: int, y: int, name: str=None, rm_base: bool=False, remove_offset:int =0):
+            x: int, y: int, name: str=None, rm_base: bool=False, remove_offset:int =0,
+            period: int =0):
         """Binds the output of a node to a target, associated to a memory-mapped region.
 
         Parameters
@@ -127,12 +130,18 @@ class FlooNoc2dMeshNarrowWide(gvsoc.systree.Component):
             if True, the base address is substracted to the address of any request going through
         remove_offset: int
             Offset to remove from the address before applying the mapping
+        period: int
+            If non-zero, this mapping also matches any address obtained by adding a whole
+            multiple of `period` to an address within [base, base+size). Useful when the
+            address bits selecting this target sit below other, unrelated bits (e.g. a
+            cacheline tag) that the NoC doesn't otherwise interpret.
         """
         if name is None:
             name = itf.component.name
         if rm_base and remove_offset == 0:
             remove_offset =base
-        self.__add_mapping(f"narrow_{name}", base=base, size=size, x=x, y=y, remove_offset=remove_offset)
+        self.__add_mapping(f"narrow_{name}", base=base, size=size, x=x, y=y,
+            remove_offset=remove_offset, period=period)
         self.itf_bind(f"ni_narrow_{x}_{y}", itf, signature='io')
 
 

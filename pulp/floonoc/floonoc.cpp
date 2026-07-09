@@ -59,6 +59,7 @@ FlooNoc::FlooNoc(vp::ComponentConf &config)
             uint64_t base = config->get_uint("base");
             uint64_t size = config->get_uint("size");
             uint64_t remove_offset = config->get_uint("remove_offset");
+            uint64_t period = config->get_uint("period");
             int x = config->get_int("x");
             int y = config->get_int("y");
 
@@ -70,6 +71,7 @@ FlooNoc::FlooNoc(vp::ComponentConf &config)
                 this->entries[id].x = x;
                 this->entries[id].y = y;
                 this->entries[id].remove_offset = remove_offset;
+                this->entries[id].period = period;
             }
 
             if (x >= 0 && y >= 0)
@@ -250,6 +252,16 @@ Entry *FlooNoc::get_entry(uint64_t base, uint64_t size)
         if (base >= entry->base && base < entry->base + entry->size)
         {
             return entry;
+        }
+        // Periodic entry: also match any address reachable from [base, base+size) by adding
+        // a whole multiple of period (see the `period` field comment in floonoc.hpp).
+        if (entry->period > 0 && base >= entry->base)
+        {
+            uint64_t rel = (base - entry->base) % entry->period;
+            if (rel < entry->size)
+            {
+                return entry;
+            }
         }
     }
     return NULL;

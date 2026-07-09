@@ -91,18 +91,44 @@ class CachepoolV2Cluster(st.Component):
         # ----------------------------------------------------------------
         # Bindings — L1 NoC (cross-group cache forwarding)
         # ----------------------------------------------------------------
-        for i in range(nb_x_groups):
-            for j in range(nb_y_groups):
-                group_id = i * nb_y_groups + j
-                dram_base = 0x80000000
-                base = dram_base + group_id * noc_size_per_group
-                size = noc_size_per_group
-                for k in range(nb_remote_ports_per_group):
-                    self.group_list[group_id].o_GROUP_OUTPUT(
-                        k, self.l1_noc_list[k].i_NARROW_INPUT(i, j))
-                    self.l1_noc_list[k].o_NARROW_MAP(
-                        self.group_list[group_id].i_GROUP_INPUT(k),
-                        base=base, size=size, x=i, y=j)
+        # L1NocAddressConverter only rearranges the low bank_offset/group_id bits
+        # (bits below constant_bits_lsb+bank_offset_bits+group_id_bits); it leaves bit 29
+        # (the 0x8000_0000 vs 0xa000_0000 DRAM-region selector) untouched. So a cross-group
+        # request whose original address is in the 0xa000_0000 "uncached label" window
+        # (where fdotp's actual source data lives — see architecture doc §3) still carries
+        # that bit through the NoC-space transform. Without a matching map entry, FlooNoc's
+        # get_entry() finds no target, and NetworkQueue::enqueue_router_req() silently drops
+        # the burst (never completes it) — permanently occupying the NI's single
+        # in-flight-burst slot and DENYing every subsequent request through that NI forever.
+        # Register a mirror window at the 0xa0000000 base (same group->target routing) so
+        # 0xa0000000-region traffic resolves an entry exactly like 0x80000000-region traffic.
+        #
+        # `period`: L1NocAddressConverter only rearranges bits within
+        # [0, constant_bits_lsb+bank_offset_bits+group_id_bits) — i.e. exactly the
+        # noc_size_per_group*nb_groups span below. Any bits *above* that (the cacheline
+        # "tag" — which line within a bank, as opposed to which bank) pass through
+        # unmodified and simply add tag * (nb_groups*noc_size_per_group) to the address, since
+        # that stride is exactly one full pass over all groups' windows at the current tag=0.
+        # A plain base+size window therefore only ever matches tag==0; every other tag would
+        # silently drop (or in principle alias into a different group's window — see
+        # architecture doc §13.2.3's "residual" note / §13.2.4). Passing `period` makes
+        # FlooNoc::get_entry() match every tag by construction, at any address.
+        noc_period = nb_groups * noc_size_per_group
+        for dram_base, region_tag in ((0x80000000, "dram"), (0xa0000000, "pdcp")):
+            for i in range(nb_x_groups):
+                for j in range(nb_y_groups):
+                    group_id = i * nb_y_groups + j
+                    base = dram_base + group_id * noc_size_per_group
+                    size = noc_size_per_group
+                    for k in range(nb_remote_ports_per_group):
+                        if dram_base == 0x80000000:
+                            self.group_list[group_id].o_GROUP_OUTPUT(
+                                k, self.l1_noc_list[k].i_NARROW_INPUT(i, j))
+                        self.l1_noc_list[k].o_NARROW_MAP(
+                            self.group_list[group_id].i_GROUP_INPUT(k),
+                            base=base, size=size, x=i, y=j,
+                            name=f"group_{i}_{j}_port_{k}_{region_tag}",
+                            period=noc_period)
 
         # ----------------------------------------------------------------
         # Bindings — AXI (L2 refill from each group)
