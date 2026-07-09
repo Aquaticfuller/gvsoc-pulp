@@ -21,6 +21,9 @@
 # so a core starting from the reset vector does not fault.
 #
 
+import os
+import struct
+import tempfile
 import memory.memory as memory
 from vp.clock_domain import Clock_domain
 from interco.router import Router
@@ -30,6 +33,32 @@ import gvsoc.systree as st
 from pulp.cachepool_v2.cachepool_v2_cluster import CachepoolV2Cluster
 from pulp.cachepool_v2.cachepool_v2_cluster_peripheral import CachepoolV2ClusterPeripheral
 from pulp.mempool.l2_subsystem import L2_subsystem
+
+
+# Debug-only topology override, for isolating structural/interconnect issues from
+# core-count-dependent software behavior (barrier/reduction logic reads core_count /
+# tile_count from BOOTDATA, so the bootrom must be re-patched to match — see
+# _patch_bootrom below, mirroring pulp/cachepool.py's v1 mechanism). Unset -> the
+# validated 4x4 groups x 4 tiles x 4 cores = 256-core default, unchanged.
+_NB_X_GROUPS      = int(os.environ.get('CACHEPOOL_V2_NB_X_GROUPS', '4'))
+_NB_Y_GROUPS      = int(os.environ.get('CACHEPOOL_V2_NB_Y_GROUPS', '4'))
+_NB_CORES_PER_TILE = int(os.environ.get('CACHEPOOL_V2_CORES_PER_TILE', '4'))
+_NB_TILES_PER_GROUP = int(os.environ.get('CACHEPOOL_V2_TILES_PER_GROUP', '4'))
+_TOTAL_CORES = _NB_X_GROUPS * _NB_Y_GROUPS * _NB_TILES_PER_GROUP * _NB_CORES_PER_TILE
+_NB_TILES = _NB_X_GROUPS * _NB_Y_GROUPS * _NB_TILES_PER_GROUP
+
+
+def _patch_bootrom(base_path):
+    """Patch the base bootrom's BOOTDATA core_count(@0x44) + tile_count(@0x68) to match
+    the (possibly overridden) topology, writing a per-config temp blob and returning its
+    path. No-op content-wise when the topology is left at the 256-core default."""
+    data = bytearray(open(base_path, 'rb').read())
+    struct.pack_into('<I', data, 0x44, _TOTAL_CORES)  # BOOTDATA core_count
+    struct.pack_into('<I', data, 0x68, _NB_TILES)      # BOOTDATA tile_count
+    out = os.path.join(tempfile.gettempdir(), f'cachepool_v2_bootrom_{_TOTAL_CORES}c_{_NB_TILES}t.bin')
+    with open(out, 'wb') as f:
+        f.write(data)
+    return out
 
 
 class CachepoolV2SoC(st.Component):
@@ -74,7 +103,7 @@ class CachepoolV2SoC(st.Component):
         # Boot ROM: 4 KB at 0x1000, pre-loaded from ManyRVData build tree.
         rom = memory.Memory(self, 'rom', size=0x1000,
                             width_log2=(axi_data_width - 1).bit_length(),
-                            stim_file=self.get_file_path('pulp/cachepool_v2/bootrom.bin'))
+                            stim_file=_patch_bootrom(self.get_file_path('pulp/cachepool_v2/bootrom.bin')))
 
         l2_mem = L2_subsystem(self, 'l2_mem',
                               nb_banks=nb_l2_banks,
@@ -179,9 +208,9 @@ class CachepoolV2System(st.Component):
 
         soc = CachepoolV2SoC(
             self, 'cachepool_v2_soc', parser,
-            nb_cores_per_tile=4,
-            nb_x_groups=4, nb_y_groups=4,
-            total_cores=256,
+            nb_cores_per_tile=_NB_CORES_PER_TILE,
+            nb_x_groups=_NB_X_GROUPS, nb_y_groups=_NB_Y_GROUPS,
+            total_cores=_TOTAL_CORES,
             nb_remote_ports_per_tile=2,
             axi_data_width=64,
             nb_axi_masters_per_group=1,
