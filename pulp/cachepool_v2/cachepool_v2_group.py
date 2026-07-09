@@ -128,6 +128,7 @@ class CachepoolV2Group(st.Component):
         # ----------------------------------------------------------------
         axi_ico = Hierarchical_Interco(
             self, 'axi_ico',
+            nb_slaves=nb_tiles_per_group,
             enable_cache=False,
             bandwidth=axi_data_width)
 
@@ -172,7 +173,7 @@ class CachepoolV2Group(st.Component):
         # Bindings — AXI (L2 cache refill)
         # ----------------------------------------------------------------
         for i in range(nb_tiles_per_group):
-            self.bind(self.tile_list[i], 'axi_out', axi_ico, 'input')
+            self.bind(self.tile_list[i], 'axi_out', axi_ico, f'input_{i}')
 
         self.bind(axi_ico, 'output', self, 'axi_out_0')
 
