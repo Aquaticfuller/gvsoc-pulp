@@ -105,9 +105,16 @@ class CachepoolV2Tile(st.Component):
             # L1 without address normalization so refills use the real address and reach
             # pdcp_mem (where .pdcp_src ELF data is loaded) rather than l2_mem (code).
             ico = Router(self, f'ico{core_id}', bandwidth=4, latency=0)
-            ico.add_mapping('stack', base=STACK_BASE,  remove_offset=STACK_BASE,   size=STACK_SIZE)
-            ico.add_mapping('l1',    base=DRAM_BASE,   size=0x20000000)
-            ico.add_mapping('l1',    base=0xa0000000,  size=0x20000000)
+            ico.add_mapping('stack',    base=STACK_BASE,  remove_offset=STACK_BASE,   size=STACK_SIZE)
+            # NB: these must have DISTINCT names. Router.add_mapping() stores mappings in a
+            # dict keyed by name (interco/router.py); reusing 'l1' for both silently drops
+            # the first entry (whichever registers first, here the DRAM_BASE one), leaving
+            # scalar accesses to that whole region with no working 'l1' mapping — they fall
+            # through to the 'axi' catch-all and bypass the L1 cache entirely (routed via
+            # the flat L2-refill path instead), even though both are meant to reach the same
+            # L1 target. Both mapping names are bound to the same l1.pe_in{core_id} port below.
+            ico.add_mapping('l1_dram', base=DRAM_BASE,   size=0x20000000)
+            ico.add_mapping('l1_pdcp', base=0xa0000000,  size=0x20000000)
             ico.add_mapping('axi')
             ico_list.append(ico)
 
@@ -118,9 +125,10 @@ class CachepoolV2Tile(st.Component):
         # Core scalar data → ico → stack | l1 | axi_ico
         for core_id in range(nb_cores_per_tile):
             self.bind(self.int_cores[core_id], 'data',  ico_list[core_id], 'input')
-            self.bind(ico_list[core_id], 'stack', stack_mems[core_id], 'input')
-            self.bind(ico_list[core_id], 'l1',    l1, f'pe_in{core_id}')
-            self.bind(ico_list[core_id], 'axi',   axi_ico, 'input')
+            self.bind(ico_list[core_id], 'stack',   stack_mems[core_id], 'input')
+            self.bind(ico_list[core_id], 'l1_dram', l1, f'pe_in{core_id}')
+            self.bind(ico_list[core_id], 'l1_pdcp', l1, f'pe_in{core_id}')
+            self.bind(ico_list[core_id], 'axi',     axi_ico, 'input')
 
         # Spatz VLSU ports → pass-through shim → L1.
         # DramNormalizer no longer modifies addresses (was incorrectly subtracting
