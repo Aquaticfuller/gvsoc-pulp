@@ -130,7 +130,12 @@ class CachepoolV2SoC(st.Component):
         # Second DRAM region at 0xa0000000 for the .pdcp_src ELF section.
         # In CachePool there is no separate "private" memory — 0xa0000000 is
         # ordinary DRAM, accessed through L1 the same way as 0x80000000.
-        pdcp_mem = memory.Memory(self, 'pdcp_mem', size=0x10000000)  # 256 MB
+        # Sized to match the full 0xa0000000-0xC0000000 window the L1 side advertises
+        # (cachepool_v2_tile.py's l1_pdcp mapping, size=0x20000000) — a 256 MB mismatch
+        # here left addresses 0xb0000000+ falling through to soc_ico's catch-all, which has
+        # no mapping for them, so refills there were rejected IO_REQ_INVALID and the
+        # requesting core's MSHR entry never drained.
+        pdcp_mem = memory.Memory(self, 'pdcp_mem', size=0x20000000)  # 512 MB
 
         # ----------------------------------------------------------------
         # AXI interconnect (one router per AXI master from the cluster)
@@ -140,7 +145,7 @@ class CachepoolV2SoC(st.Component):
         for i in range(nb_axi_masters):
             r = Router(self, f'axi_ico_{i}', latency=0)
             r.add_mapping('l2',   base=0x80000000, remove_offset=0x80000000, size=l2_size)
-            r.add_mapping('pdcp', base=0xa0000000, remove_offset=0xa0000000, size=0x10000000)
+            r.add_mapping('pdcp', base=0xa0000000, remove_offset=0xa0000000, size=0x20000000)
             r.add_mapping('soc')
             axi_ico.append(r)
 
@@ -165,7 +170,7 @@ class CachepoolV2SoC(st.Component):
         loader_router.add_mapping('mem',   base=0x80000000, remove_offset=0x80000000,
                                   size=l2_size)
         loader_router.add_mapping('pdcp',  base=0xa0000000, remove_offset=0xa0000000,
-                                  size=0x10000000)
+                                  size=0x20000000)
         loader_router.add_mapping('soc',   base=0xC0000000, size=0x10000000)
 
         # ----------------------------------------------------------------
