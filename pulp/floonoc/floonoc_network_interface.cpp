@@ -132,8 +132,6 @@ void NetworkQueue::enqueue_router_req(vp::IoReq *req, bool is_address, bool wide
             if (entry == NULL)
             {
                 // Burst is invalid if no target is found
-                fprintf(stderr, "[NI_DBG %s] NO_ENTRY_FOUND base=0x%lx size=0x%lx (burst silently dropped)\n",
-                    this->ni.get_path().c_str(), (unsigned long)burst_base, (unsigned long)size);
                 this->trace.msg(vp::Trace::LEVEL_ERROR, "No entry found for base 0x%x\n", burst_base);
                 return;
                 // TODO
@@ -380,14 +378,6 @@ vp::IoReqStatus NetworkInterface::wide_req(vp::Block *__this, vp::IoReq *req)
 
 vp::IoReqStatus NetworkInterface::handle_req(vp::IoReq *req)
 {
-    static long ni_handle_req_count = 0;
-    ni_handle_req_count++;
-    if ((ni_handle_req_count % 2000) == 1)
-    {
-        fprintf(stderr, "[NI_DBG %s] HANDLE_REQ_ENTRY #%ld addr=0x%lx is_write=%d\n",
-            this->get_path().c_str(), ni_handle_req_count, (unsigned long)req->get_addr(),
-            (int)req->get_is_write());
-    }
     this->trace.msg(vp::Trace::LEVEL_DEBUG, "Received request from target (req: %p, base: 0x%x, size: 0x%x, wide: %d)\n",
         req, req->get_addr(), req->get_size(), *(int *)req->arg_get_last(NetworkInterface::REQ_WIDE));
 
@@ -415,16 +405,6 @@ vp::IoReqStatus NetworkInterface::handle_req(vp::IoReq *req)
 
     if (*queue || this->nb_pending_bursts[is_wide] >= this->ni_outstanding_reqs)
     {
-        static long ni_deny_count = 0;
-        ni_deny_count++;
-        if ((ni_deny_count % 5000) == 1)
-        {
-            fprintf(stderr, "[NI_DBG %s] DENY #%ld req=%p addr=0x%lx is_wide=%d is_write=%d "
-                "queue_nonnull=%d nb_pending=%d denied_qsize=%zu\n",
-                this->get_path().c_str(), ni_deny_count, req, (unsigned long)req->get_addr(),
-                (int)is_wide, (int)req->get_is_write(), (*queue != nullptr),
-                this->nb_pending_bursts[is_wide], denied_queue->size());
-        }
         denied_queue->push(req);
         return vp::IO_REQ_DENIED;
     }
@@ -448,17 +428,6 @@ vp::IoReqStatus NetworkInterface::handle_req(vp::IoReq *req)
 bool NetworkInterface::handle_request(FloonocNode *node, vp::IoReq *req, int from_x, int from_y)
 {
     NetworkInterface *origin_ni = *(NetworkInterface **)req->arg_get(FlooNoc::REQ_SRC_NI);
-
-    {
-        static long ni_handle_request_count = 0;
-        ni_handle_request_count++;
-        if ((ni_handle_request_count % 2000) == 1)
-        {
-            fprintf(stderr, "[NI_DBG %s] HANDLE_REQUEST #%ld origin_ni=%p addr=0x%lx is_write=%d\n",
-                this->get_path().c_str(), ni_handle_request_count, (void*)origin_ni,
-                (unsigned long)req->get_addr(), (int)req->get_is_write());
-        }
-    }
 
     if (origin_ni == NULL)
     {
@@ -486,14 +455,6 @@ bool NetworkInterface::handle_request(FloonocNode *node, vp::IoReq *req, int fro
             {
                 this->trace.msg(vp::Trace::LEVEL_DEBUG, "Finished burst (burst: %p)\n", burst);
                 this->nb_pending_bursts[wide]--;
-                static long ni_final_resp_count = 0;
-                ni_final_resp_count++;
-                if ((ni_final_resp_count % 5000) == 1)
-                {
-                    fprintf(stderr, "[NI_DBG %s] FINAL_RESP #%ld burst=%p addr=0x%lx\n",
-                        this->get_path().c_str(), ni_final_resp_count, burst,
-                        (unsigned long)burst->get_addr());
-                }
                 burst->get_resp_port()->resp(burst);
             }
         }
@@ -656,14 +617,6 @@ void NetworkInterface::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         _this->narrow_denied_read_req.pop();
         _this->req_queue.handle_req(req);
         req->get_resp_port()->grant(req);
-        static long ni_retry_count = 0;
-        ni_retry_count++;
-        if ((ni_retry_count % 5000) == 1)
-        {
-            fprintf(stderr, "[NI_DBG %s] RETRY_READ #%ld req=%p addr=0x%lx qsize_after=%zu\n",
-                _this->get_path().c_str(), ni_retry_count, req, (unsigned long)req->get_addr(),
-                _this->narrow_denied_read_req.size());
-        }
         _this->fsm_event.enqueue();
     }
 

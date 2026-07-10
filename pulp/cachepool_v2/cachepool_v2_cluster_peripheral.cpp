@@ -18,10 +18,9 @@
  *                              how many other cores had arrived, i.e. it was a no-op from a
  *                              synchronization standpoint — snrt_cluster_hw_barrier() never
  *                              actually blocked, letting faster cores race arbitrarily far
- *                              ahead of slower ones across loop iterations (see
- *                              prompt/cachepool_v2_architecture.md §13.1.2 in the parent repo
- *                              for the investigation that found this via fdotp's two-level
- *                              reduction reading future-iteration values from faster cores).
+ *                              ahead of slower ones across loop iterations (found via fdotp's
+ *                              two-level reduction reading future-iteration values from
+ *                              faster cores).
  *   0x10  CLUSTER_BOOT_CONTROL WRITE/READ — stores application entry point;
  *                              first non-zero write also schedules the boot wakeup
  *                              (barrier_ack after boot_wakeup_latency cycles) so
