@@ -38,9 +38,10 @@ class L1_subsystem(gvsoc.systree.Component):
         (local or remote).
 
     remote_in_{i} / remote_out_{i}    (i = 0..nb_remote_ports-1)
-        Remote-side I/O. By convention port 0 carries intra-group
-        neighbor traffic and ports 1..N-1 carry inter-group NoC
-        traffic; the tile is responsible for the actual wiring.
+        Remote-side I/O. Ports 0..nb_intra_group_ports-1 carry
+        intra-group neighbor traffic and the remaining ports carry
+        inter-group NoC traffic; the tile is responsible for the actual
+        wiring.
 
     dma
         DMA AXI port.
@@ -50,12 +51,17 @@ class L1_subsystem(gvsoc.systree.Component):
                  tile_id: int = 0, group_id: int = 0,
                  nb_tiles_per_group: int = 16, nb_groups: int = 4,
                  nb_local_ports: int = 0, nb_remote_ports: int = 0,
+                 nb_intra_group_ports: int = 1,
                  size: int = 0, nb_banks_per_tile: int = 0,
                  bandwidth: int = 0, axi_data_width: int = 64):
         super(L1_subsystem, self).__init__(parent, name)
 
-        assert nb_remote_ports >= 1, "Need at least one remote port (port 0 = intra-group)"
-        nb_inter_group = nb_remote_ports - 1
+        assert nb_intra_group_ports >= 1, "Need at least one intra-group (local) port"
+        assert nb_remote_ports >= nb_intra_group_ports, \
+            "nb_remote_ports must cover the intra-group ports (ports 0..nb_intra_group_ports-1)"
+        # Remote ports split: 0..nb_intra_group_ports-1 = intra-group (local),
+        # the rest = inter-group NoC.
+        nb_inter_group = nb_remote_ports - nb_intra_group_ports
 
         l1_bank_size      = size / nb_banks_per_tile
         total_banks       = nb_groups * nb_tiles_per_group * nb_banks_per_tile
@@ -97,13 +103,18 @@ class L1_subsystem(gvsoc.systree.Component):
         remote_out_interface = MempoolXbar(self, 'remote_out_itf', latency=1, bandwidth=bandwidth,
                                            nb_input_port=nb_local_ports, nb_output_port=nb_remote_ports,
                                            shared_rw_bandwidth=True, max_input_pending_size=4)
+        # Each local master is statically assigned an intra-group output port
+        # (round-robin over ports 0..nb_intra_group_ports-1) and, when NoC ports
+        # exist, an inter-group output port (round-robin over the NoC ports,
+        # which start at index nb_intra_group_ports).
         intra_group_selectors = [
-            MempoolXbarSelector(self, f'intra_group_selector_{i}', output_id=0)
+            MempoolXbarSelector(self, f'intra_group_selector_{i}',
+                                output_id=i % nb_intra_group_ports)
             for i in range(nb_local_ports)
         ]
         inter_group_selectors = [
             MempoolXbarSelector(self, f'inter_group_selector_{i}',
-                                output_id=(i % nb_inter_group) + 1 if nb_inter_group > 0 else 0)
+                                output_id=(i % nb_inter_group) + nb_intra_group_ports)
             for i in range(nb_local_ports)
         ] if nb_inter_group > 0 else []
 
@@ -177,7 +188,8 @@ class L1_subsystem(gvsoc.systree.Component):
                     self.bind(local_interleaver, f'out_{i}', intra_group_selectors[j], 'input')
             else:
                 # Inter-group remote target -> route through inter-group selectors.
-                assert nb_inter_group > 0, "Inter-group target requires nb_remote_ports > 1"
+                assert nb_inter_group > 0, \
+                    "Inter-group target requires nb_remote_ports > nb_intra_group_ports"
                 for j, local_interleaver in enumerate(local_interleavers):
                     self.bind(local_interleaver, f'out_{i}', inter_group_selectors[j], 'input')
 

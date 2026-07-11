@@ -78,7 +78,10 @@ class TeranocConfig:
     bank_factor:              int
     l1_bank_bytes:            int
     l1_bank_width:            int   # bytes per L1 bank access (also the HWPE sub-port width)
-    nb_remote_ports_per_tile: int
+    # L1 interconnect ports per tile. "Local" = intra-group neighbor network,
+    # "remote" = inter-group NoC. Narrow ports carry l1_bank_width-byte beats.
+    nb_local_ports_per_tile:  int   # narrow intra-group ports (>= 1)
+    nb_remote_ports_per_tile: int   # narrow inter-group NoC ports
     axi_data_width:           int
     nb_axi_masters_per_group: int
     l2_size:                  int
@@ -117,6 +120,9 @@ class TeranocConfig:
     @property
     def nb_remote_ports_per_group(self):
         return self.nb_tiles_per_group * self.nb_remote_ports_per_tile
+    @property
+    def nb_local_ports_per_group(self):
+        return self.nb_tiles_per_group * self.nb_local_ports_per_tile
     @property
     def nb_axi_masters(self):
         return self.nb_axi_masters_per_group * self.nb_groups
@@ -177,8 +183,9 @@ class TeranocConfig:
         return self.l1_noc_remap_batch_size if self.l1_noc_remap_mode in (2, 3) else 1
     @property
     def nb_remote_ports(self):
-        # 1 intra-group neighbor port + N inter-group NoC ports.
-        return 1 + self.nb_remote_ports_per_tile
+        # L intra-group local ports + N inter-group NoC ports = total L1
+        # subsystem remote ports. Ports 0..L-1 are intra-group, L.. are NoC.
+        return self.nb_local_ports_per_tile + self.nb_remote_ports_per_tile
 
 
 SNITCHMEMPOOL_SCALAR = SnitchCoreConfig(
@@ -212,6 +219,7 @@ TERANOC = TeranocConfig(
     bank_factor              = 4,
     l1_bank_bytes            = 1024,
     l1_bank_width            = 4,
+    nb_local_ports_per_tile  = 1,
     nb_remote_ports_per_tile = 2,
     axi_data_width           = 64,
     nb_axi_masters_per_group = 1,
@@ -235,6 +243,7 @@ MEMPOOL_NOC = TeranocConfig(
     bank_factor              = 4,
     l1_bank_bytes            = 1024,
     l1_bank_width            = 4,
+    nb_local_ports_per_tile  = 1,
     nb_remote_ports_per_tile = 2,
     axi_data_width           = 64,
     nb_axi_masters_per_group = 1,
@@ -258,6 +267,7 @@ MINPOOL_NOC = TeranocConfig(
     bank_factor              = 4,
     l1_bank_bytes            = 1024,
     l1_bank_width            = 4,
+    nb_local_ports_per_tile  = 1,
     nb_remote_ports_per_tile = 2,
     axi_data_width           = 32,
     nb_axi_masters_per_group = 1,
@@ -281,6 +291,7 @@ TENSORPOOL64_NOC = TeranocConfig(
     bank_factor              = 8,
     l1_bank_bytes            = 2048,
     l1_bank_width            = 4,
+    nb_local_ports_per_tile  = 1,
     nb_remote_ports_per_tile = 2,
     axi_data_width           = 64,
     nb_axi_masters_per_group = 1,
@@ -310,6 +321,7 @@ TENSORPOOL256_NOC = TeranocConfig(
     bank_factor              = 8,
     l1_bank_bytes            = 2048,
     l1_bank_width            = 4,
+    nb_local_ports_per_tile  = 1,
     nb_remote_ports_per_tile = 2,
     axi_data_width           = 64,
     nb_axi_masters_per_group = 1,
@@ -340,6 +352,7 @@ MINPOOL_SPATZ4_FPU = TeranocConfig(
     bank_factor              = 4,
     l1_bank_bytes            = 1024,
     l1_bank_width            = 4,
+    nb_local_ports_per_tile  = 1,
     nb_remote_ports_per_tile = 2,
     axi_data_width           = 32,
     nb_axi_masters_per_group = 1,
@@ -364,6 +377,7 @@ MEMPOOL_SPATZ4_FPU = TeranocConfig(
     bank_factor              = 4,
     l1_bank_bytes            = 1024,
     l1_bank_width            = 4,
+    nb_local_ports_per_tile  = 1,
     nb_remote_ports_per_tile = 2,
     axi_data_width           = 64,
     nb_axi_masters_per_group = 1,
@@ -388,6 +402,7 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
     bank_factor              = 4,
     l1_bank_bytes            = 1024,
     l1_bank_width            = 4,
+    nb_local_ports_per_tile  = 1,
     nb_remote_ports_per_tile = 2,
     axi_data_width           = 64,
     nb_axi_masters_per_group = 1,

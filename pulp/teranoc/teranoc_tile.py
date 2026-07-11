@@ -50,12 +50,13 @@ class TeranocTile(st.Component):
 
         # Snitch TCDM (L1 subsystem). Local ports cover Snitch scalar data
         # ports, optional VLSU ports, and, when present, HWPE sub-ports.
-        # Remote: port 0 = intra-group neighbor, 1..N = NoC.
+        # Remote: ports 0..L-1 are intra-group, L..L+N-1 are NoC.
         l1 = l1_subsystem.L1_subsystem(self, 'l1',
             tile_id=tile_id, group_id=group_id,
             nb_tiles_per_group=arch.nb_tiles_per_group, nb_groups=arch.nb_groups,
             nb_local_ports=arch.nb_local_ports_for(has_redmule),
             nb_remote_ports=arch.nb_remote_ports,
+            nb_intra_group_ports=arch.nb_local_ports_per_tile,
             size=arch.l1_per_tile_bytes, bandwidth=4,
             nb_banks_per_tile=arch.nb_banks_per_tile,
             axi_data_width=arch.axi_data_width)
@@ -199,9 +200,11 @@ class TeranocTile(st.Component):
                 self.bind(hwpe_addr_scrambler_list[i], 'output', l1,
                     f'local_in_{arch.redmule_local_port_id(i)}')
 
-        # Remote ports: index 0 is the intra-group neighbor; 1..N are the NoC.
-        self.bind(self, 'loc_remt_slave_in', l1, 'remote_in_0')
-        self.bind(l1, 'remote_out_0', self, 'loc_remt_master_out')
+        # Remote ports: indices 0..L-1 are intra-group neighbor ports;
+        # L..L+N-1 are the NoC ports (L = arch.nb_local_ports_per_tile).
+        for i in range(0, arch.nb_local_ports_per_tile):
+            self.bind(self, f'loc_remt_slave_in_{i}', l1, f'remote_in_{i}')
+            self.bind(l1, f'remote_out_{i}', self, f'loc_remt_master_out_{i}')
 
         for i in range(0, arch.nb_remote_ports_per_tile):
             self.bind(l1_noc_itf, f'noc_req_mst_{i}', self, f'l1_noc_req_mst_{i}')
@@ -210,8 +213,9 @@ class TeranocTile(st.Component):
             self.bind(l1_noc_itf, f'noc_resp_slv_{i}', self, f'l1_noc_resp_slv_{i}')
 
         for i in range(0, arch.nb_remote_ports_per_tile):
-            self.bind(l1_noc_itf, f'tcdm_req_mst_{i}', l1, f'remote_in_{i + 1}')
-            self.bind(l1, f'remote_out_{i + 1}', l1_noc_itf, f'core_req_slv_{i}')
+            noc_remote_port = arch.nb_local_ports_per_tile + i
+            self.bind(l1_noc_itf, f'tcdm_req_mst_{i}', l1, f'remote_in_{noc_remote_port}')
+            self.bind(l1, f'remote_out_{noc_remote_port}', l1_noc_itf, f'core_req_slv_{i}')
 
         self.bind(self, 'dma_tcdm', l1, 'dma')
 

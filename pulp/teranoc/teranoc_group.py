@@ -45,9 +45,15 @@ class TeranocGroup(st.Component):
                 tile_id=i, group_id_x=group_id_x, group_id_y=group_id_y,
                 has_redmule=(i < arch.nb_redmule_tiles_per_group)))
 
-        #Group local interconnect
-        group_local_interleaver = Interleaver(self, 'group_local_interleaver', nb_slaves=arch.nb_tiles_per_group, nb_masters=arch.nb_tiles_per_group,
-            interleaving_bits=int(math.log2(4*arch.nb_banks_per_tile)), offset_translation=False)
+        #Group local interconnect: one interleaver per local port. The local
+        #ports replicate the intra-group network, so local-port k of every tile
+        #forms its own crossbar (network k). Requests are spread across the k
+        #networks by the per-master selectors inside each tile's L1 subsystem.
+        group_local_interleavers = []
+        for k in range(0, arch.nb_local_ports_per_tile):
+            group_local_interleavers.append(Interleaver(self, f'group_local_interleaver_{k}',
+                nb_slaves=arch.nb_tiles_per_group, nb_masters=arch.nb_tiles_per_group,
+                interleaving_bits=int(math.log2(4*arch.nb_banks_per_tile)), offset_translation=False))
 
         # L1 NoC Request Router
         l1_noc_req_routers = []
@@ -87,12 +93,14 @@ class TeranocGroup(st.Component):
         ##########               Design Bindings              ##########
         ################################################################
         #Tile local master -> Group local interconnect
-        for i in range(0, arch.nb_tiles_per_group):
-            self.bind(self.tile_list[i], 'loc_remt_master_out', group_local_interleaver, 'in_%d' % i)
+        for k in range(0, arch.nb_local_ports_per_tile):
+            for i in range(0, arch.nb_tiles_per_group):
+                self.bind(self.tile_list[i], f'loc_remt_master_out_{k}', group_local_interleavers[k], 'in_%d' % i)
 
         #Group local interconnect -> Tile local slave
-        for i in range(0, arch.nb_tiles_per_group):
-            self.bind(group_local_interleaver, 'out_%d' % i, self.tile_list[i], 'loc_remt_slave_in')
+        for k in range(0, arch.nb_local_ports_per_tile):
+            for i in range(0, arch.nb_tiles_per_group):
+                self.bind(group_local_interleavers[k], 'out_%d' % i, self.tile_list[i], f'loc_remt_slave_in_{k}')
 
         for i in range(0, arch.nb_tiles_per_group):
             for port in range(0, arch.nb_remote_ports_per_tile):
