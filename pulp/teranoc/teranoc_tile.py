@@ -18,10 +18,10 @@
 #         Yichao Zhang (ETH Zurich) (yiczhang@iis.ee.ethz.ch)
 
 from pulp.cpu.iss.snitch_mempool import SnitchMempool, SnitchMempoolConfig
-from pulp.mempool.hierarchical_cache import Hierarchical_cache
 from pulp.mempool.xbar.mempool_xbar import MempoolXbar
 from pulp.mempool.l1_interconnect.l1_remote_itf import L1_RemoteItf
 import pulp.teranoc.l1_subsystem as l1_subsystem
+from pulp.teranoc.hierarchical_cache import Hierarchical_cache
 import interco.router as router
 import gvsoc.systree as st
 from pulp.mempool.l1_interconnect.l1_address_scrambler import L1AddressScrambler
@@ -94,8 +94,11 @@ class TeranocTile(st.Component):
                                     tile_id=tile_id, group_id_x=group_id_x, group_id_y=group_id_y, nb_x_groups=arch.nb_x_groups, nb_y_groups=arch.nb_y_groups, \
                                     byte_offset=2, num_tiles_per_group=arch.nb_tiles_per_group, num_banks_per_tile=arch.nb_banks_per_tile)
 
-        # Shared icache
-        icache = Hierarchical_cache(self, 'shared_icache', nb_cores=arch.nb_snitch_per_tile, synchronous=False)
+        # Shared icache. The TeraNoC-specific hierarchy mirrors the cache parameters
+        # in the RTL mempool_pkg.sv instead of inheriting Mempool's configuration.
+        icache = Hierarchical_cache(
+            self, 'shared_icache', num_cores_per_cache=arch.nb_snitch_per_tile,
+            num_fus_per_core=arch.bank_multiplier_per_snitch, synchronous=False)
 
         # Snitch scalar LSU address scramblers.
         snitch_address_scrambler_list = []
