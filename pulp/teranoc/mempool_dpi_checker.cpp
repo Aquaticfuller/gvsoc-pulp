@@ -76,6 +76,7 @@ private:
     static float bits_to_f32(uint32_t bits);
     static float fp16_to_float(uint16_t value);
     static float fp8_to_float(uint8_t value);
+    static bool check_fp_error(float result, float expected, float tolerance);
     static unsigned int clog2_floor_power2(uint64_t value);
     static uint64_t bit_mask(unsigned int bits);
     static unsigned int elem_size_for_type(uint32_t check_type);
@@ -249,6 +250,20 @@ float MempoolDpiChecker::fp8_to_float(uint8_t value)
 }
 
 
+bool MempoolDpiChecker::check_fp_error(float result, float expected,
+                    float tolerance) {
+  if (std::isnan(result) || std::isnan(expected) || std::isnan(tolerance)) {
+    return true;
+  }
+  if (std::isinf(result) || std::isinf(expected)) {
+    return result != expected;
+  }
+
+  float diff = result - expected;
+  return (diff > tolerance) || (diff < -tolerance);
+}
+
+
 uint8_t MempoolDpiChecker::read_l2_byte(uint64_t addr)
 {
     uint64_t l2_limit = (uint64_t)this->l2_base + this->l2_size;
@@ -392,9 +407,9 @@ int MempoolDpiChecker::compare_f8(const uint8_t *result, const uint8_t *golden,
     float tol = MempoolDpiChecker::fp8_to_float(tolerance);
     for (int i = 0; i < count; i++)
     {
-        float diff = MempoolDpiChecker::fp8_to_float(result[i]) -
-            MempoolDpiChecker::fp8_to_float(golden[i]);
-        bool error = (diff > tol) || (diff < -tol);
+        float res = MempoolDpiChecker::fp8_to_float(result[i]);
+        float exp = MempoolDpiChecker::fp8_to_float(golden[i]);
+        bool error = MempoolDpiChecker::check_fp_error(res, exp, tol);
         if (error)
         {
             errors++;
@@ -416,9 +431,9 @@ int MempoolDpiChecker::compare_f16(const uint8_t *result, const uint8_t *golden,
     {
         uint16_t exp_bits = MempoolDpiChecker::load_u16(&golden[2 * i]);
         uint16_t res_bits = MempoolDpiChecker::load_u16(&result[2 * i]);
-        float diff = MempoolDpiChecker::fp16_to_float(res_bits) -
-            MempoolDpiChecker::fp16_to_float(exp_bits);
-        bool error = (diff > tolerance) || (diff < -tolerance);
+        float res = MempoolDpiChecker::fp16_to_float(res_bits);
+        float exp = MempoolDpiChecker::fp16_to_float(exp_bits);
+        bool error = MempoolDpiChecker::check_fp_error(res, exp, tolerance);
         if (error)
         {
             errors++;
@@ -440,9 +455,9 @@ int MempoolDpiChecker::compare_f32(const uint8_t *result, const uint8_t *golden,
     {
         uint32_t exp_bits = MempoolDpiChecker::load_u32(&golden[4 * i]);
         uint32_t res_bits = MempoolDpiChecker::load_u32(&result[4 * i]);
-        float diff = MempoolDpiChecker::bits_to_f32(res_bits) -
-            MempoolDpiChecker::bits_to_f32(exp_bits);
-        bool error = (diff > tolerance) || (diff < -tolerance);
+        float res = MempoolDpiChecker::bits_to_f32(res_bits);
+        float exp = MempoolDpiChecker::bits_to_f32(exp_bits);
+        bool error = MempoolDpiChecker::check_fp_error(res, exp, tolerance);
         if (error)
         {
             errors++;
