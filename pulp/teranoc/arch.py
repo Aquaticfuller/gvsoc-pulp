@@ -59,7 +59,17 @@ class RedmuleConfig:
     ce_width:    int
     ce_pipe:     int
     elem_size:   int   # bytes per element (2 = FP16, 1 = INT8/FP8)
-    queue_depth: int   # max outstanding TCDM bursts
+    rob_depth:   int   # outstanding loads in each RTL X/W/Y stream ROB
+
+    @property
+    def max_outstanding_loads(self) -> int:
+        return 4 * self.rob_depth
+
+    @property
+    def queue_depth(self) -> int:
+        # LightRedmule has one global pool and preserves the legacy inclusive
+        # `outstanding <= queue_depth` gate, so N slots require a threshold N-1.
+        return self.max_outstanding_loads - 1
 
     @property
     def req_width(self) -> int:
@@ -110,6 +120,11 @@ class TeranocConfig:
     @property
     def nb_banks_per_group(self): return self.nb_banks_per_tile * self.nb_tiles_per_group
     @property
+    def l1_size(self):
+        # Total shared-L1/TCDM size in bytes (== RTL L1_SIZE). Used e.g. to size
+        # the iDMA local (TCDM) window so DMAs to the whole L1 route correctly.
+        return self.nb_banks_per_tile * self.nb_tiles_total * self.l1_bank_bytes
+    @property
     def total_snitch(self):       return self.nb_snitch_per_tile * self.nb_tiles_total
     @property
     def l1_per_tile_bytes(self):  return self.nb_banks_per_tile * self.l1_bank_bytes
@@ -130,9 +145,15 @@ class TeranocConfig:
     def has_vector(self):
         return self.vector is not None
     @property
+    def num_fus_per_core(self):
+        # RTL NumFUsPerCore = max(NumIPUsPerCore, NumFPUsPerCore); 1 for a scalar
+        # core. Drives the shared-icache line width / size / ways (mempool_pkg.sv
+        # ICacheLineWidth/ICacheSizeByte) as well as the TCDM bank count.
+        return 1 if self.vector is None else self.vector.nb_lanes
+    @property
     def bank_multiplier_per_snitch(self):
         # RTL Spatz configs scale TCDM banks by NumFUsPerCore.
-        return 1 if self.vector is None else self.vector.nb_lanes
+        return self.num_fus_per_core
     @property
     def nb_banks_per_tile(self):
         return self.nb_snitch_per_tile * self.bank_factor * self.bank_multiplier_per_snitch
@@ -195,7 +216,7 @@ SNITCHMEMPOOL_SCALAR = SnitchCoreConfig(
 )
 
 SNITCHMEMPOOL_VECTOR_CORE = SnitchCoreConfig(
-    isa             = 'rv32imafcv',
+    isa             = 'rv32imafv',
     zfinx           = False,
     lsu_outstanding = 8,
 )
@@ -204,14 +225,14 @@ SNITCHMEMPOOL_VECTOR = SnitchVectorConfig(
     vlen             = 512,
     nb_ipus          = 4,
     nb_fpus          = 4,
-    lane_width       = 8,
+    lane_width       = 4,
     rvf              = True,
     rvd              = False,
     vlsu_outstanding = 8,
 )
 
 
-TERANOC = TeranocConfig(
+TERAPOOL = TeranocConfig(
     nb_snitch_per_tile       = 4,
     nb_tiles_per_group       = 16,
     nb_x_groups              = 4,
@@ -235,7 +256,7 @@ TERANOC = TeranocConfig(
     nb_redmule_tiles_per_group = 0,
 )
 
-MEMPOOL_NOC = TeranocConfig(
+MEMPOOL = TeranocConfig(
     nb_snitch_per_tile       = 4,
     nb_tiles_per_group       = 16,
     nb_x_groups              = 2,
@@ -259,7 +280,7 @@ MEMPOOL_NOC = TeranocConfig(
     nb_redmule_tiles_per_group = 0,
 )
 
-MINPOOL_NOC = TeranocConfig(
+MINPOOL = TeranocConfig(
     nb_snitch_per_tile       = 4,
     nb_tiles_per_group       = 1,
     nb_x_groups              = 2,
@@ -268,22 +289,22 @@ MINPOOL_NOC = TeranocConfig(
     l1_bank_bytes            = 1024,
     l1_bank_width            = 4,
     nb_local_ports_per_tile  = 1,
-    nb_remote_ports_per_tile = 2,
+    nb_remote_ports_per_tile = 1,
     axi_data_width           = 32,
     nb_axi_masters_per_group = 1,
     l2_size                  = 0x400000,
     nb_l2_banks              = 4,
-    l2_axi_interleave        = 16,
-    l1_noc_remap_mode        = 3,
-    l1_noc_remap_batch_size  = 4,
-    l1_noc_remap_shuffle     = True,
+    l2_axi_interleave        = 2,
+    l1_noc_remap_mode        = 0,
+    l1_noc_remap_batch_size  = 2,
+    l1_noc_remap_shuffle     = False,
     snitch                  = SNITCHMEMPOOL_SCALAR,
     vector                   = None,
     redmule                  = None,
     nb_redmule_tiles_per_group = 0,
 )
 
-TENSORPOOL64_NOC = TeranocConfig(
+TENSORPOOL64 = TeranocConfig(
     nb_snitch_per_tile       = 4,
     nb_tiles_per_group       = 4,
     nb_x_groups              = 2,
@@ -308,12 +329,12 @@ TENSORPOOL64_NOC = TeranocConfig(
         ce_width    = 16,
         ce_pipe     = 3,
         elem_size   = 2,
-        queue_depth = 128,
+        rob_depth   = 16,
     ),
     nb_redmule_tiles_per_group = 1,
 )
 
-TENSORPOOL256_NOC = TeranocConfig(
+TENSORPOOL256 = TeranocConfig(
     nb_snitch_per_tile       = 4,
     nb_tiles_per_group       = 4,
     nb_x_groups              = 4,
@@ -325,8 +346,8 @@ TENSORPOOL256_NOC = TeranocConfig(
     nb_remote_ports_per_tile = 2,
     axi_data_width           = 64,
     nb_axi_masters_per_group = 1,
-    l2_size                  = 0x400000,
-    nb_l2_banks              = 4,
+    l2_size                  = 0x1000000,
+    nb_l2_banks              = 16,
     l2_axi_interleave        = 16,
     l1_noc_remap_mode        = 3,
     l1_noc_remap_batch_size  = 4,
@@ -338,13 +359,49 @@ TENSORPOOL256_NOC = TeranocConfig(
         ce_width    = 32,
         ce_pipe     = 3,
         elem_size   = 2,
-        queue_depth = 128,
+        rob_depth   = 16,
+    ),
+    nb_redmule_tiles_per_group = 1,
+)
+
+TENSORPOOL256_SPATZ4 = TeranocConfig(
+    # RTL toy LLM-benchmark config `tensorpool256_spatz4`: TENSORPOOL256
+    # topology (256 cores, 4/tile, 4 tiles/group, 16 groups) with BOTH a
+    # per-core Spatz vector unit AND a per-tile RedMule HWPE, plus a 512 MiB L2.
+    # L1 auto-scales to 8 MiB via bank_multiplier_per_snitch = nb_lanes = 4.
+    nb_snitch_per_tile       = 4,
+    nb_tiles_per_group       = 4,
+    nb_x_groups              = 4,
+    nb_y_groups              = 4,
+    # RTL config/tensorpool256_spatz4.mk uses banking_factor 4, not the 8 of the
+    # non-Spatz tensorpool256: Spatz already scales banks by NumFUsPerCore.
+    bank_factor              = 4,
+    l1_bank_bytes            = 2048,
+    l1_bank_width            = 4,
+    nb_local_ports_per_tile  = 1,
+    nb_remote_ports_per_tile = 2,
+    axi_data_width           = 64,
+    nb_axi_masters_per_group = 1,
+    l2_size                  = 0x20000000,
+    nb_l2_banks              = 16,
+    l2_axi_interleave        = 16,
+    l1_noc_remap_mode        = 3,
+    l1_noc_remap_batch_size  = 4,
+    l1_noc_remap_shuffle     = True,
+    snitch                  = SNITCHMEMPOOL_VECTOR_CORE,
+    vector                   = SNITCHMEMPOOL_VECTOR,
+    redmule                  = RedmuleConfig(
+        ce_height   = 8,
+        ce_width    = 32,
+        ce_pipe     = 3,
+        elem_size   = 2,
+        rob_depth   = 16,
     ),
     nb_redmule_tiles_per_group = 1,
 )
 
 MINPOOL_SPATZ4_FPU = TeranocConfig(
-    # Mirrors config/minpool_spatz4_fpu.mk in TeraNoC-Spatz.
+    # Mirrors config/minpool_spatz4_fpu.mk in TeraNoC.
     nb_snitch_per_tile       = 1,
     nb_tiles_per_group       = 1,
     nb_x_groups              = 2,
@@ -369,7 +426,7 @@ MINPOOL_SPATZ4_FPU = TeranocConfig(
 )
 
 MEMPOOL_SPATZ4_FPU = TeranocConfig(
-    # Mirrors config/mempool_spatz4_fpu.mk in TeraNoC-Spatz.
+    # Mirrors config/mempool_spatz4_fpu.mk in TeraNoC.
     nb_snitch_per_tile       = 1,
     nb_tiles_per_group       = 16,
     nb_x_groups              = 2,
@@ -394,7 +451,7 @@ MEMPOOL_SPATZ4_FPU = TeranocConfig(
 )
 
 TERAPOOL_SPATZ4_FPU = TeranocConfig(
-    # Mirrors config/terapool_spatz4_fpu.mk in TeraNoC-Spatz.
+    # Mirrors config/terapool_spatz4_fpu.mk in TeraNoC.
     nb_snitch_per_tile       = 1,
     nb_tiles_per_group       = 16,
     nb_x_groups              = 4,
@@ -418,22 +475,17 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
     nb_redmule_tiles_per_group = 0,
 )
 
-# Backward-compatible alias kept for existing GVSoC command lines.
-MINPOOL_VECTOR_NOC = MINPOOL_SPATZ4_FPU
-TERANOC_SPATZ4_FPU = TERAPOOL_SPATZ4_FPU
-
 
 CONFIGS = {
-    'teranoc':         TERANOC,
-    'mempool_noc':     MEMPOOL_NOC,
-    'minpool_noc':     MINPOOL_NOC,
-    'tensorpool64_noc': TENSORPOOL64_NOC,
-    'tensorpool256_noc': TENSORPOOL256_NOC,
+    'terapool':        TERAPOOL,
+    'mempool':         MEMPOOL,
+    'minpool':         MINPOOL,
+    'tensorpool64':    TENSORPOOL64,
+    'tensorpool256':   TENSORPOOL256,
+    'tensorpool256_spatz4': TENSORPOOL256_SPATZ4,
     'minpool_spatz4_fpu': MINPOOL_SPATZ4_FPU,
     'mempool_spatz4_fpu': MEMPOOL_SPATZ4_FPU,
     'terapool_spatz4_fpu': TERAPOOL_SPATZ4_FPU,
-    'teranoc_spatz4_fpu': TERANOC_SPATZ4_FPU,
-    'minpool_vector_noc': MINPOOL_VECTOR_NOC,
 }
 
-DEFAULT_CONFIG = 'teranoc'
+DEFAULT_CONFIG = 'terapool'
