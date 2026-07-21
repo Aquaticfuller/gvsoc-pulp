@@ -17,7 +17,7 @@ import pulp.ara.ara_v2
 from config_tree import cfg_field
 from cpu.iss.isa_gen.isa_gen import Isa
 from cpu.iss.isa_gen.isa_pulpv2 import PulpV2
-from cpu.iss.isa_gen.isa_smallfloats import Xf16, Xf16alt, Xf8, Xfaux, XfvecSnitch
+from cpu.iss.isa_gen.isa_smallfloats import Xf16, Xfaux, XfvecSnitch
 from cpu.iss_v2.riscv import (Arch, ExecInOrder, IssModule, Lsu, LsuV2, Offload,
                               PrefetchSingleLine, Regfile, RiscvCommon)
 from cpu.iss_v2.riscv_config import RiscvConfig
@@ -74,7 +74,60 @@ class IrqMempool(IssModule):
         ])
 
 
+class SnitchMempoolEvent(IssModule):
+    """Events implementation carrying the Snitch/Spatz scalar-FPU timing state."""
+
+    @override
+    def gen(self, iss: RiscvCommon):
+        iss.isa.add_define('CONFIG_GVSOC_ISS_EVENT', 'SnitchMempoolEvents')
+        iss.isa.add_include(
+            '<cpu/iss_v2/include/cores/snitchmempool/events.hpp>')
+        iss.isa.add_implem_include(
+            '<cpu/iss_v2/include/cores/snitchmempool/events_implem.hpp>')
+        iss.add_sources([
+            'cpu/iss_v2/src/event/event.cpp',
+            'cpu/iss_v2/src/cores/snitchmempool/events.cpp',
+        ])
+
+
 _isa_instances: dict[str, Isa] = {}
+
+
+def _apply_rtl_instruction_legality(isa: Isa, spatz: bool):
+    """Keep the generated ISA within the two instantiated FPU backends."""
+    scalar_dotp = {
+        'vfdotpex.s.h',
+        'vfdotpex.s.r.h',
+        'vfndotpex.s.h',
+        'vfndotpex.s.r.h',
+    }
+    scalar_fp_memory = {'flb', 'fsb', 'flh', 'fsh', 'flw', 'fsw', 'fld', 'fsd'}
+    scalar_missing_sum = {'vfsum.s', 'vfnsum.s', 'vfsum.h', 'vfnsum.h'}
+    spatz_missing_rvv_fp = {
+        'vmfeq.vv', 'vmfeq.vf', 'vmfne.vv', 'vmfne.vf',
+        'vmfle.vv', 'vmfle.vf', 'vmflt.vv', 'vmflt.vf',
+        'vmfgt.vf', 'vmfge.vf', 'vfncvt.rod.f.f.w',
+    }
+
+    for insn in isa.get_insns():
+        label = insn.get_label()
+        disabled = (
+            label.startswith(('fdiv.', 'fsqrt.', 'vfdiv.', 'vfsqrt.')) or
+            '.ah' in label
+        )
+
+        if not spatz:
+            disabled = (
+                disabled or
+                label in scalar_fp_memory or
+                label in scalar_missing_sum or
+                (insn.isa.name == 'faux' and label not in scalar_dotp)
+            )
+        else:
+            disabled = disabled or label in spatz_missing_rvv_fp
+
+        if disabled:
+            insn.set_active(False)
 
 
 class SnitchMempool(RiscvCommon):
@@ -84,23 +137,35 @@ class SnitchMempool(RiscvCommon):
 
     def __init__(self, parent: Component, name: str, config: SnitchMempoolConfig):
 
+        if config.vector and config.zfinx:
+            raise ValueError(
+                "SnitchMempool with Spatz requires a private floating-point register file "
+                "(vector=True requires zfinx=False)")
+
         cache_key = ('vector_' if config.vector else 'scalar_') + config.isa
         isa_instance: Isa | None = _isa_instances.get(cache_key)
 
         if isa_instance is None:
             if config.vector:
-                extensions = [Xf16(), Xf8(), XfvecSnitch(), Xfaux()]
+                # Spatz's MemPool fpnew instance implements FP32/FP16. It has
+                # no scalar packed-Xfvec/Xfaux, FP8, DIVSQRT, DOTP, or FP64 unit.
+                extensions = [Xf16()]
             else:
-                extensions = [Xf16(), Xf8(), XfvecSnitch(), Xfaux(),
+                # Scalar MemPool uses Zfinx with FP32/FP16 and packed Xfvec.
+                # Xfaux supplies the four extended dot products which the
+                # scalar decoder routes to fpnew's enabled DOTP operation group.
+                extensions = [Xf16(), XfvecSnitch(), Xfaux(),
                               PulpV2(hwloop=False, elw=False)]
             isa_instance = cpu.iss.isa_gen.isa_riscv_gen.RiscvIsa(
                 'snitch_mempool_' + cache_key, config.isa, extensions=extensions)
             if config.vector:
                 pulp.ara.ara_v2.extend_isa(isa_instance)
+            _apply_rtl_instruction_legality(isa_instance, config.vector)
             _isa_instances[cache_key] = isa_instance
 
         modules: dict[str, IssModule] = {
             'arch': ArchSnitchMempool(),
+            'event': SnitchMempoolEvent(),
             'exec': ExecInOrder(scoreboard=True),
             'regfile': Regfile(scoreboard=True),
             'prefetch': PrefetchSingleLine(),

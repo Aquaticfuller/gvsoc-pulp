@@ -85,7 +85,7 @@ class Tile(st.Component):
             if use_spatz:
                 config = SnitchMempoolConfig(isa="rv32imafv", fetch_enable=False,
                     boot_addr=0, hart_id=core_global_id, htif=False, nb_outstanding=8, 
-                    vector=True, nb_lanes=nb_fus_per_core, lane_width=4)
+                    vector=True, zfinx=False, nb_lanes=nb_fus_per_core, lane_width=4)
                 self.cores.append(SnitchMempool(self, f'pe{core_id}', config=config))
 
             else:

@@ -25,7 +25,7 @@ class SnitchMempool
 public:
     SnitchMempool(Iss &iss);
 
-    void start() {}
+    void start();
     void stop() {}
     void reset(bool active);
 
