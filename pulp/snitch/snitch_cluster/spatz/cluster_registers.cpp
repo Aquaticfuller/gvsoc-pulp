@@ -142,6 +142,29 @@ vp::IoReqStatus ClusterRegisters::core_req(vp::Block *__this, vp::IoReq *req, in
         return vp::IO_REQ_OK;
     }
 
+    // CachePool HW_BARRIER lives at PERIPH+0x10 (software/snRuntime/include/cachepool_peripheral.h:
+    // HW_BARRIER_REG_OFFSET 0x10; _snrt_cluster_barrier is a single blocking `lw` of that address). The
+    // generated *spatz* regmap has regwidth 64 and puts HART_SELECT_0 at 0x10 and HW_BARRIER at 0x40, so a
+    // CachePool barrier read never reached hw_barrier_req(): it returned 0 immediately, barrier_status stayed
+    // 0 and the barrier_req/barrier_ack wires were dead. Result: snrt_cluster_hw_barrier() NEVER BLOCKED for
+    // any CachePool binary, cores drifted apart across loop iterations, and cross-core reductions (fdotp's
+    // result[]) mixed values from different iterations — a timing-sensitive wrong result. Route 0x10 to the
+    // real counting barrier, which parks each arriving core with IO_REQ_PENDING and responds to all of them
+    // once the last one checks in.
+    if (_this->cachepool_mode && offset == 0x10)
+    {
+        _this->hw_barrier_req(0x10, size, data, is_write);
+        if (!is_write && data != nullptr) memset(data, 0, size);
+        req->inc_latency(11);
+        if (_this->stall_core)
+        {
+            _this->waiting_reqs[id] = req;
+            _this->stall_core = false;
+            return vp::IO_REQ_PENDING;
+        }
+        return vp::IO_REQ_OK;
+    }
+
     // CachePool register block (L1D-config / EOC@0x24) not present in the spatz regmap.
     if (_this->cachepool_mode && _this->cachepool_access(offset, size, data, is_write))
     {
@@ -243,9 +266,32 @@ bool ClusterRegisters::cachepool_access(uint64_t offset, int size, uint8_t *data
         if (!is_write && data != nullptr) memset(data, 0, size);
         return true;
     }
+    // Older-layout L1D config block (0x28..0x4c), used by the cachepool_fpu_512 binaries. Restores the
+    // pre-integration behaviour: RW scratch, with L1D_FLUSH_STATUS (0x3c) always reading 0 so snrt's
+    // l1d_wait() exits immediately. Without it these offsets fall through to the regmap, which reports
+    // "Accessing invalid register" and exits 1 (observed at 0x3c and 0x4c). Safe for the newer layout too:
+    // this whole function only runs in cachepool_mode, and the cachepool_v2 target uses its own peripheral
+    // model (cachepool_v2_cluster_peripheral.cpp), not this one.
+    if (offset >= 0x28 && offset <= 0x4c)
+    {
+        int idx = (int)((offset - 0x28) / 4);          // 0..9
+        int n = size < 4 ? (int)size : 4;
+        if (is_write)
+        {
+            if (data != NULL) memcpy(&this->cp_l1d[idx], data, n);
+        }
+        else if (data != NULL)
+        {
+            uint32_t v = (offset == 0x3c) ? 0 : this->cp_l1d[idx];
+            memcpy(data, &v, n);
+        }
+        return true;
+    }
     if (offset >= 0x58 && offset <= 0xa4)
     {
-        int idx = (int)((offset - 0x58) / 4);
+        // NOTE: indices are offset by 10 to stay clear of the 0x28..0x4c block above. The original form
+        // (offset-0x58)/4 reaches 19, which overran the 16-entry cp_l1d[] array.
+        int idx = 10 + (int)((offset - 0x58) / 4);     // 10..29
         int n = size < 4 ? (int)size : 4;
         if (is_write)
         {
