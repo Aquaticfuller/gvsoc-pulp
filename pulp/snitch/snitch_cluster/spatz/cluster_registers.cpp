@@ -220,6 +220,21 @@ bool ClusterRegisters::cachepool_access(uint64_t offset, int size, uint8_t *data
     // aligned base offset and fires a force_warning (→ exit(1) under --werror) for any mid-register
     // access. Intercept all of 0x00–0x2F here as scratch (reads return 0, writes ignored). Safe
     // because CL_CLINT (0x30/0x38) and HW_BARRIER (0x40) are above this range and still fall through.
+    //
+    // EXCEPT 0x24: the OLDER CachePool software layout (config cachepool_fpu_512, the CachePoolTests
+    // binaries our `cachepool` target runs) signals end-of-computation at CLUSTER_EOC_EXIT = 0x24 with
+    // retval in bits[3:1], whereas the newer layout above (cachepool_fpu_16g / dev/multi-group) uses
+    // 0x68. Both are supported: swallowing 0x24 as perf-counter scratch makes the older binaries never
+    // terminate (they hang with no output). 0x24 is PERF_COUNTER_0+4 in the new layout, which software
+    // only ever reads, so treating a WRITE as EOC is safe for both revisions.
+    if (offset == 0x24 && is_write && data != NULL && (data[0] & 0x1))
+    {
+        int retval = (data[0] >> 1) & 0x7;
+        fprintf(stderr, "[EOC] Simulation exiting: retval=%d cycles=%ld\n",
+                retval, (long)this->clock.get_cycles());
+        this->time.get_engine()->quit(retval);
+        return true;
+    }
     if (offset < 0x30)
     {
         if (!is_write && data != nullptr) memset(data, 0, size);
