@@ -235,7 +235,10 @@ bool ClusterRegisters::cachepool_access(uint64_t offset, int size, uint8_t *data
         this->time.get_engine()->quit(retval);
         return true;
     }
-    if (offset < 0x30)
+    // EXCEPT 0x20: CLUSTER_BOOT_CONTROL in the older layout. The ElfLoader writes the ELF entry there and
+    // the bootrom reads it back (tcdm_end+0x20) to jump to _start. Swallowing it as scratch makes every core
+    // read 0 and jump to 0 -> the run never terminates. Fall through to the regmap, which models it.
+    if (offset < 0x30 && offset != 0x20)
     {
         if (!is_write && data != nullptr) memset(data, 0, size);
         return true;
