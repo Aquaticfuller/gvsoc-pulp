@@ -167,7 +167,11 @@ class CachePoolSoc(gvsoc.systree.Component):
         narrow_axi = router.Router(self, 'narrow_axi', bandwidth=8)
         wide_axi   = router.Router(self, 'wide_axi', bandwidth=64)
         uart       = CachePoolUart(self, 'uart')
-        uncached   = memory.memory.Memory(self, 'uncached', size=UNCACHED_SIZE, atomics=True, width_log2=2)
+        # The kernel's input data (.pdcp_src, e.g. fdotp's A/B at 0xA0000000) streams through this
+        # uncached path. width_log2=2 (4 B/cycle) 8x-under-provisions the ~32 B/cycle aggregate VLSU
+        # stream, so its busy-stamp (memory.cpp next_packet_start) diverges and get_full_latency()
+        # grows without bound (the A1 delayed-commit then exposes it as a ~3.5x collapse). width_log2=6.
+        uncached   = memory.memory.Memory(self, 'uncached', size=UNCACHED_SIZE, atomics=True, width_log2=6)
         cluster    = SnitchCluster(self, 'cluster_0', cluster_arch, parser, entry=entry,
                                    binaries=debug_binaries)
         # The bootrom reads the ELF entry from CLUSTER_BOOT_CONTROL (peripheral + 0x20).
@@ -265,7 +269,11 @@ class CachePoolBoard(gvsoc.systree.Component):
             mem = memory.dramsys.Dramsys(self, 'mem')
             mem.add_properties({'dram-type': os.environ.get('CACHEPOOL_DRAM_TYPE', 'ddr4-example.json')})
         else:
-            mem = memory.memory.Memory(self, 'mem', size=DRAM_CACHED_SIZE, atomics=True, width_log2=2)
+            # width_log2=6 (64 B/cycle): the plain memory's per-packet occupancy (memory.cpp
+            # next_packet_start) must sustain the aggregate VLSU stream (~32 B/cycle at 4 cores), else
+            # its busy-stamp diverges and get_full_latency() grows without bound — which the A1 delayed-
+            # commit then exposes as a ~3.5x collapse. width_log2=2 (4 B/cycle) was an 8x under-provision.
+            mem = memory.memory.Memory(self, 'mem', size=DRAM_CACHED_SIZE, atomics=True, width_log2=6)
 
         self.bind(clock, 'out', chip, 'clock')
         self.bind(clock, 'out', mem, 'clock')
