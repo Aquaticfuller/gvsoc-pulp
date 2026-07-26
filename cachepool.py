@@ -131,11 +131,15 @@ def _make_arch(target):
     # separate SPMs. 1 group (4-core) = one shared SPM (the passing MINIMAL case); NB_TILE groups (16-core) =
     # 4 per-tile SPMs. (A single shared SPM collides 16 stacks; fully per-core breaks shared l1alloc.)
     cluster.private_spm = True
-    # DiyouS's 53effd9 switched this to NB_CORE (per-core SPM), which suits his cachepool_v2 software; for
-    # the CachePoolTests (cachepool_fpu_512) binaries this target runs, per-core SPM breaks snrt's SHARED
-    # l1alloc and the run hangs. Keep our verified per-TILE default, overridable for his configuration:
-    #   CACHEPOOL_SPM_GROUPS=<n>  (n=NB_CORE → per-core, n=1 → one shared SPM)
-    cluster.spm_num_groups = int(os.environ.get('CACHEPOOL_SPM_GROUPS', str(NB_TILE)))
+    # Per-core-private SPM — the RTL CachePool organization (each core's [TCDMStartAddr,+2KiB) window is
+    # physically private), and REQUIRED by these binaries: the snrt crt0 gives every hart the SAME stack VA,
+    # so a shared SPM makes all cores' stack frames land on the same physical addresses and they clobber
+    # each other (confirmed 2026-07-25: byte-enable's _vsnprintf saved-ra slot was overwritten by another
+    # core's printf_ frame → ret to 0x0 → instruction-access-fault trap; fixed by per-core SPM). None of
+    # the 8 CI kernels use snrt_l1alloc (verified: 0 symbols), so the earlier "per-core breaks shared
+    # l1alloc" concern does not apply to this suite. Override: CACHEPOOL_SPM_GROUPS=<n> (n=1 → one shared
+    # SPM, n=NB_TILE → per-tile).
+    cluster.spm_num_groups = int(os.environ.get('CACHEPOOL_SPM_GROUPS', str(NB_CORE)))
     if use_cache:
         # Cache fronts the cached DRAM PMA [DRAM_BASE, UNCACHED_BASE). Uncached/SPM/peripheral stay direct.
         # Refills route via cluster wide_axi → o_WIDE_SOC → SoC DRAM.
