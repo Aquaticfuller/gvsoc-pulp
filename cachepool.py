@@ -247,7 +247,18 @@ class CachePoolBoard(gvsoc.systree.Component):
         clock = Clock_domain(self, 'clock', frequency=10000000)
         cluster_arch = _make_arch(self)
         chip = CachePoolChip(self, 'chip', parser, cluster_arch, binary, debug_binaries)
-        mem = memory.memory.Memory(self, 'mem', size=DRAM_CACHED_SIZE, atomics=True, width_log2=2)
+        # Cached-DRAM backing store. Default = plain fixed-latency memory (fast, functional). Set
+        # CACHEPOOL_DRAMSYS=1 to route it through DRAMSys (realistic DRAM timing — the CachePool L2
+        # backing is DDR4 per the RTL L2 scramble) for cycle calibration. CACHEPOOL_DRAM_TYPE selects
+        # the DRAM config (default ddr4). Requires the DRAMSys infra (source dramsys_pushbutton*.sh).
+        if int(os.environ.get('CACHEPOOL_DRAMSYS', '0')) != 0:
+            import memory.dramsys
+            # version 2 (the v1 wrapper segfaults at sim start in this tree). The framework inserts the
+            # IoV2BeatAdapter for the plain-io hbm master automatically.
+            mem = memory.dramsys.Dramsys(self, 'mem', version=2)
+            mem.add_properties({'dram-type': os.environ.get('CACHEPOOL_DRAM_TYPE', 'ddr4-example.json')})
+        else:
+            mem = memory.memory.Memory(self, 'mem', size=DRAM_CACHED_SIZE, atomics=True, width_log2=2)
 
         self.bind(clock, 'out', chip, 'clock')
         self.bind(clock, 'out', mem, 'clock')
