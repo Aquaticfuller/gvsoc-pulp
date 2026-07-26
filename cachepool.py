@@ -32,6 +32,7 @@ import gvsoc.runner
 import gvsoc.systree
 from vp.clock_domain import Clock_domain
 import memory.memory
+import memory.dramsys
 from elftools.elf.elffile import ELFFile
 import interco.router as router
 import utils.loader.loader
@@ -261,7 +262,6 @@ class CachePoolBoard(gvsoc.systree.Component):
         # OPEN: the vendored DRAMSys SystemC model then segfaults inside sc_simcontext::simulate —
         # a third-party-library crash, needs a debug build of DRAMSys to localize.)
         if int(os.environ.get('CACHEPOOL_DRAMSYS', '0')) != 0:
-            import memory.dramsys
             mem = memory.dramsys.Dramsys(self, 'mem')
             mem.add_properties({'dram-type': os.environ.get('CACHEPOOL_DRAM_TYPE', 'ddr4-example.json')})
         else:
