@@ -136,6 +136,14 @@ class InsituCacheCalib(st.Component):
 
         # --- Cache tile: single controller, 5 ports, 64 KiB (matches RTL DUT). ---
         cache_cfg = make_cachepool_512_calib_config()
+        # Xbar request-hop override. The RTL standalone calib TB instruments ONE cachepool_cache_ctrl
+        # directly — NO tcdm_cache_interco in front — so its 10/67 references are at the ctrl boundary.
+        # Since 0f32f605 the tile default xbar_latency_cycles=1 (the RTL interco's request-side spill
+        # register, present in the integrated SoC), which adds +1 to EVERY calib-TB access (isolated
+        # refs become 11/68 at the driver). Set INSITU_CALIB_XBAR_LAT=0 for the 1:1 RTL-TB diff (10/67).
+        _xlat = os.environ.get('INSITU_CALIB_XBAR_LAT')
+        if _xlat is not None:
+            cache_cfg.xbar_latency_cycles = int(_xlat)
         # Structural-core open-loop bring-up hook: run the per-cycle structural InsituCacheCore
         # (Step 4) instead of the calibrated controller. Functional gate = data_err=0 on replay;
         # cycle counts are uncalibrated (the structural timing-calibration phase tunes them). Off by
