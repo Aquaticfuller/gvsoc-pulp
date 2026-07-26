@@ -158,6 +158,15 @@ class InsituCacheCalib(st.Component):
             cache_cfg.structural_tile = True
             cache_cfg.use_structural_core = True
             cache_cfg.num_controllers = int(os.environ.get('INSITU_CALIB_STRUCT_BANKS', '4'))
+            # Line-granular BankSel (log2(64B line)) — RTL cachepool_tile granularity, and REQUIRED
+            # for E1 MSB rotation (rotation with dyn_offset != log2(line) would move offset bits and
+            # corrupt data; the tile guard disables rotation in that case). The flat calib DUT's
+            # dynamic_offset=2 is a flat-interco artifact and does not apply to the structural tile.
+            cache_cfg.interco.dynamic_offset = 6
+            # E1 A/B knob: 0 → pre-E1 behaviour (rotation off, per-bank capacity collapse).
+            _er = os.environ.get('INSITU_CALIB_ENABLE_ROTATION')
+            if _er is not None:
+                cache_cfg.enable_rotation = (_er != '0')
             # A2: insert the structural per-cell par_coalescer (4 VLSU lanes merge; scalar bypasses).
             if int(os.environ.get('INSITU_CALIB_CELL_COALESCER', '0')) != 0:
                 cache_cfg.cell_coalescer = True
