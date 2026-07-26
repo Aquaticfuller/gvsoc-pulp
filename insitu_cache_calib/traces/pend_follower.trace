@@ -1,0 +1,12 @@
+# pend_follower — D1/D2 validation (structural sync path, ML=50):
+#   acc0 cold read-miss (67), acc1 same-line follower DURING the refill window (must clamp to
+#   ready+drain ≈ 72, was ~10 pre-D1), acc2 cold write-miss (D2 early ack ≈ 8, was ~67),
+#   acc3 read-after-write on the WRITE_PEND line (clamp ≈ 72 + returns the written word),
+#   acc4 post-ready read (clean hit 10).
+# Delays are PER-PORT gaps: acc3's 900 puts it ~5 cy after acc2 (port 1 was idle since t≈6).
+# port,rw,addr,size,delay
+0,R,0x80000000,4,0
+1,R,0x80000000,4,5
+0,W,0x80000040,4,900
+1,R,0x80000040,4,900
+0,R,0x80000040,4,900
