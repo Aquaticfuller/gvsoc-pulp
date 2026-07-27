@@ -423,10 +423,14 @@ class SnitchCluster(gvsoc.systree.Component):
             if arch.use_spatz:
                 for port in range(0, arch.spatz_nb_lanes):
                     if arch.use_insitu_cache and cache_region is not None:
-                        # Address-route the VLSU lane like the scalar: only the cached-DRAM region goes
-                        # through the cache (its per-lane port); the SPM and the UNCACHED region (e.g. the
-                        # 0xA0000000 input arrays) bypass it. Without this the VLSU's huge uncached loads were
-                        # wrongly cached, creating input-size-proportional eviction pressure (the M32768 bug).
+                        # Address-route the VLSU lane like the scalar: the cache_region goes through
+                        # the cache (its per-lane port); the SPM stays direct; the rest (bootrom/
+                        # peripheral/UART) falls through to the SoC. Since E4 (P2.13) cache_region
+                        # covers the WHOLE DRAM PMA [0x80000000, 0xBFFFF800) like the RTL — the
+                        # 0xA0000000 input arrays are cached, not dodged around the cache over the
+                        # narrow AXI (that dodge was the M32768-eviction-bug workaround; with the P1
+                        # cache fixes the full range goes through the cache). A/B:
+                        # CACHEPOOL_CACHE_ALL_DRAM=0 in cachepool.py restores the old small region.
                         vico = router.Router(self, f'pe{core_id}_vlsu{port}_ico',
                             bandwidth=arch.tcdm.bank_width)
                         cores[core_id].o_VLSU(port, vico.i_INPUT())

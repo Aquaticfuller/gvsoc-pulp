@@ -142,9 +142,17 @@ def _make_arch(target):
     # SPM, n=NB_TILE → per-tile).
     cluster.spm_num_groups = int(os.environ.get('CACHEPOOL_SPM_GROUPS', str(NB_CORE)))
     if use_cache:
-        # Cache fronts the cached DRAM PMA [DRAM_BASE, UNCACHED_BASE). Uncached/SPM/peripheral stay direct.
-        # Refills route via cluster wide_axi → o_WIDE_SOC → SoC DRAM.
-        cluster.cache_region = Area(DRAM_BASE, DRAM_CACHED_SIZE)
+        # E4 (P2.13): the RTL caches the WHOLE DRAM PMA (cachepool_pkg.sv:464-469: one rule
+        # base=0x80000000 mask=0xFC000000 → 0x80000000-0xBFFFFFFF) — 0xA0000000 is the private-bank
+        # boundary, NOT an uncached region. The old [DRAM_BASE, UNCACHED_BASE) region + the VLSU
+        # narrow-AXI dodge was a workaround for the M32768 eviction data bug; with the P1 fixes in
+        # (A1/D1/E1/B1/C1) the full [DRAM_BASE, SPM_BASE) range now goes through the cache (the SPM
+        # window itself stays direct). A/B: CACHEPOOL_CACHE_ALL_DRAM=0 restores the old bypass.
+        # Refills/evictions on the extended range route via wide_axi → the `uncached` backing memory
+        # (already mapped below) — so from here the streams pay cache hit/miss + refill occupancy
+        # instead of a free side-channel.
+        cache_all = int(os.environ.get('CACHEPOOL_CACHE_ALL_DRAM', '1')) != 0
+        cluster.cache_region = Area(DRAM_BASE, (SPM_BASE - DRAM_BASE) if cache_all else DRAM_CACHED_SIZE)
     return cluster
 
 
@@ -167,10 +175,13 @@ class CachePoolSoc(gvsoc.systree.Component):
         narrow_axi = router.Router(self, 'narrow_axi', bandwidth=8)
         wide_axi   = router.Router(self, 'wide_axi', bandwidth=64)
         uart       = CachePoolUart(self, 'uart')
-        # The kernel's input data (.pdcp_src, e.g. fdotp's A/B at 0xA0000000) streams through this
-        # uncached path. width_log2=2 (4 B/cycle) 8x-under-provisions the ~32 B/cycle aggregate VLSU
-        # stream, so its busy-stamp (memory.cpp next_packet_start) diverges and get_full_latency()
-        # grows without bound (the A1 delayed-commit then exposes it as a ~3.5x collapse). width_log2=6.
+        # Backing store for the [UNCACHED_BASE, SPM_BASE) DRAM range. With E4 (CACHEPOOL_CACHE_ALL_DRAM=1,
+        # default) the kernel's input data (.pdcp_src at 0xA0000000) is CACHED like in RTL — this memory
+        # now serves cache refills/evictions over the wide AXI instead of direct VLSU streams (any
+        # residual direct traffic comes via the narrow-AXI default map). width_log2=6 (64 B/cycle): the
+        # plain memory's per-packet occupancy (memory.cpp next_packet_start) must sustain the aggregate
+        # refill + stream rate, else its busy-stamp diverges and get_full_latency() grows without bound
+        # (the P1.1 A1 delayed-commit exposed the width_log2=2 under-provision as a ~3.5x collapse).
         uncached   = memory.memory.Memory(self, 'uncached', size=UNCACHED_SIZE, atomics=True, width_log2=6)
         cluster    = SnitchCluster(self, 'cluster_0', cluster_arch, parser, entry=entry,
                                    binaries=debug_binaries)
