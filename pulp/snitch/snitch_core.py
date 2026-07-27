@@ -261,7 +261,9 @@ class SnitchFast(cpu.iss.riscv.RiscvCommon):
         ])
 
         if inc_spatz:
-            pulp.ara.ara.attach(self, vlen, nb_lanes=spatz_nb_lanes, use_spatz=True, lane_width=spatz_lane_width)
+            pulp.ara.ara.attach(self, vlen, nb_lanes=spatz_nb_lanes, use_spatz=True,
+                lane_width=spatz_lane_width,
+                nb_outstanding_reqs=int(os.environ.get('CACHEPOOL_VLSU_OUTSTANDING', '32')))
 
             self.add_c_flags([
                 "-DCONFIG_GVSOC_ISS_USE_SPATZ",

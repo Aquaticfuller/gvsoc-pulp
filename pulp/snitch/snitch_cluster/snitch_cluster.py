@@ -14,6 +14,7 @@
 # limitations under the License.
 #
 
+import os
 import gvsoc.runner
 import pulp.snitch.snitch_core as iss
 import memory.memory as memory
@@ -221,7 +222,11 @@ class SnitchCluster(gvsoc.systree.Component):
                     fetch_enable=arch.auto_fetch, boot_addr=arch.boot_addr,
                     core_id=arch.first_hartid + core_id, htif=True, binaries=binaries,
                     inc_spatz=arch.use_spatz, spatz_nb_lanes=arch.spatz_nb_lanes,
-                    spatz_lane_width=8
+                    # RTL Spatz VLSU lane = 32b (SpatzDataWidth, cachepool_4t_fpu_512.mk
+                    # data_width=32) → 4 lanes × 4 B = 16 B/cycle aggregate. The old
+                    # spatz_lane_width=8 made the model's VLSU 2x too wide (32 B/cycle) —
+                    # a first-order issue-side cause of the "model too fast" kernel family.
+                    spatz_lane_width=int(os.environ.get('CACHEPOOL_VLSU_LANE_BYTES', '4'))
                 ))
 
             else:

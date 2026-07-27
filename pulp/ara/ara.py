@@ -56,7 +56,8 @@ def extend_isa(isa_instance):
         # if insn.label.find('vfmac') == 0:
         #     insn.set_latency(1)
 
-def attach(component, vlen, nb_lanes, use_spatz=False, spatz_nb_ports=None, lane_width=8):
+def attach(component, vlen, nb_lanes, use_spatz=False, spatz_nb_ports=None, lane_width=8,
+           nb_outstanding_reqs=None):
     component.add_sources([
         "cpu/iss/src/ara/ara.cpp",
         "cpu/iss/src/ara/ara_vcompute.cpp",
@@ -84,4 +85,8 @@ def attach(component, vlen, nb_lanes, use_spatz=False, spatz_nb_ports=None, lane
     component.add_property('vu/compute_width', lane_width)
     if use_spatz:
         component.add_property('vu/nb_ports', nb_lanes if spatz_nb_ports is None else spatz_nb_ports)
-        component.add_property('vu/nb_outstanding_reqs', 8)
+        # RTL NumSpatzOutstandingLoads = 32 (cachepool_4t_fpu_512.mk; the calib driver's
+        # requester budget). The old hardcoded 8 capped sustained vector MLP at ~2 bursts/port —
+        # with the RTL lane width (4 B) that under-provisions the stream. 32 restores it.
+        component.add_property('vu/nb_outstanding_reqs',
+                               8 if nb_outstanding_reqs is None else nb_outstanding_reqs)
