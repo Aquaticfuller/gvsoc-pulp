@@ -197,6 +197,10 @@ class CachePoolSoc(gvsoc.systree.Component):
         narrow_axi.o_MAP(rom.i_INPUT(), base=BOOTROM_BASE, size=BOOTROM_SIZE, rm_base=True)
         # Fake UART (snrt printf → stdout).
         narrow_axi.o_MAP(uart.i_INPUT(), base=UART_BASE, size=UART_SIZE, rm_base=True)
+        # Anything the wide AXI doesn't explicitly map (SPM/peripheral/UART/...) falls through to
+        # the narrow AXI — needed by the loader's entry write to CLUSTER_BOOT_CONTROL (0xC0000020),
+        # which lives on the cluster's narrow input.
+        wide_axi.o_MAP(narrow_axi.i_INPUT())
         # Uncached DRAM [UNCACHED_BASE, SPM_BASE): bypasses the cache, goes directly to memory.
         wide_axi.o_MAP(uncached.i_INPUT(),   base=UNCACHED_BASE, size=UNCACHED_SIZE, rm_base=True)
         narrow_axi.o_MAP(uncached.i_INPUT(), base=UNCACHED_BASE, size=UNCACHED_SIZE, rm_base=True)
@@ -208,7 +212,13 @@ class CachePoolSoc(gvsoc.systree.Component):
         narrow_axi.o_MAP(cluster.i_NARROW_INPUT(), base=SPM_BASE,
                          size=(UART_BASE - SPM_BASE), rm_base=False)
         # Binary loader: load ELF (DRAM), write the entry to BOOT_CONTROL, wake the wfi'd cores.
-        loader.o_OUT(narrow_axi.i_INPUT())
+        # The ELF segment writes ride the WIDE axi (bw=64): over the narrow one (bw=8) a big
+        # .pdcp_src section (linked-list: 16 MB) costs ~2.1M cycles of simulated load time before
+        # any instruction runs — an artifact the RTL doesn't have (fesvr backdoor load ≈ 0 cycles).
+        # wide_axi ≈ 262k cycles for 16 MB — still nonzero, so for cycle comparisons use the
+        # kernels' own start/end prints where available (only linked-list has them) or subtract
+        # section_bytes/64. (A true backdoor loader would need a new memory-model write API.)
+        loader.o_OUT(wide_axi.i_INPUT())
         loader.o_START(cluster.i_FETCHEN())
         # Wake the wfi'd bootrom via MSIP (machine software interrupt, mip bit 3). The bootrom enables
         # mie=0xF (bits 0-3, MSIE set) — NOT MEIE (bit 11) — so gvsoc's wfi (wakes when mie & mip != 0)
