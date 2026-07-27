@@ -51,6 +51,14 @@ private:
     bool          cachepool_mode = false;
     uint32_t      cp_l1d[16] = {0};   // CachePool L1D-config block (0x28..0x4c) RW scratch
 
+    // F1 flush: on a COMMIT (0x38) write, fan a flush request out to every insitu-cache cell
+    // (each computes its own walk duration from its dirty-line count and stamps it back);
+    // L1D_FLUSH_STATUS (0x3c) reads busy until the slowest cell's walk ends.
+    int           nb_flush = 0;
+    int64_t       flush_busy_until_ = 0;
+    std::vector<vp::IoMaster> flush_out_itf;
+    vp::IoReq     flush_req_;
+
     vp_regmap_cluster_periph regmap;
 
     vp::IoSlave in;
@@ -81,6 +89,13 @@ ClusterRegisters::ClusterRegisters(vp::ComponentConf &config)
     this->nb_cores = this->get_js_config()->get("nb_cores")->get_int();
     auto cp = this->get_js_config()->get("cachepool");
     this->cachepool_mode = (cp != NULL) && cp->get_bool();
+
+    // F1: flush fan-out ports (0 = the accept-as-scratch fallback; the structural cache wires N).
+    auto nf = this->get_js_config()->get("nb_flush");
+    if (nf != NULL) this->nb_flush = nf->get_int();
+    this->flush_out_itf.resize(this->nb_flush);
+    for (int i = 0; i < this->nb_flush; i++)
+        this->new_master_port("flush_out_" + std::to_string(i), &this->flush_out_itf[i]);
 
     this->in.set_req_meth(&ClusterRegisters::req);
     this->new_slave_port("input", &this->in);
@@ -279,10 +294,33 @@ bool ClusterRegisters::cachepool_access(uint64_t offset, int size, uint8_t *data
         if (is_write)
         {
             if (data != NULL) memcpy(&this->cp_l1d[idx], data, n);
+            // F1: COMMIT (0x38) — fan the flush out to every insitu-cache cell. Each cell writes
+            // back its dirty lines, invalidates, and stamps its walk duration; FLUSH_STATUS spins
+            // until the slowest one ends.
+            if (offset == 0x38 && this->nb_flush > 0 && this->cp_l1d[idx] != 0)
+            {
+                int64_t max_lat = 0;
+                for (int i = 0; i < this->nb_flush; i++)
+                {
+                    this->flush_req_.init();
+                    this->flush_req_.set_addr(this->cp_l1d[(0x2c - 0x28) / 4]);   // the insn code
+                    this->flush_req_.set_size(4);
+                    this->flush_req_.set_is_write(false);
+                    vp::IoReqStatus st = this->flush_out_itf[i].req(&this->flush_req_);
+                    if (st == vp::IO_REQ_OK) {
+                        const int64_t lat = (int64_t)this->flush_req_.get_full_latency();
+                        if (lat > max_lat) max_lat = lat;
+                    }
+                }
+                this->flush_busy_until_ = this->clock.get_cycles() + max_lat;
+            }
         }
         else if (data != NULL)
         {
-            uint32_t v = (offset == 0x3c) ? 0 : this->cp_l1d[idx];
+            // F1: FLUSH_STATUS (0x3c) reads busy until the slowest cell's walk ends (was pinned 0).
+            uint32_t v = (offset == 0x3c)
+                ? (this->clock.get_cycles() < this->flush_busy_until_ ? 1u : 0u)
+                : this->cp_l1d[idx];
             memcpy(data, &v, n);
         }
         return true;

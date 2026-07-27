@@ -238,10 +238,15 @@ class SnitchCluster(gvsoc.systree.Component):
             cores_ico.append(router.Router(self, f'pe{core_id}_ico', bandwidth=arch.tcdm.bank_width))
 
         # Cluster peripherals
+        # F1: number of structural-insitu-cache cells the peripheral's COMMIT flush fans out to.
+        nb_flush = 0
         if arch.use_spatz:
+            if arch.use_insitu_cache and getattr(arch, 'use_structural_insitu_cache', False):
+                _nt = getattr(arch, 'cachepool_num_tiles', 1) if getattr(arch, 'use_cachepool_group', False) else 1
+                nb_flush = _nt * getattr(arch, 'cachepool_banks_per_tile', arch.nb_core)
             cluster_registers = pulp.snitch.snitch_cluster.spatz.cluster_registers.ClusterRegisters(
                 self, 'cluster_registers', nb_cores=arch.nb_core, boot_addr=entry,
-                cachepool=getattr(arch, 'cachepool_periph', False))
+                cachepool=getattr(arch, 'cachepool_periph', False), nb_flush=nb_flush)
         else:
             cluster_registers = pulp.snitch.snitch_cluster.cluster_registers.ClusterRegisters(
                 self, 'cluster_registers', nb_cores=arch.nb_core, boot_addr=entry)
@@ -367,6 +372,21 @@ class SnitchCluster(gvsoc.systree.Component):
                 import math
                 cache_cfg.interco.dynamic_offset = int(math.log2(cache_cfg.controller.cache_line_bytes))
             insitu_cache = InsituCacheTile(self, 'insitu_cache', config=cache_cfg)
+
+        # F1 flush fan-out: the peripheral's COMMIT (0x38) flushes every cache cell; each cell
+        # writes back its dirty lines, invalidates, and stamps its walk duration; FLUSH_STATUS
+        # spins on the slowest. One flush master per cell (nb_flush computed above).
+        if insitu_cache is not None and nb_flush > 0:
+            _p = 0
+            if getattr(arch, 'use_cachepool_group', False):
+                for _t in range(cache_cfg.num_tiles):
+                    for _cb in range(cache_cfg.num_controllers):
+                        cluster_registers.o_FLUSH(_p, insitu_cache.i_FLUSH(_t, _cb))
+                        _p += 1
+            else:
+                for _cb in range(cache_cfg.num_controllers):
+                    cluster_registers.o_FLUSH(_p, insitu_cache.i_FLUSH(_cb))
+                    _p += 1
 
         # Per-core-private SPM (CachePool: the snrt crt0 sets the SAME sp VA for every hart — the per-hart
         # stack offset is commented out — because the CachePool SPM/TCDM at TCDMStartAddr is per-core-private.
