@@ -81,7 +81,7 @@ class L1_subsystem(gvsoc.systree.Component):
         for i in range(nb_banks_per_tile):
             l1_banks.append(Memory(self, f'tcdm_bank{i}', size=l1_bank_size,
                                    width_log2=int(math.log(bandwidth, 2.0)),
-                                   latency=1, atomics=True))
+                                   latency=1, atomics=True, atomic_rmw_cycles=2))
             l1_adapters.append(L1_RemoteItf(self, f'tcdm_bank_adapter{i}',
                                             bandwidth=bandwidth, shared_rw_bandwidth=True,
                                             synchronous=False))
