@@ -35,6 +35,7 @@ import memory.memory
 import memory.dramsys
 from elftools.elf.elffile import ELFFile
 import interco.router as router
+import interco.interleaver as interleaver
 import utils.loader.loader
 from gvrun.parameter import TargetParameter
 from pulp.snitch.snitch_cluster.snitch_cluster import ClusterArch, Area, SnitchCluster
@@ -182,16 +183,25 @@ class CachePoolSoc(gvsoc.systree.Component):
         # plain memory's per-packet occupancy (memory.cpp next_packet_start) must sustain the aggregate
         # refill + stream rate, else its busy-stamp diverges and get_full_latency() grows without bound
         # (the P1.1 A1 delayed-commit exposed the width_log2=2 under-provision as a ~3.5x collapse).
-        uncached   = memory.memory.Memory(self, 'uncached', size=UNCACHED_SIZE, atomics=True, width_log2=6)
+        # latency: first-order DRAM access cost (see `mem` below).
+        uncached   = memory.memory.Memory(self, 'uncached', size=UNCACHED_SIZE, atomics=True, width_log2=6,
+            latency=int(os.environ.get('CACHEPOOL_MEM_LATENCY', '50')))
         cluster    = SnitchCluster(self, 'cluster_0', cluster_arch, parser, entry=entry,
                                    binaries=debug_binaries)
         # The bootrom reads the ELF entry from CLUSTER_BOOT_CONTROL (peripheral + 0x20).
         loader = utils.loader.loader.ElfLoader(self, 'loader', binary=binary, entry_addr=BOOT_CONTROL)
 
         # --- bindings ---
-        # Cached DRAM [DRAM_BASE, UNCACHED_BASE): cache refills reach HBM via wide_axi.
-        wide_axi.o_MAP(self.i_HBM(), base=DRAM_BASE, size=DRAM_CACHED_SIZE, rm_base=True, latency=0)
-        narrow_axi.o_MAP(wide_axi.i_INPUT(), base=DRAM_BASE, size=DRAM_CACHED_SIZE, rm_base=False)
+        # R5: with CACHEPOOL_DRAMSYS=1 the FULL DRAM range routes to the board's channelized
+        # DRAMSys L2 (the internal `uncached` store is left unused); otherwise the cached range goes
+        # to the board's `mem` and the rest to the internal `uncached` store.
+        if int(os.environ.get('CACHEPOOL_DRAMSYS', '0')) != 0:
+            wide_axi.o_MAP(self.i_HBM(), base=DRAM_BASE, size=(SPM_BASE - DRAM_BASE), rm_base=True, latency=0)
+            narrow_axi.o_MAP(wide_axi.i_INPUT(), base=DRAM_BASE, size=(SPM_BASE - DRAM_BASE), rm_base=False)
+        else:
+            # Cached DRAM [DRAM_BASE, UNCACHED_BASE): cache refills reach HBM via wide_axi.
+            wide_axi.o_MAP(self.i_HBM(), base=DRAM_BASE, size=DRAM_CACHED_SIZE, rm_base=True, latency=0)
+            narrow_axi.o_MAP(wide_axi.i_INPUT(), base=DRAM_BASE, size=DRAM_CACHED_SIZE, rm_base=False)
         # Bootrom.
         wide_axi.o_MAP(rom.i_INPUT(),   base=BOOTROM_BASE, size=BOOTROM_SIZE, rm_base=True)
         narrow_axi.o_MAP(rom.i_INPUT(), base=BOOTROM_BASE, size=BOOTROM_SIZE, rm_base=True)
@@ -201,9 +211,11 @@ class CachePoolSoc(gvsoc.systree.Component):
         # the narrow AXI — needed by the loader's entry write to CLUSTER_BOOT_CONTROL (0xC0000020),
         # which lives on the cluster's narrow input.
         wide_axi.o_MAP(narrow_axi.i_INPUT())
-        # Uncached DRAM [UNCACHED_BASE, SPM_BASE): bypasses the cache, goes directly to memory.
-        wide_axi.o_MAP(uncached.i_INPUT(),   base=UNCACHED_BASE, size=UNCACHED_SIZE, rm_base=True)
-        narrow_axi.o_MAP(uncached.i_INPUT(), base=UNCACHED_BASE, size=UNCACHED_SIZE, rm_base=True)
+        if int(os.environ.get('CACHEPOOL_DRAMSYS', '0')) == 0:
+            # Uncached DRAM [UNCACHED_BASE, SPM_BASE): bypasses the cache, goes directly to memory.
+            # (With CACHEPOOL_DRAMSYS=1 the whole range rides the channelized L2 above instead.)
+            wide_axi.o_MAP(uncached.i_INPUT(),   base=UNCACHED_BASE, size=UNCACHED_SIZE, rm_base=True)
+            narrow_axi.o_MAP(uncached.i_INPUT(), base=UNCACHED_BASE, size=UNCACHED_SIZE, rm_base=True)
         # Cluster: SoC accesses to the SPM + peripheral range (loader entry write, the bootrom's
         # entry read) route to the cluster's narrow input; the cluster's internal router dispatches to
         # SPM / peripheral by absolute address (rm_base=False).
@@ -274,9 +286,11 @@ class CachePoolBoard(gvsoc.systree.Component):
         cluster_arch = _make_arch(self)
         chip = CachePoolChip(self, 'chip', parser, cluster_arch, binary, debug_binaries)
         # Cached-DRAM backing store. Default = plain fixed-latency memory (fast, functional). Set
-        # CACHEPOOL_DRAMSYS=1 to route it through DRAMSys (realistic DRAM timing — the CachePool L2
-        # backing is DDR4 per the RTL L2 scramble) for cycle calibration. CACHEPOOL_DRAM_TYPE selects
-        # the DRAM config (default ddr4-example.json). Requires the DRAMSys infra AND, in this tree,
+        # CACHEPOOL_DRAMSYS=1 to route the WHOLE DRAM range through a channelized DRAMSys L2 —
+        # matching the RTL: cachepool_4t_fpu_512.mk has l2_channel=4, l2_bank_width=512b,
+        # l2_interleave=16×64B = 1 KiB stripes, and the RTL tb backs each channel with DRAMSys
+        # (sim_dram, ddr4-example.json). CACHEPOOL_DRAM_CHANNELS overrides the count;
+        # CACHEPOOL_DRAM_TYPE selects the DRAM config. Requires the DRAMSys infra AND, in this tree,
         # LD_PRELOAD of the freshly-built libs + the SystemC-enabled launcher:
         #   make dramsys_preparation   # builds SystemC 3.0.1 + libDRAMSys_Simulator.so + configs
         #   LD_PRELOAD="$PWD/third_party/systemc_install/lib64/libsystemc.so.3.0.1 \
@@ -284,21 +298,33 @@ class CachePoolBoard(gvsoc.systree.Component):
         #     install/bin/gvsoc_launcher_sc --config=gvsoc_config.json
         # (dramsys.so/gvsoc_launcher don't link SystemC, so the sc_api_version symbol is unresolved
         # without the preload; the prebuilt libDRAMSys needs SystemC 2.3, so use the rebuilt one.
-        # OPEN: the vendored DRAMSys SystemC model then segfaults inside sc_simcontext::simulate —
-        # a third-party-library crash, needs a debug build of DRAMSys to localize.)
+        # Wall-clock is 10-100x slower than plain memory — use small kernels / the calib TB.)
         if int(os.environ.get('CACHEPOOL_DRAMSYS', '0')) != 0:
-            mem = memory.dramsys.Dramsys(self, 'mem')
-            mem.add_properties({'dram-type': os.environ.get('CACHEPOOL_DRAM_TYPE', 'ddr4-example.json')})
+            nb_ch = int(os.environ.get('CACHEPOOL_DRAM_CHANNELS', '4'))
+            l2_mux = interleaver.Interleaver(self, 'l2_mux', nb_slaves=nb_ch, interleaving_bits=10)
+            self.bind(clock, 'out', l2_mux, 'clock')
+            mem = None
+            for ch in range(nb_ch):
+                chmem = memory.dramsys.Dramsys(self, f'l2_ch{ch}')
+                chmem.add_properties({'dram-type': os.environ.get('CACHEPOOL_DRAM_TYPE', 'ddr4-example.json')})
+                self.bind(l2_mux, 'out_%d' % ch, chmem, 'input')
+                self.bind(clock, 'out', chmem, 'clock')
+            self.bind(chip, 'hbm', l2_mux, 'input')
         else:
             # width_log2=6 (64 B/cycle): the plain memory's per-packet occupancy (memory.cpp
             # next_packet_start) must sustain the aggregate VLSU stream (~32 B/cycle at 4 cores), else
             # its busy-stamp diverges and get_full_latency() grows without bound — which the A1 delayed-
             # commit then exposes as a ~3.5x collapse. width_log2=2 (4 B/cycle) was an 8x under-provision.
-            mem = memory.memory.Memory(self, 'mem', size=DRAM_CACHED_SIZE, atomics=True, width_log2=6)
+            # latency: first-order DRAM access cost on every L2 touch (refill / eviction / functional-WT
+            # / icache fill). 0 (the old default) made the whole miss path ~50 cycles too cheap — the
+            # dominant term of the "model too fast" kernel family. CACHEPOOL_MEM_LATENCY tunes it
+            # (default 50 = the RTL standalone calib responder's MemLatency; DRAMSys runs refine it).
+            mem = memory.memory.Memory(self, 'mem', size=DRAM_CACHED_SIZE, atomics=True, width_log2=6,
+                latency=int(os.environ.get('CACHEPOOL_MEM_LATENCY', '50')))
+            self.bind(clock, 'out', mem, 'clock')
+            self.bind(chip, 'hbm', mem, 'input')
 
         self.bind(clock, 'out', chip, 'clock')
-        self.bind(clock, 'out', mem, 'clock')
-        self.bind(chip, 'hbm', mem, 'input')
 
 
 class Target(gvsoc.runner.Target):
