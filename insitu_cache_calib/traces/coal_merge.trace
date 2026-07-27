@@ -1,0 +1,24 @@
+# coal_merge — B1+C1 gate (structural tile + coalescer, ML=50):
+#   acc0-3: 4 same-part COLD reads, same cycle → ONE refill; all inherit ~68 (not 67,136,205,274).
+#   acc4-7: 4 same-part WARM reads, same cycle → ONE wide hit; each ~10 (B1 alone would give 10,11,12,13).
+#   acc8-11: 4 same-part word writes covering the whole 16B part → ONE wide write (D2 ack ~8 each).
+#   acc12-15: read back the merged write (data correctness).
+# Delays are PER-PORT gaps: every access in a block carries delay 900 on ALL ports so the four
+# lanes re-synchronize into one cycle per block.
+# port,rw,addr,size,delay
+0,R,0x80000000,4,0
+1,R,0x80000004,4,0
+2,R,0x80000008,4,0
+3,R,0x8000000c,4,0
+0,R,0x80000000,4,900
+1,R,0x80000004,4,900
+2,R,0x80000008,4,900
+3,R,0x8000000c,4,900
+0,W,0x80000040,4,900
+1,W,0x80000044,4,900
+2,W,0x80000048,4,900
+3,W,0x8000004c,4,900
+0,R,0x80000040,4,900
+1,R,0x80000044,4,900
+2,R,0x80000048,4,900
+3,R,0x8000004c,4,900

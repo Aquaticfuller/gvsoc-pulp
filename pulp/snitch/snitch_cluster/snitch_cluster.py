@@ -339,15 +339,21 @@ class SnitchCluster(gvsoc.systree.Component):
             # synchronous-slave core). Needs num_controllers == num_cores (the per-core-cell binding) →
             # controllers_track_cores; line-granular routing (dynamic_offset = log2(line)) so an access
             # never spans the bank-interleave granule (the structural xbar routes a whole access to one
-            # bank, unlike the flat interco which splits). cell_coalescer OFF (can't batch under sequential
-            # sync delivery). amo_lane ON: the scalar lane (n_ppc-1) carries the core's atomics (snrt_mutex =
-            # amoswap on a cached lock word); without the LR/SC-AMO shim a cached atomic is a plain write and
-            # the cross-core mutex provides no mutual exclusion (1 core OK, 2+ cores → overlapping prints /
-            # data races). The shim sits on lane n_ppc-1, so the scalar MUST be wired to that lane (see the
-            # cache_region port assignment below). Default off → the flat tile.
+            # bank, unlike the flat interco which splits). cell_coalescer ON (C1, 2026-07-26): the RTL
+            # par_coalescer inside cachepool_cache_ctrl merges the 4 VLSU lanes' same-cycle same-part
+            # same-type accesses into ONE 16 B beat — required for correct bank occupancy now that the
+            # core serializes per-cell (B1); without it B1 alone swings ~4× pessimistic on unit-stride
+            # streams. The lanes tolerate PENDING (spatz_vlsu DENIED/PENDING paths). A/B:
+            # CACHEPOOL_CELL_COALESCER=0. amo_lane ON: the scalar lane (n_ppc-1) carries the core's
+            # atomics (snrt_mutex = amoswap on a cached lock word); without the LR/SC-AMO shim a cached
+            # atomic is a plain write and the cross-core mutex provides no mutual exclusion (1 core OK,
+            # 2+ cores → overlapping prints / data races). The shim sits on lane n_ppc-1, so the scalar
+            # MUST be wired to that lane (see the cache_region port assignment below). Default off →
+            # the flat tile.
             if getattr(arch, 'use_structural_insitu_cache', False):
+                import os as _os
                 cache_cfg.structural_tile = True
-                cache_cfg.cell_coalescer = False
+                cache_cfg.cell_coalescer = (int(_os.environ.get('CACHEPOOL_CELL_COALESCER', '1')) != 0)
                 cache_cfg.amo_lane = True
                 # Cache banks (cells) for this single tile = cachepool_banks_per_tile (power-of-two for the
                 # address-bit routing; default = nb_core, i.e. one cell per core). When banks==cores this is
