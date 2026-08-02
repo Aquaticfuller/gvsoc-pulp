@@ -95,7 +95,8 @@ class TeranocSystem(st.Component):
         # Convenience locals for the bits we use heavily below; everything
         # else is read straight from `arch`.
         axi_data_width     = arch.axi_data_width
-        nb_banks_per_group = arch.nb_banks_per_group
+        l1_group_width     = arch.l1_group_width
+        l2_fold_width      = arch.l2_fold_width
         l2_bank_size       = arch.l2_bank_size
 
         ################################################################
@@ -130,8 +131,10 @@ class TeranocSystem(st.Component):
         uart = Stdout(self, 'uart', max_cluster=1, max_core_per_cluster=1, user_set_core_id=0, user_set_cluster_id=0)
 
         # DMA
-        dma = MemPoolDmaTop(self, 'dma', loc_base=0x0, loc_size=0x400000, burst_size=4*nb_banks_per_group, tcdm_width=4*nb_banks_per_group,
-                            nb_groups=arch.nb_groups, nb_dmas_per_group=1, be_width=4*nb_banks_per_group, transfer_queue_size=16)
+        dma = MemPoolDmaTop(self, 'dma', loc_base=0x0, loc_size=arch.l1_size,
+                            burst_size=l1_group_width, tcdm_width=l1_group_width,
+                            nb_groups=arch.nb_groups, nb_dmas_per_group=1,
+                            be_width=l1_group_width, transfer_queue_size=16)
 
         # Binary Loader
         loader = utils.loader.loader.ElfLoader(self, 'loader', binary=binary, entry=0x80000000)
@@ -139,8 +142,7 @@ class TeranocSystem(st.Component):
 
         # L2 loader converter
         l2_loader_converter = Converter(self, 'l2_loader_converter',
-            output_width=axi_data_width*arch.l2_axi_interleave,
-            output_align=axi_data_width*arch.l2_axi_interleave)
+            output_width=l2_fold_width, output_align=l2_fold_width)
 
         # L2 loader address scrambler
         l2_loader_scrambler = L2AddressScrambler(self, 'l2_loader_scrambler',

@@ -96,7 +96,6 @@ class TeranocConfig:
     nb_axi_masters_per_group: int
     l2_size:                  int
     nb_l2_banks:              int
-    l2_axi_interleave:        int
     # L1 NoC router remapper: batch size for the rotating remap, and whether
     # ports within a batch are shuffled. Mode follows the RTL config:
     # 0=off, 1=req, 2=resp, 3=req+resp.
@@ -120,10 +119,30 @@ class TeranocConfig:
     @property
     def nb_banks_per_group(self): return self.nb_banks_per_tile * self.nb_tiles_per_group
     @property
+    def l1_group_width(self):
+        # Aggregate byte width of one bank line across a group. This is the
+        # iDMA distribution width and the natural L2 folding boundary.
+        width = self.nb_banks_per_group * self.l1_bank_width
+        if width <= 0 or width & (width - 1):
+            raise ValueError("L1 group width must be a positive power of two")
+        return width
+    @property
     def l1_size(self):
-        # Total shared-L1/TCDM size in bytes (== RTL L1_SIZE). Used e.g. to size
-        # the iDMA local (TCDM) window so DMAs to the whole L1 route correctly.
-        return self.nb_banks_per_tile * self.nb_tiles_total * self.l1_bank_bytes
+        # Total shared-L1/TCDM capacity in bytes (== RTL TCDMSize). This is the
+        # full iDMA local address range, not the capacity of just one group.
+        return self.nb_groups * self.nb_banks_per_group * self.l1_bank_bytes
+    @property
+    def l2_fold_width(self):
+        # Keep L2 bank folding aligned with one complete L1 group bank line.
+        return self.l1_group_width
+    @property
+    def l2_axi_interleave(self):
+        if self.l2_fold_width % self.axi_data_width != 0:
+            raise ValueError("L1 group width must be a multiple of the AXI data width")
+        interleave = self.l2_fold_width // self.axi_data_width
+        if interleave <= 0 or interleave & (interleave - 1):
+            raise ValueError("L2 AXI interleave must be a positive power of two")
+        return interleave
     @property
     def total_snitch(self):       return self.nb_snitch_per_tile * self.nb_tiles_total
     @property
@@ -246,7 +265,6 @@ TERAPOOL = TeranocConfig(
     nb_axi_masters_per_group = 1,
     l2_size                  = 0x1000000,
     nb_l2_banks              = 16,
-    l2_axi_interleave        = 16,
     l1_noc_remap_mode        = 3,
     l1_noc_remap_batch_size  = 4,
     l1_noc_remap_shuffle     = True,
@@ -270,7 +288,6 @@ MEMPOOL = TeranocConfig(
     nb_axi_masters_per_group = 1,
     l2_size                  = 0x400000,
     nb_l2_banks              = 4,
-    l2_axi_interleave        = 16,
     l1_noc_remap_mode        = 3,
     l1_noc_remap_batch_size  = 4,
     l1_noc_remap_shuffle     = True,
@@ -294,7 +311,6 @@ MINPOOL = TeranocConfig(
     nb_axi_masters_per_group = 1,
     l2_size                  = 0x400000,
     nb_l2_banks              = 4,
-    l2_axi_interleave        = 2,
     l1_noc_remap_mode        = 0,
     l1_noc_remap_batch_size  = 2,
     l1_noc_remap_shuffle     = False,
@@ -318,7 +334,6 @@ TENSORPOOL64 = TeranocConfig(
     nb_axi_masters_per_group = 1,
     l2_size                  = 0x400000,
     nb_l2_banks              = 4,
-    l2_axi_interleave        = 16,
     l1_noc_remap_mode        = 3,
     l1_noc_remap_batch_size  = 4,
     l1_noc_remap_shuffle     = True,
@@ -348,7 +363,6 @@ TENSORPOOL256 = TeranocConfig(
     nb_axi_masters_per_group = 1,
     l2_size                  = 0x1000000,
     nb_l2_banks              = 16,
-    l2_axi_interleave        = 16,
     l1_noc_remap_mode        = 3,
     l1_noc_remap_batch_size  = 4,
     l1_noc_remap_shuffle     = True,
@@ -384,7 +398,6 @@ TENSORPOOL256_SPATZ4 = TeranocConfig(
     nb_axi_masters_per_group = 1,
     l2_size                  = 0x20000000,
     nb_l2_banks              = 16,
-    l2_axi_interleave        = 16,
     l1_noc_remap_mode        = 3,
     l1_noc_remap_batch_size  = 4,
     l1_noc_remap_shuffle     = True,
@@ -415,7 +428,6 @@ MINPOOL_SPATZ4_FPU = TeranocConfig(
     nb_axi_masters_per_group = 1,
     l2_size                  = 0x400000,
     nb_l2_banks              = 4,
-    l2_axi_interleave        = 2,
     l1_noc_remap_mode        = 0,
     l1_noc_remap_batch_size  = 2,
     l1_noc_remap_shuffle     = False,
@@ -440,7 +452,6 @@ MEMPOOL_SPATZ4_FPU = TeranocConfig(
     nb_axi_masters_per_group = 1,
     l2_size                  = 0x400000,
     nb_l2_banks              = 4,
-    l2_axi_interleave        = 16,
     l1_noc_remap_mode        = 3,
     l1_noc_remap_batch_size  = 8,
     l1_noc_remap_shuffle     = True,
@@ -465,7 +476,6 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
     nb_axi_masters_per_group = 1,
     l2_size                  = 0x1000000,
     nb_l2_banks              = 16,
-    l2_axi_interleave        = 16,
     l1_noc_remap_mode        = 3,
     l1_noc_remap_batch_size  = 4,
     l1_noc_remap_shuffle     = True,
