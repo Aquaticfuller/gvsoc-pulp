@@ -26,6 +26,7 @@ from pulp.teranoc.teranoc_tile import TeranocTile
 from pulp.teranoc.l1_interconnect.l1_noc_endpoint_router import L1NocEndpointRouter
 from pulp.mempool.l2_interconnect.hierarchical_interco import Hierarchical_Interco
 from pulp.teranoc.l1_interconnect.l1_noc_router_remapper import L1NocRouterRemapper
+from pulp.teranoc.l2_interconnect.cache_line_splitter import CacheLineSplitter
 
 class TeranocGroup(st.Component):
 
@@ -83,7 +84,11 @@ class TeranocGroup(st.Component):
         l2_cache_rules.append((0x00000008, 0x0000000C))
         l2_cache_rules.append((0x0000000C, 0x00000010))
         # AXI Interconnect
-        axi_ico = Hierarchical_Interco(self, 'axi_ico', synchronous=False, nb_slaves=arch.nb_tiles_per_group+1, enable_cache=True, cache_rules=l2_cache_rules, bandwidth=arch.axi_data_width)
+        axi_ico = Hierarchical_Interco(
+            self, 'axi_ico', synchronous=False, nb_slaves=arch.nb_tiles_per_group + 1,
+            enable_cache=True, cache_rules=l2_cache_rules, bandwidth=arch.axi_data_width,
+            cache_line_width=arch.axi_data_width,
+            cache_input_adapter_cls=CacheLineSplitter)
 
         # AXI Interface
         axi_itf = router.Router(self, 'axi_itf', bandwidth=arch.axi_data_width, latency=2)

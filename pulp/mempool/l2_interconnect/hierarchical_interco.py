@@ -39,11 +39,19 @@ class Hierarchical_Interco(gvsoc.systree.Component):
 
     def __init__(self, parent: gvsoc.systree.Component, name: str, bandwidth: int, synchronous: bool=True,
                  nb_slaves: int=1, nb_masters: int=1, enable_cache: bool=False, cache_rules: List[Tuple[int, int]]=[],
-                 cache_line_width: int=64, cache_size: int=8192, nb_cache_sets: int=2):
+                 cache_line_width: int=64, cache_size: int=8192, nb_cache_sets: int=2,
+                 cache_input_adapter_cls=None):
         super(Hierarchical_Interco, self).__init__(parent, name)
 
         nb_sets = 2
-        nb_lines = cache_size / (cache_line_width * nb_sets)
+        if cache_line_width <= 0 or cache_line_width & (cache_line_width - 1):
+            raise ValueError('cache_line_width must be a positive power of two')
+        line_ways_size = cache_line_width * nb_sets
+        if cache_size <= 0 or cache_size % line_ways_size != 0:
+            raise ValueError('cache_size must be a positive multiple of the cache line ways')
+        nb_lines = cache_size // line_ways_size
+        if nb_lines & (nb_lines - 1):
+            raise ValueError('the number of cache sets must be a power of two')
 
         nb_sets_bits = int(math.log2(nb_lines))
         nb_ways_bits = int(math.log2(nb_sets))
@@ -69,7 +77,13 @@ class Hierarchical_Interco(gvsoc.systree.Component):
             self.bind(input_itf, 'output', input_link_ctrl, 'input')
             self.bind(input_link_ctrl, 'output', filter, 'input')
 
-        self.bind(filter, 'cache', cache, 'input')
+        if cache_input_adapter_cls is None:
+            self.bind(filter, 'cache', cache, 'input')
+        else:
+            cache_input_adapter = cache_input_adapter_cls(
+                self, 'cache_input_adapter', line_size=cache_line_width)
+            self.bind(filter, 'cache', cache_input_adapter, 'input')
+            self.bind(cache_input_adapter, 'output', cache, 'input')
         self.bind(filter, 'bypass', self, 'output')
         self.bind(cache, 'refill', self, 'output')
         self.bind(self, 'rocache_cfg', filter, 'config')
