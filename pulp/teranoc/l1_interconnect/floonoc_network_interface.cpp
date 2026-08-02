@@ -88,9 +88,13 @@ vp::IoReqStatus NetworkInterface::req(vp::Block *__this, vp::IoReq *req)
 
     if (_this->router_stalled)
     {
+        _this->trace.msg(vp::Trace::LEVEL_TRACE,
+                         "MESH_IN flit=%p status=1\n", (void *)req);
         return vp::IO_REQ_DENIED;
     }
 
+    _this->trace.msg(vp::Trace::LEVEL_TRACE,
+                     "MESH_IN flit=%p status=2\n", (void *)req);
     _this->handle_req(req);
     return vp::IO_REQ_PENDING;
 }
@@ -127,6 +131,9 @@ void NetworkInterface::req_from_router(vp::IoReq *req, int from_x, int from_y)
     // This does the actual operation(read, write or atomic operation) on the target
     // Note: Memory is read/written already here. The backward path is only used to get the delay of the network.
     vp::IoReqStatus result = target->req(req);
+    this->trace.msg(vp::Trace::LEVEL_TRACE,
+                    "MESH_OUT flit=%p status=%d\n", (void *)req,
+                    result == vp::IO_REQ_DENIED ? 1 : 2);
 
     if (result == vp::IO_REQ_DENIED)
     {

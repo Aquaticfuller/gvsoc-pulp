@@ -346,6 +346,9 @@ vp::IoReqStatus L1_NocItf::handle_core_req(vp::IoReq *req, int port)
     this->trace.msg(vp::Trace::LEVEL_TRACE, "L1_NocItf: core_req translate to noc_req dest_x: %d dest_y: %d\n", (long)*noc_req->arg_get(FlooNoc::REQ_DEST_X), (long)*noc_req->arg_get(FlooNoc::REQ_DEST_Y));
 
     core_req_slvs[port]->next_burst_cycle = cycles + 1;
+    this->trace.msg(vp::Trace::LEVEL_TRACE,
+                    "NOC_INJECT port=%d req=%p flit=%p\n",
+                    port, (void *)req, (void *)noc_req);
     vp::IoReqStatus retval = noc_req_mst_itfs[port]->req(noc_req);
     if (retval == vp::IO_REQ_DENIED)
     {
@@ -386,6 +389,13 @@ vp::IoReqStatus L1_NocItf::handle_noc_req(vp::IoReq *req, int port)
     core_req->arg_push((void *)req);
     core_req->arg_push((void *)core_resp_port);
     vp::IoReqStatus retval = this->tcdm_req_mst_itfs[port]->req(core_req);
+    // status is normalised to the io_v2 spelling (1 == denied) so one trace
+    // parser covers both the v1 and the v3 model.
+    this->trace.msg(vp::Trace::LEVEL_TRACE,
+                    "NOC_TCDM_REQ port=%d req=%p flit=%p addr=0x%llx status=%d\n",
+                    port, (void *)core_req, (void *)req,
+                    (unsigned long long)core_req->get_addr(),
+                    retval == vp::IO_REQ_DENIED ? 1 : 2);
 
     if (retval == vp::IO_REQ_OK)
     {
@@ -419,6 +429,9 @@ vp::IoReqStatus L1_NocItf::handle_noc_resp(vp::IoReq *req, int port)
 
     this->trace.msg(vp::Trace::LEVEL_TRACE, "L1_NocItf: noc_resp translate to core_resp addr: 0x%x size: %d opcode: %d req: %p\n", core_req->get_addr(), core_req->get_size(), core_req->get_opcode(), (void *)core_req);
 
+    this->trace.msg(vp::Trace::LEVEL_TRACE,
+                    "NOC_RESP_IN port=%d req=%p flit=%p\n",
+                    port, (void *)core_req, (void *)req);
     core_req->resp_port->resp(core_req);
     delete req;
     return vp::IO_REQ_OK;
@@ -500,6 +513,11 @@ void L1_NocItf::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
             core_req->arg_push((void *)req);
             core_req->arg_push((void *)core_resp_port);
             vp::IoReqStatus retval = tcdm_itf->req(core_req);
+            _this->trace.msg(vp::Trace::LEVEL_TRACE,
+                             "NOC_TCDM_REQ port=%d req=%p flit=%p addr=0x%llx status=%d\n",
+                             i, (void *)core_req, (void *)req,
+                             (unsigned long long)core_req->get_addr(),
+                             retval == vp::IO_REQ_DENIED ? 1 : 2);
 
             if (retval == vp::IO_REQ_OK)
             {
@@ -537,6 +555,12 @@ void L1_NocItf::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         {
             vp::IoReq *noc_req = (vp::IoReq *)output->out_queue.pop();
             vp::IoReqStatus retval = output_itf->req(noc_req);
+            vp::IoReq *burst = (vp::IoReq *)*noc_req->arg_get(FlooNoc::REQ_BURST);
+            _this->trace.msg(vp::Trace::LEVEL_TRACE,
+                             "NOC_RESP_OUT port=%d req=%p flit=%p addr=0x%llx status=%d\n",
+                             i, (void *)burst, (void *)noc_req,
+                             (unsigned long long)burst->get_addr(),
+                             retval == vp::IO_REQ_DENIED ? 1 : 2);
             if (retval == vp::IO_REQ_DENIED)
             {
                 output->stalled = true;

@@ -49,6 +49,7 @@ struct WideReqState
     vp::IoReq * wide_req;
     int         pending_subreqs;   // sub-reqs not yet RESPONDED (completion)
     uint64_t    max_latency;
+    int64_t     issue_cycle;
 };
 
 class TeranocHWPEInterleaver : public vp::Component
@@ -120,6 +121,9 @@ void TeranocHWPEInterleaver::complete_if_done(WideReqState *state)
     if (state->pending_subreqs == 0)
     {
         vp::IoReq *wide_req = state->wide_req;
+        this->trace.msg(vp::Trace::LEVEL_TRACE,
+                        "HWPE_RESP addr=0x%llx\n",
+                        (unsigned long long)wide_req->get_addr());
         wide_req->inc_latency(state->max_latency);
         delete state;
         wide_req->get_resp_port()->resp(wide_req);
@@ -129,6 +133,9 @@ void TeranocHWPEInterleaver::complete_if_done(WideReqState *state)
 bool TeranocHWPEInterleaver::send_wide(WideReqState *state)
 {
     vp::IoReq *req = state->wide_req;
+    this->trace.msg(vp::Trace::LEVEL_TRACE, "ISSUE_START addr=0x%llx\n",
+                    (unsigned long long)req->get_addr());
+    state->issue_cycle = this->clock.get_cycles();
     uint64_t offset = req->get_addr();
     bool is_write = req->get_is_write();
     uint64_t size = req->get_size();
@@ -173,6 +180,7 @@ bool TeranocHWPEInterleaver::send_wide(WideReqState *state)
         {
             // Not yet accepted: holds the issue barrier until grant(). Still in
             // flight (l1_noc_itf processes it and resp()s after grant).
+            this->trace.msg(vp::Trace::LEVEL_TRACE, "SUB_DENY bank=%d\n", bank_id);
             this->accept_pending += 1;
         }
         else
@@ -188,12 +196,24 @@ bool TeranocHWPEInterleaver::send_wide(WideReqState *state)
     }
 
     this->busy = this->accept_pending > 0;
+    if (!this->busy)
+    {
+        this->trace.msg(vp::Trace::LEVEL_TRACE, "ISSUE_DONE\n");
+    }
     return state->pending_subreqs == 0;
 }
 
 vp::IoReqStatus TeranocHWPEInterleaver::req(vp::Block *__this, vp::IoReq *req)
 {
     TeranocHWPEInterleaver *_this = (TeranocHWPEInterleaver *)__this;
+
+    // Traced on arrival (not on issue) so the queueing delay is visible, which
+    // is what the v3 model reports too.
+    _this->trace.msg(vp::Trace::LEVEL_TRACE,
+                     "HWPE_REQ addr=0x%llx size=%llu queued=%d\n",
+                     (unsigned long long)req->get_addr(),
+                     (unsigned long long)req->get_size(),
+                     _this->busy ? 1 : 0);
 
     WideReqState *state = new WideReqState;
     state->wide_req        = req;
@@ -228,6 +248,11 @@ void TeranocHWPEInterleaver::resp(vp::Block *__this, vp::IoReq *sub_req)
     {
         state->max_latency = sub_req->get_latency();
     }
+    _this->trace.msg(vp::Trace::LEVEL_TRACE,
+                     "SUB_RESP lat=%ld req=%p addr=0x%llx\n",
+                     (long)(_this->clock.get_cycles() - state->issue_cycle),
+                     (void *)sub_req,
+                     (unsigned long long)sub_req->get_addr());
     state->pending_subreqs -= 1;
     delete sub_req;
 
@@ -240,7 +265,15 @@ void TeranocHWPEInterleaver::resp(vp::Block *__this, vp::IoReq *sub_req)
 void TeranocHWPEInterleaver::grant(vp::Block *__this, vp::IoReq *sub_req)
 {
     TeranocHWPEInterleaver *_this = (TeranocHWPEInterleaver *)__this;
-    (void)sub_req;
+
+    {
+        WideReqState *gs = *((WideReqState **)sub_req->arg_get(0));
+        _this->trace.msg(vp::Trace::LEVEL_TRACE,
+                         "SUB_GRANT lat=%ld req=%p addr=0x%llx\n",
+                         (long)(_this->clock.get_cycles() - gs->issue_cycle),
+                         (void *)sub_req,
+                         (unsigned long long)sub_req->get_addr());
+    }
 
     if (_this->accept_pending == 0)
     {
@@ -253,6 +286,7 @@ void TeranocHWPEInterleaver::grant(vp::Block *__this, vp::IoReq *sub_req)
         return;
     }
 
+    _this->trace.msg(vp::Trace::LEVEL_TRACE, "ISSUE_DONE\n");
     _this->busy = false;
     while (!_this->busy && !_this->wait_queue.empty())
     {
