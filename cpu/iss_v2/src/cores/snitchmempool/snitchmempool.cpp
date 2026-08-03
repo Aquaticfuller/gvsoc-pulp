@@ -166,6 +166,14 @@ void SnitchMempool::start()
             item->u.insn.latency = 1;
         }
     }
+
+    // div/divu/rem/remu all run on the serial divider; their operand-dependent
+    // cycle count is captured by SnitchMempoolEvents::event_div_account.
+    for (iss_decoder_item_t *item : *this->iss.decode.get_insns_from_tag("div"))
+    {
+        item->u.insn.resource_id = static_cast<int>(SnitchMempoolMClass::Div);
+        item->u.insn.latency = 1;
+    }
 }
 
 void SnitchMempool::reset(bool active)

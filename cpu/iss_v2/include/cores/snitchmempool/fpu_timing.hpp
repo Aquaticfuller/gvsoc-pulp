@@ -106,15 +106,24 @@ public:
       new_completion.tail_cycles = 2;
     }
 
-    for (Completion &completion : this->completions) {
-      if (!completion.valid) {
-        completion = new_completion;
-        this->pending_count++;
-        return {true, destination_mask != 0, false, false};
-      }
-    }
+    return this->push(new_completion);
+  }
 
-    return {false, false, false, true};
+  // Serial-divider result. The IPU divider is not pipelined and answers
+  // directly, so its completion needs no fpnew/sequencer arbitration: it only
+  // waits for its own FSM. Issue serialisation is enforced by the caller.
+  ScheduleResult schedule_div(uint64_t destination_mask, int64_t ready_cycle) {
+    destination_mask &= ~uint64_t{1};
+
+    Completion new_completion = {};
+    new_completion.destination_mask = destination_mask;
+    new_completion.sequence = this->next_sequence++;
+    new_completion.source = Source::Fpu;
+    new_completion.phase = Phase::Tail;
+    new_completion.ready_cycle = ready_cycle;
+    new_completion.valid = true;
+
+    return this->push(new_completion);
   }
 
   uint64_t release_ready(int64_t cycle) {
@@ -248,6 +257,18 @@ private:
     Source source;
     bool valid;
   };
+
+  ScheduleResult push(const Completion &new_completion) {
+    for (Completion &completion : this->completions) {
+      if (!completion.valid) {
+        completion = new_completion;
+        this->pending_count++;
+        return {true, new_completion.destination_mask != 0, false, false};
+      }
+    }
+
+    return {false, false, false, true};
+  }
 
   int pipeline_depth(SnitchMempoolFpuClass op_class) const {
     switch (op_class) {
