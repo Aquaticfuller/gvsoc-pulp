@@ -501,11 +501,18 @@ class FlooNocV22dMeshNarrowWide(gvsoc.systree.Component):
         self.__add_mapping(f"ni_{name}", base=base, size=size, x=dir, y=0, remove_offset=remove_offset)
 
     def o_MAP(self, base: int, size: int,
-            x: int, y: int,
+            x: int, y: int, name: str | None=None,
             rm_base: bool=False, remove_offset:int =0):
+        """Add an address mapping to a mesh position.
+
+        ``name`` must be unique when several address windows target the same
+        position. This matches the io_v1 API and, in particular, allows the RTL
+        host/peripheral endpoint to own both its low and high address windows.
+        """
         if rm_base and remove_offset == 0:
             remove_offset = base
-        self.__add_mapping(f"ni_{x}_{y}", base=base, size=size, x=x, y=y, remove_offset=remove_offset)
+        self.__add_mapping(f"ni_{x}_{y}" if name is None else name,
+            base=base, size=size, x=x, y=y, remove_offset=remove_offset)
 
     def i_NARROW_INPUT(self, x: int, y: int) -> gvsoc.systree.SlaveItf:
         return gvsoc.systree.SlaveItf(self, f'narrow_input_{x}_{y}',

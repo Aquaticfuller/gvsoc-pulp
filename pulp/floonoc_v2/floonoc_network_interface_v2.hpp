@@ -95,11 +95,15 @@ private:
     static void link_unstall(vp::Block *__this, int nw);
     static vp::IoRespAck wide_response(vp::Block *__this, vp::IoReq *req);
     static void wide_retry(vp::Block *__this, vp::IoRetryChannel);
+    static void wide_input_resp_retry(vp::Block *__this, vp::IoRetryChannel);
     static vp::IoRespAck narrow_response(vp::Block *__this, vp::IoReq *req);
     static void narrow_retry(vp::Block *__this, vp::IoRetryChannel);
+    static void narrow_input_resp_retry(vp::Block *__this, vp::IoRetryChannel);
     static vp::IoReqStatus narrow_req(vp::Block *__this, vp::IoReq *req);
     static vp::IoReqStatus wide_req(vp::Block *__this, vp::IoReq *req);
     vp::IoReqStatus handle_req(vp::IoReq *req, bool wide);
+    bool send_input_response(vp::IoReq *req, bool wide, int nw, bool owned);
+    void retry_input_response(bool wide, vp::IoRetryChannel channel);
     // Destination side: build the object forwarded to the local target for one
     // mesh request flit. Write data flits hand the encapsulated external write
     // beat itself to the target (ownership travelled with the flit; the target
@@ -201,20 +205,35 @@ private:
     bool owes_retry_wide_input;
     bool owes_retry_narrow_input;
 
+    // One elastic response slot per external input and read/write channel.
+    // A denied response stalls the mesh link which delivered it until the
+    // external initiator accepts the exact same object from resp_retry().
+    struct HeldInputResponse
+    {
+        vp::IoReq *req = nullptr;
+        int link_nw = -1;
+        vp::IoRetryChannel channel = vp::IO_RETRY_ANY;
+        bool owned = false;
+    };
+    HeldInputResponse held_input_responses[2];
+
     // When a downstream target returns DENIED, v2 requires the master (this
-    // NI) to hold the req and re-send it on the target's retry(). One slot
-    // per output port. Holds whatever make_target_req built: the flit itself
-    // for reads/atomics, or the encapsulated external write beat for write
-    // data flits (the flit then stays reachable via beat->initiator).
+    // NI) to hold the req and re-send it on the target's retry(). Wide reads
+    // and writes arrive on separate physical networks and can be denied
+    // concurrently, so the wide output needs one slot per retry channel.
+    // The narrow output is fed by one request network and needs one slot.
+    // Each slot holds whatever make_target_req built: the flit itself for
+    // reads/atomics, or the encapsulated external write beat for write data
+    // flits (the flit then stays reachable via beat->initiator).
     // nullptr-initialized here (not just in reset()) because reset() itself
     // inspects them to recycle a held pool write beat.
-    vp::IoReq *wide_target_stalled_req = nullptr;
+    vp::IoReq *wide_target_stalled_req[2] = {nullptr, nullptr};
     vp::IoReq *narrow_target_stalled_req = nullptr;
     // Link input (NW_* index) to unstall when a target retry frees the
     // corresponding output, -1 when none. This is the link the denied request
     // ARRIVED on, which is not implied by its wide flag (a wide read AR
     // travels on the req network).
-    int wide_stalled_link_nw;
+    int wide_stalled_link_nw[2] = {-1, -1};
     int narrow_stalled_link_nw;
 
     // Synchronous responses are pushed here so they fire after the latency
