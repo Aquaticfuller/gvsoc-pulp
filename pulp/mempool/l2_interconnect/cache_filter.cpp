@@ -40,7 +40,7 @@ private:
     void add_rule(uint64_t start, uint64_t end);
     void update_rule(size_t idx, uint64_t start, uint64_t end);
     void get_rule(size_t idx, uint64_t &start, uint64_t &end);
-    bool match(uint64_t addr, uint64_t size);
+    bool match(uint64_t addr);
     void build_snapshot_unlocked();
     mutable std::mutex mu_;
     std::vector<CacheRule> rules_;
@@ -138,21 +138,17 @@ void CacheFilter::get_rule(size_t idx, uint64_t &start, uint64_t &end)
     end = rules_[idx].end;
 }
 
-bool CacheFilter::match(uint64_t addr, uint64_t size)
+bool CacheFilter::match(uint64_t addr)
 {
-    if (size == 0) return false;
-    uint64_t end = addr + size;
-    if (end < addr) return false;
-
     auto snap = std::atomic_load_explicit(&snapshot_, std::memory_order_acquire);
     if (!snap || snap->intervals.empty()) return false;
 
     const auto &ivs = snap->intervals;
-    auto it = std::upper_bound(ivs.begin(), ivs.end(), end - 1,
+    auto it = std::upper_bound(ivs.begin(), ivs.end(), addr,
                                 [](uint64_t value, const CacheRule &r){ return value < r.start; });
     if (it == ivs.begin()) return false;
     size_t j = static_cast<size_t>(std::distance(ivs.begin(), it) - 1);
-    return snap->max_hi_prefix[j] > addr;
+    return snap->max_hi_prefix[j] > addr;  // end-exclusive [start, end)
 }
 
 void CacheFilter::build_snapshot_unlocked()
@@ -202,7 +198,11 @@ vp::IoReqStatus CacheFilter::req(vp::Block *__this, vp::IoReq *req)
 {
     CacheFilter *_this = (CacheFilter *)__this;
 
-    if (_this->bypass || !_this->match(req->get_addr(), req->get_size()))
+    // RTL snitch_read_only_cache always bypasses AW and locked/atomic AR,
+    // and addr_decode selects ordinary reads from the AR start address only.
+    // IoReq has no AXI burst metadata, so opcode + start-address membership
+    // are the directly representable selection rules.
+    if (_this->bypass || req->get_opcode() != vp::READ || !_this->match(req->get_addr()))
     {
         _this->trace.msg("CacheFilter: bypassing req addr=0x%lx size=%lu\n", req->get_addr(), req->get_size());
         return _this->bypass_itf.req_forward(req);
