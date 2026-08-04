@@ -4,8 +4,10 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
 
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <vp/vp.hpp>
@@ -42,6 +44,30 @@ private:
     static void output_retry(vp::Block *__this, int output, vp::IoRetryChannel channel);
 
     int select(uint64_t address) const;
+
+    // Per-request latency probe, mirroring the RTL `noc_profiling/spmem_*` and
+    // `pe_*` taps so one analysis covers model and hardware. This shim sits on
+    // every local port, so it sees all three requester classes at once: port 0
+    // is the scalar Snitch data port, 1..N the Spatz VLSU ports, the rest
+    // RedMulE. Everything here is gated on the trace being active, so a normal
+    // run pays only a bool test on the request path.
+    struct Probe
+    {
+        int64_t first_attempt;  // first (possibly denied) attempt = RTL valid
+        int64_t accepted;       // the accepted handshake = RTL valid & ready
+        uint64_t addr;
+        int size;
+        int dst_tile;
+        bool is_write;
+    };
+
+    bool probe_active() { return this->trace.get_active(vp::Trace::LEVEL_TRACE); }
+    int dst_tile_of(uint64_t address, int output) const;
+    void probe_emit(vp::IoReq *req, const Probe &probe, int64_t response_cycle);
+
+    // Keyed on the request object: a master cannot reuse one until its response
+    // has come back, so at most one transaction per pointer is ever in flight.
+    std::unordered_map<vp::IoReq *, Probe> probes;
 
     vp::Trace trace;
     vp::IoSlave input_itf{0, &TeranocL1Shim::input_req,
@@ -95,6 +121,30 @@ void TeranocL1Shim::reset(bool active)
         this->denied_request[output] = false;
         this->denied_response[output] = false;
     }
+    this->probes.clear();
+}
+
+// Global destination tile, or -1 for a non-TCDM (SoC/L2) access -- the same
+// decode the RTL testbench emits, so the classes line up: dst == tile_id is
+// local, same group is intra-group, anything else crosses the mesh.
+int TeranocL1Shim::dst_tile_of(uint64_t address, int output) const
+{
+    if (output == OUT_SOC)
+    {
+        return -1;
+    }
+    return (int)((address >> this->tile_shift) & this->tile_mask);
+}
+
+// `req` is identity only -- it may already have been freed and reused by the
+// master when an accepted resp() returns, so nothing is read through it.
+void TeranocL1Shim::probe_emit(vp::IoReq *req, const Probe &probe, int64_t response_cycle)
+{
+    this->trace.msg(vp::Trace::LEVEL_TRACE,
+        "SPMEM src=%d dst=%d wr=%d size=%d addr=0x%llx q=%ld a=%ld p=%ld req=%p\n",
+        (int)this->tile_id, probe.dst_tile, probe.is_write ? 1 : 0, probe.size,
+        (unsigned long long)probe.addr, (long)probe.first_attempt, (long)probe.accepted,
+        (long)response_cycle, (void *)req);
 }
 
 int TeranocL1Shim::select(uint64_t address) const
@@ -128,10 +178,41 @@ vp::IoReqStatus TeranocL1Shim::input_req(vp::Block *__this, vp::IoReq *req, int)
         return vp::IO_REQ_DENIED;
     }
 
+    Probe *probe = nullptr;
+    if (_this->probe_active())
+    {
+        int64_t now = _this->clock.get_cycles();
+        auto entry = _this->probes.find(req);
+        if (entry == _this->probes.end())
+        {
+            entry = _this->probes.emplace(req, Probe{now, -1, req->get_addr(),
+                (int)req->get_size(), _this->dst_tile_of(req->get_addr(), output),
+                req->get_is_write()}).first;
+        }
+        probe = &entry->second;
+        // Stamp before the call: a downstream may answer synchronously, and
+        // output_resp() then needs the accept cycle already in place.
+        probe->accepted = now;
+    }
+
     vp::IoReqStatus status = _this->output_itfs[output]->req(req);
     if (status == vp::IO_REQ_DENIED)
     {
         _this->denied_request[output] = true;
+        if (probe != nullptr)
+        {
+            // Not accepted after all -- keep first_attempt so the retry that
+            // does cross reports the full wait for grant.
+            probe->accepted = -1;
+        }
+        return status;
+    }
+
+    // Inline completion produces no resp(), so close the probe here.
+    if (status == vp::IO_REQ_DONE && probe != nullptr)
+    {
+        _this->probe_emit(req, *probe, _this->clock.get_cycles());
+        _this->probes.erase(req);
     }
     return status;
 }
@@ -153,10 +234,37 @@ vp::IoRespAck TeranocL1Shim::output_resp(vp::Block *__this, vp::IoReq *req, int 
 {
     auto *_this = static_cast<TeranocL1Shim *>(__this);
     _this->denied_response[output] = false;
+
+    // Lift the probe out before resp(): an accepted response lets the master
+    // free and reuse this request object inside the very same call, which would
+    // rebind the key to a different transaction.
+    bool probed = false;
+    Probe probe{};
+    if (_this->probe_active())
+    {
+        auto entry = _this->probes.find(req);
+        if (entry != _this->probes.end() && entry->second.accepted >= 0)
+        {
+            probe = entry->second;
+            probed = true;
+            _this->probes.erase(entry);
+        }
+    }
+
     vp::IoRespAck ack = _this->input_itf.resp(req);
     if (ack == vp::IO_RESP_DENIED)
     {
         _this->denied_response[output] = true;
+        if (probed)
+        {
+            // Not delivered: the re-offer is the arrival that counts. Safe to
+            // re-key, since a denied master cannot have reused the object.
+            _this->probes.emplace(req, probe);
+        }
+    }
+    else if (probed)
+    {
+        _this->probe_emit(req, probe, _this->clock.get_cycles());
     }
     return ack;
 }
