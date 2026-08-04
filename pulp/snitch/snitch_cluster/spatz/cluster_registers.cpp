@@ -46,6 +46,10 @@ private:
     // CachePool-mode interception of the CachePool peripheral register block (offsets absent from the
     // spatz regmap). Returns true if handled (quit / scratch RW); false to fall through to the regmap.
     bool cachepool_access(uint64_t offset, int size, uint8_t *data, bool is_write);
+    // E3: push one partition-config write through the config broadcast (o_CONFIG → shim → every
+    // xbar / core cell / remote xbar). One-time stderr tripwire if a partition CSR write arrives
+    // with the config path unbound (the stale-gvsoc_config.json symptom).
+    void push_config(uint32_t csr, uint32_t value);
 
     vp::Trace     trace;
     bool          cachepool_mode = false;
@@ -62,6 +66,9 @@ private:
     int64_t       flush_busy_until_ = 0;
     std::vector<vp::IoMaster> flush_out_itf;
     vp::IoReq     flush_req_;
+    // E3: partition-config master (created only when nb_config > 0, i.e. a structural cache exists).
+    vp::IoMaster  config_out_itf_;
+    vp::IoReq     config_req_;
 
     vp_regmap_cluster_periph regmap;
 
@@ -100,6 +107,11 @@ ClusterRegisters::ClusterRegisters(vp::ComponentConf &config)
     this->flush_out_itf.resize(this->nb_flush);
     for (int i = 0; i < this->nb_flush; i++)
         this->new_master_port("flush_out_" + std::to_string(i), &this->flush_out_itf[i]);
+
+    // E3: partition-config master → the config broadcast shim (present when a structural cache exists).
+    if (this->get_js_config()->get("nb_config") != NULL &&
+        this->get_js_config()->get("nb_config")->get_int() > 0)
+        this->new_master_port("config_out", &this->config_out_itf_);
 
     this->in.set_req_meth(&ClusterRegisters::req);
     this->new_slave_port("input", &this->in);
@@ -242,6 +254,25 @@ vp::IoReqStatus ClusterRegisters::req(vp::Block *__this, vp::IoReq *req)
     return vp::IO_REQ_OK;
 }
 
+void ClusterRegisters::push_config(uint32_t csr, uint32_t value)
+{
+    if (!this->config_out_itf_.is_bound()) {
+        static bool warned = false;
+        if (!warned) {
+            fprintf(stderr, "[cluster_registers] partition CSR (csr=%u) written but the config path is "
+                    "UNBOUND — partition change is a no-op (stale gvsoc_config.json or no structural cache)\n", csr);
+            warned = true;
+        }
+        return;
+    }
+    this->config_req_.init();
+    this->config_req_.set_addr(csr);
+    this->config_req_.set_size(4);
+    this->config_req_.set_is_write(true);
+    this->config_req_.set_data((uint8_t *)&value);
+    (void)this->config_out_itf_.req(&this->config_req_);
+}
+
 bool ClusterRegisters::cachepool_access(uint64_t offset, int size, uint8_t *data, bool is_write)
 {
     // CachePool-specific peripheral registers not present in the standard Spatz regmap.
@@ -302,6 +333,20 @@ bool ClusterRegisters::cachepool_access(uint64_t offset, int size, uint8_t *data
         if (is_write)
         {
             if (data != NULL) memcpy(&this->cp_l1d[idx], data, n);
+            // E3: partition-commit semantics (older block). The RTL latches the partition registers
+            // unconditionally BEFORE the busy check, so push {num_private, private_start} FIRST, then
+            // the flush fan-out (so the re-issued flush walks under the NEW geometry). A "flush private
+            // banks" with num_private=0 correctly costs nothing (the cells return 0 latency).
+            if (offset == 0x38 && this->cp_l1d[idx] != 0)
+            {
+                this->push_config(0 /*L1D_PRIVATE*/, this->cp_l1d[(0x40 - 0x28) / 4]);
+                this->push_config(1 /*L1D_ADDR*/,    this->cp_l1d[(0x44 - 0x28) / 4]);
+            }
+            // XBAR_OFFSET commit (0x4c): push dyn_offset only (no flush coupling on this path in RTL).
+            if (offset == 0x4c && this->cp_l1d[idx] != 0)
+            {
+                this->push_config(2 /*XBAR_OFFSET*/, this->cp_l1d[(0x48 - 0x28) / 4]);
+            }
             // F1: COMMIT (0x38) — fan the flush out to every insitu-cache cell. Each cell writes
             // back its dirty lines, invalidates, and stamps its walk duration; FLUSH_STATUS spins
             // until the slowest one ends.

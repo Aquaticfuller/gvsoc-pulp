@@ -21,7 +21,7 @@ import regmap.regmap_c_header
 
 class ClusterRegisters(gvsoc.systree.Component):
 
-    def __init__(self, parent, name, boot_addr=0, nb_cores=1, binary=None, cachepool=False, nb_flush=0):
+    def __init__(self, parent, name, boot_addr=0, nb_cores=1, binary=None, cachepool=False, nb_flush=0, nb_config=0):
         super(ClusterRegisters, self).__init__(parent, name)
 
         self.add_sources(['pulp/snitch/snitch_cluster/spatz/cluster_registers.cpp'])
@@ -36,11 +36,19 @@ class ClusterRegisters(gvsoc.systree.Component):
             # F1: number of insitu-cache cells the COMMIT flush fans out to (0 = scratch fallback,
             # FLUSH_STATUS pinned 0). The cluster wires one flush_out_N per cell when set.
             'nb_flush': nb_flush,
+            # E3: number of partition-config endpoints (xbar + core cells + remote xbars) the
+            # partition-commit config broadcast fans out to. 0 = no config path (non-structural builds).
+            'nb_config': nb_config,
         })
 
     def o_FLUSH(self, port: int, itf: gvsoc.systree.SlaveItf):
         """Flush fan-out master ``port`` → one insitu-cache cell's flush slave port."""
         self.itf_bind(f'flush_out_{port}', itf, signature='io')
+
+    def o_CONFIG(self, itf: gvsoc.systree.SlaveItf):
+        """E3 partition-config master → the config broadcast shim (one partition-commit write fans
+        out to every xbar / core cell / remote xbar)."""
+        self.itf_bind('config_out', itf, signature='io')
 
     def gen(self, builddir, installdir):
         comp_path = 'pulp/snitch/snitch_cluster/spatz'

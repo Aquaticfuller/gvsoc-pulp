@@ -245,13 +245,18 @@ class SnitchCluster(gvsoc.systree.Component):
         # Cluster peripherals
         # F1: number of structural-insitu-cache cells the peripheral's COMMIT flush fans out to.
         nb_flush = 0
+        nb_config = 0
         if arch.use_spatz:
             if arch.use_insitu_cache and getattr(arch, 'use_structural_insitu_cache', False):
                 _nt = getattr(arch, 'cachepool_num_tiles', 1) if getattr(arch, 'use_cachepool_group', False) else 1
                 nb_flush = _nt * getattr(arch, 'cachepool_banks_per_tile', arch.nb_core)
+                # E3: partition-config endpoints = per-port-class xbars + cells (+ group remote xbars).
+                _nppc = 1 + (arch.spatz_nb_lanes if arch.use_spatz else 0)
+                _bpt  = getattr(arch, 'cachepool_banks_per_tile', arch.nb_core)
+                nb_config = _nt * (_nppc + _bpt) + (_nppc if getattr(arch, 'use_cachepool_group', False) else 0)
             cluster_registers = pulp.snitch.snitch_cluster.spatz.cluster_registers.ClusterRegisters(
                 self, 'cluster_registers', nb_cores=arch.nb_core, boot_addr=entry,
-                cachepool=getattr(arch, 'cachepool_periph', False), nb_flush=nb_flush)
+                cachepool=getattr(arch, 'cachepool_periph', False), nb_flush=nb_flush, nb_config=nb_config)
         else:
             cluster_registers = pulp.snitch.snitch_cluster.cluster_registers.ClusterRegisters(
                 self, 'cluster_registers', nb_cores=arch.nb_core, boot_addr=entry)
@@ -392,6 +397,28 @@ class SnitchCluster(gvsoc.systree.Component):
                 for _cb in range(cache_cfg.num_controllers):
                     cluster_registers.o_FLUSH(_p, insitu_cache.i_FLUSH(_cb))
                     _p += 1
+
+        # E3: partition-config broadcast — peripheral's one commit write fans out to every xbar,
+        # cache cell, and (group) remote xbar. Endpoint ORDER is irrelevant (all apply the csr locally).
+        if insitu_cache is not None and nb_config > 0:
+            from cache.insitu.insitu_cache_config_broadcast import InsituCacheConfigBroadcast
+            cfg_bcast = InsituCacheConfigBroadcast(self, 'cfg_bcast', nb_masters=nb_config)
+            cluster_registers.o_CONFIG(cfg_bcast.i_INPUT())
+            _k = 0
+            _nppc2 = 1 + (arch.spatz_nb_lanes if arch.use_spatz else 0)
+            if getattr(arch, 'use_cachepool_group', False):
+                for _t in range(cache_cfg.num_tiles):
+                    for _j in range(_nppc2):
+                        cfg_bcast.o_OUTPUT(_k, insitu_cache.i_CONFIG_XBAR(_t, _j)); _k += 1
+                    for _cb in range(cache_cfg.num_controllers):
+                        cfg_bcast.o_OUTPUT(_k, insitu_cache.i_CONFIG_CORE(_t, _cb)); _k += 1
+                for _j in range(_nppc2):
+                    cfg_bcast.o_OUTPUT(_k, insitu_cache.i_CONFIG_RXBAR(_j)); _k += 1
+            else:
+                for _j in range(_nppc2):
+                    cfg_bcast.o_OUTPUT(_k, insitu_cache.i_CONFIG_XBAR(_j)); _k += 1
+                for _cb in range(cache_cfg.num_controllers):
+                    cfg_bcast.o_OUTPUT(_k, insitu_cache.i_CONFIG_CORE(_cb)); _k += 1
 
         # Per-core-private SPM (CachePool: the snrt crt0 sets the SAME sp VA for every hart — the per-hart
         # stack offset is commented out — because the CachePool SPM/TCDM at TCDMStartAddr is per-core-private.
