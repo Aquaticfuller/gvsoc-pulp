@@ -57,9 +57,18 @@ private:
     static void input_resp_retry(vp::Block *__this, vp::IoRetryChannel channel);
     static vp::IoRespAck output_resp(vp::Block *__this, vp::IoReq *req, int output);
     static void output_retry(vp::Block *__this, int output, vp::IoRetryChannel channel);
+    static void retry_handler(vp::Block *__this, vp::ClockEvent *event);
+
+    void drive_parked_outputs(uint8_t channels);
+    void schedule_retry();
 
     static uint8_t response_channel(vp::IoReq *req);
     static uint8_t retry_channels(vp::IoRetryChannel channel);
+    static int channel_index(uint8_t channel) { return channel == WRITE_CHANNEL ? 1 : 0; }
+    static int other_output(int output)
+    {
+        return output == CACHE_OUTPUT ? BYPASS_OUTPUT : CACHE_OUTPUT;
+    }
 
     vp::Trace trace;
     vp::WireSlave<IssOffloadInsn<uint32_t> *> config_itf;
@@ -83,11 +92,22 @@ private:
     // write channels.  Remember which producer must be nudged when the input
     // master calls resp_retry().
     std::array<uint8_t, 2> blocked_response_channels = {0, 0};
+
+    // The cache-refill and bypass paths are two independent response producers
+    // fanning into ONE upstream response port.  That port grants one beat per
+    // cycle and, once it denies one, io_v2 requires exactly that beat back
+    // before any other -- so the block belongs to the *channel*, not to the
+    // producer that happened to hit it.  Track which output owes the re-send
+    // and park the other one here until it clears; forwarding it instead trips
+    // the router's "still holds a denied one" assert.
+    std::array<int, 2> response_owner = {-1, -1};
+
+    vp::ClockEvent retry_event;
 };
 
 
 CacheFilter::CacheFilter(vp::ComponentConf &config)
-    : vp::Component(config)
+    : vp::Component(config), retry_event(this, &CacheFilter::retry_handler)
 {
     this->traces.new_trace("trace", &this->trace, vp::DEBUG);
     this->config_itf.set_sync_meth(&CacheFilter::config_sync);
@@ -118,6 +138,7 @@ void CacheFilter::reset(bool active)
     {
         this->denied_outputs = {-1, -1};
         this->blocked_response_channels = {0, 0};
+        this->response_owner = {-1, -1};
     }
 }
 
@@ -257,6 +278,16 @@ vp::IoRespAck CacheFilter::output_resp(vp::Block *__this, vp::IoReq *req, int ou
 {
     CacheFilter *_this = static_cast<CacheFilter *>(__this);
     uint8_t channel = response_channel(req);
+    int index = channel_index(channel);
+
+    // Upstream is still holding the *other* producer's denied beat and owes it
+    // the re-send first.  Park this one here rather than break that contract;
+    // drive_parked_outputs() releases it once the channel is free again.
+    if (_this->response_owner[index] >= 0 && _this->response_owner[index] != output)
+    {
+        _this->blocked_response_channels[output] |= channel;
+        return vp::IO_RESP_DENIED;
+    }
 
     // Retire the old blocked state before the synchronous callback.  The
     // upstream consumer may accept this response, immediately reuse its
@@ -264,11 +295,28 @@ vp::IoRespAck CacheFilter::output_resp(vp::Block *__this, vp::IoReq *req, int ou
     // same output.  Clearing after the callback would lose any DENIED state
     // installed by that nested response.
     _this->blocked_response_channels[output] &= ~channel;
+    _this->response_owner[index] = -1;
     vp::IoRespAck status = _this->input_itf.resp(req);
     if (status == vp::IO_RESP_DENIED)
     {
         _this->blocked_response_channels[output] |= channel;
+        _this->response_owner[index] = output;
     }
+    else if ((_this->blocked_response_channels[other_output(output)] & channel) != 0)
+    {
+        // The channel just freed while the other producer sits parked on our
+        // retry.  Upstream never saw that beat, so it will not nudge us on its
+        // behalf -- we own the wake-up.
+        _this->schedule_retry();
+    }
+
+    _this->trace.msg(vp::Trace::LEVEL_TRACE,
+        "Response out (output=%s, req=%p, addr=0x%lx, size=%lu, write=%d, first=%d, last=%d, "
+        "denied=%d)\n",
+        output == CACHE_OUTPUT ? "cache" : "bypass", req, req->get_addr(), req->get_size(),
+        req->get_is_write() ? 1 : 0, req->is_first ? 1 : 0, req->is_last ? 1 : 0,
+        status == vp::IO_RESP_DENIED ? 1 : 0);
+
     return status;
 }
 
@@ -276,21 +324,58 @@ vp::IoRespAck CacheFilter::output_resp(vp::Block *__this, vp::IoReq *req, int ou
 void CacheFilter::input_resp_retry(vp::Block *__this, vp::IoRetryChannel channel)
 {
     CacheFilter *_this = static_cast<CacheFilter *>(__this);
-    uint8_t channels = retry_channels(channel);
+    _this->drive_parked_outputs(retry_channels(channel));
+}
 
-    // Snapshot before either synchronous callback can update the masks.
-    bool retry_cache =
-        (_this->blocked_response_channels[CACHE_OUTPUT] & channels) != 0;
-    bool retry_bypass =
-        (_this->blocked_response_channels[BYPASS_OUTPUT] & channels) != 0;
 
-    if (retry_cache)
+void CacheFilter::retry_handler(vp::Block *__this, vp::ClockEvent *)
+{
+    CacheFilter *_this = static_cast<CacheFilter *>(__this);
+    _this->drive_parked_outputs(ANY_CHANNEL);
+}
+
+
+void CacheFilter::schedule_retry()
+{
+    if (!this->retry_event.is_enqueued())
     {
-        _this->cache_itf.resp_retry(channel);
+        this->retry_event.enqueue(1);
     }
-    if (retry_bypass)
+}
+
+
+void CacheFilter::drive_parked_outputs(uint8_t channels)
+{
+    for (uint8_t bit : {READ_CHANNEL, WRITE_CHANNEL})
     {
-        _this->bypass_itf.resp_retry(channel);
+        if ((channels & bit) == 0)
+        {
+            continue;
+        }
+
+        int index = channel_index(bit);
+        vp::IoRetryChannel channel = bit == WRITE_CHANNEL ? vp::IO_RETRY_WRITE : vp::IO_RETRY_READ;
+
+        // The owner goes first: upstream owes it that exact beat, so anything
+        // else would only be parked again by the guard in output_resp().
+        int first = this->response_owner[index] >= 0 ? this->response_owner[index] : CACHE_OUTPUT;
+        for (int output : {first, other_output(first)})
+        {
+            // Re-read each time: a resp_retry() re-enters output_resp()
+            // synchronously and updates both masks.
+            if ((this->blocked_response_channels[output] & bit) == 0)
+            {
+                continue;
+            }
+            if (output == CACHE_OUTPUT)
+            {
+                this->cache_itf.resp_retry(channel);
+            }
+            else
+            {
+                this->bypass_itf.resp_retry(channel);
+            }
+        }
     }
 }
 
