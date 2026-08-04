@@ -280,7 +280,11 @@ bool ClusterRegisters::cachepool_access(uint64_t offset, int size, uint8_t *data
     // EXCEPT 0x20: CLUSTER_BOOT_CONTROL in the older layout. The ElfLoader writes the ELF entry there and
     // the bootrom reads it back (tcdm_end+0x20) to jump to _start. Swallowing it as scratch makes every core
     // read 0 and jump to 0 -> the run never terminates. Fall through to the regmap, which models it.
-    if (offset < 0x30 && offset != 0x20)
+    //
+    // The swallow must stop at 0x28 (NOT 0x30): 0x28..0x2f are the CachePool L1D config block
+    // (CFG_L1D_SPM @0x28, CFG_L1D_INSN @0x2c) and belong to the L1D block below — swallowing them as
+    // perf-scratch discards the flush INSN code, so a flush commit arrives with insn=0 (a no-op).
+    if (offset < 0x28 && offset != 0x20)
     {
         if (!is_write && data != nullptr) memset(data, 0, size);
         return true;
