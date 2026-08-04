@@ -177,6 +177,21 @@ class InsituCacheCalib(st.Component):
             # closed-loop sync path on the (light) calib build before the heavy spatz build.
             if int(os.environ.get('INSITU_CALIB_INLINE_SYNC', '0')) != 0:
                 cache_cfg.controller.inline_sync_miss = True
+            # E3.5: freeze a runtime partition at elaboration (the TB has no peripheral, so the
+            # partition can't be programmed by SW here). Validates the route_request mode table +
+            # per-mode rotation N + the capacity fold (private footprint on num_private banks).
+            # Default = the xbar's all-private/all-shared rule (num_tiles==1 → all-private).
+            # NOTE: the RTL short-circuits partitioning at NumTiles==1 (tcdm_cache_interco.sv:234),
+            # so a mixed partition REQUIRES INSITU_CALIB_NUM_TILES>1 to engage.
+            _nt = os.environ.get('INSITU_CALIB_NUM_TILES')
+            if _nt is not None:
+                cache_cfg.num_tiles = int(_nt)
+            _npriv = os.environ.get('INSITU_CALIB_NUM_PRIVATE')
+            if _npriv is not None:
+                cache_cfg.num_private_cache = int(_npriv)
+            _pstart = os.environ.get('INSITU_CALIB_PRIVATE_START')
+            if _pstart is not None:
+                cache_cfg.private_start_addr = int(_pstart, 0)
         cache_cfg.controller.refill_beat_bytes = refill_beat   # single-beat in wide mode
         # Alignment-investigation override (real-trace replay only): raise the coalescer's
         # warm-hit gate so same-cycle same-line reads merge even while their line's refill is

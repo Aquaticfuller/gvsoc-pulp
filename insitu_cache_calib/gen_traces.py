@@ -196,6 +196,19 @@ def main():
     lines += [f'0,R,0x{rgn_r + i*LINE:08x},4,0' for i in range(CAP_LINES)]
     w('evict_wb_miss_stream', lines)
 
+    # 13. E3.5 partition capacity fold — private-range sweeps (all addrs ≥ private_start
+    #     ⇒ always-local, bank = (line & 3) % num_private). Run with NUM_TILES=4 (the RTL
+    #     short-circuits partitioning at NumTiles==1) + NUM_PRIVATE=m + PRIVATE_START=BASE.
+    #     Per-set pressure after rotation (set = (line>>2)&255, 4 ways) decides the golden
+    #     sweep-2 hits — exactly-4 lines/set survives, 8+ thrashes to ~0:
+    #       2048-line: m=1 → ~0 | m=2,3,4 → 2048/2048
+    #       4096-line: m=1,2 → ~0 | m=3 → 2048 (bank0 folds ½ the footprint → thrashes;
+    #                  banks1,2 exactly 4/set survive — pins the non-pow2 modulo fold)
+    #                  | m=4 → 4096/4096
+    for n in (2048, 4096):
+        sweep = [f'0,R,0x{BASE + i*LINE:08x},4,200' for i in range(n)]
+        w(f'partition_priv_2sweep_{n}', sweep + sweep)
+
 
 if __name__ == '__main__':
     main()
