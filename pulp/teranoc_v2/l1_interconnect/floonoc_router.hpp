@@ -42,6 +42,8 @@ class TeranocL1NocRouter : public vp::Component {
 
     void get_next_router_pos(int dest_x, int dest_y, int &next_x, int &next_y);
     int get_output(int next_x, int next_y);
+    // Send at most one flit out of an output queue in the current cycle.
+    bool drain_output(int output);
 
     vp::Trace trace;
     int x;
@@ -55,6 +57,9 @@ class TeranocL1NocRouter : public vp::Component {
     vp::ClockEvent fsm_event;
     int current_input[DIR_NB];
     int output_owner[DIR_NB];
+    // Last cycle each output put a flit on its link, so a synchronous drain
+    // triggered by an unstall cannot exceed one flit per cycle.
+    int64_t last_output_cycle[DIR_NB];
     std::array<vp::Signal<bool>, DIR_NB> stalled_outputs;
     vp::Signal<uint64_t> signal_req;
     vp::Signal<uint64_t> signal_req_size;

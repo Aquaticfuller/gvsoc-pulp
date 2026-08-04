@@ -122,14 +122,7 @@ void TeranocL1NocRouter::fsm_handler(vp::Block *__this, vp::ClockEvent *) {
     // Output queues are registered stages. A stalled downstream input stops
     // only this output; all other outputs remain independently active.
     for (int output = 0; output < DIR_NB; output++) {
-        vp::Queue *queue = _this->output_queues[output];
-        if (!queue->empty() && !_this->stalled_outputs[output]) {
-            auto *req = static_cast<FloonocReqV2 *>(queue->pop());
-            progressed = true;
-            if (_this->output_ports[output].req(req)) {
-                _this->stalled_outputs[output] = true;
-            }
-        }
+        progressed |= _this->drain_output(output);
     }
 
     // All input and output FIFOs share this event. A later queue wake-up can
@@ -183,9 +176,37 @@ void TeranocL1NocRouter::get_next_router_pos(int dest_x, int dest_y, int &next_x
     }
 }
 
+// Put one flit on the link if this output has not already sent this cycle and
+// the downstream is not back-pressuring. Returns whether a flit moved.
+bool TeranocL1NocRouter::drain_output(int output) {
+    if (this->stalled_outputs[output]) {
+        return false;
+    }
+    int64_t cycles = this->clock.get_cycles();
+    if (this->last_output_cycle[output] == cycles) {
+        return false;
+    }
+    vp::Queue *queue = this->output_queues[output];
+    if (queue->empty()) {
+        return false;
+    }
+    auto *req = static_cast<FloonocReqV2 *>(queue->pop());
+    this->last_output_cycle[output] = cycles;
+    if (this->output_ports[output].req(req)) {
+        this->stalled_outputs[output] = true;
+    }
+    return true;
+}
+
 void TeranocL1NocRouter::link_unstall(vp::Block *__this, int output) {
     auto *_this = static_cast<TeranocL1NocRouter *>(__this);
     _this->stalled_outputs[output] = false;
+    // The RTL link's ready is combinational: the cycle the downstream frees a
+    // FIFO slot, this output may already drive the next flit into it. Only
+    // rescheduling the FSM would insert a one-cycle bubble on every
+    // back-pressure release -- invisible on an idle mesh (the median hop is
+    // unaffected) but compounding into the latency tail under saturation.
+    _this->drain_output(output);
     _this->fsm_event.enqueue();
 }
 
@@ -205,6 +226,7 @@ void TeranocL1NocRouter::reset(bool active) {
             this->stalled_outputs[direction] = false;
             this->current_input[direction] = 0;
             this->output_owner[direction] = -1;
+            this->last_output_cycle[direction] = -1;
         }
     }
 }
