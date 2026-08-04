@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <unordered_map>
 
 #include <vp/signal.hpp>
 #include <vp/stats/stats.hpp>
@@ -71,6 +72,20 @@ class TeranocL1NocRouter : public vp::Component {
     vp::StatScalar stat_in_stall[DIR_NB];
     vp::StatScalar stat_out_busy[DIR_NB];
     vp::StatScalar stat_out_stall[DIR_NB];
+    // Residency of a flit inside this router, split at the arbitration grant:
+    // arrival -> grant is time in the input queue, grant -> send is time in the
+    // output queue. Their sum is the in->out residency the RTL router logs give
+    // (pair a P io=0 with the matching P io=1 on the same rid).
+    static constexpr int nb_res_buckets = 10;   // 1,2,3,4,5,6-8,9-12,13-16,17-32,33+
+    vp::StatScalar stat_in_res[nb_res_buckets];
+    vp::StatScalar stat_out_res[nb_res_buckets];
+    vp::StatScalar stat_res_sum_in, stat_res_n_in, stat_res_max_in;
+    vp::StatScalar stat_res_sum_out, stat_res_n_out, stat_res_max_out;
+    bool stats_enabled = false;
+    std::unordered_map<void *, int64_t> arrival_cycle;
+    std::unordered_map<void *, int64_t> grant_cycle;
+    void account_residency(vp::StatScalar *buckets, vp::StatScalar &sum,
+        vp::StatScalar &count, vp::StatScalar &peak, int64_t wait);
 #endif
     vp::Signal<uint64_t> signal_req;
     vp::Signal<uint64_t> signal_req_size;

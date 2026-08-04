@@ -7,6 +7,7 @@
 #include "floonoc_router.hpp"
 
 #include <algorithm>
+#include <vp/stats/stats_engine.hpp>
 #include <cstdint>
 
 static const char *dir_names[TeranocL1NocRouter::DIR_NB] = {"right", "left", "up", "down", "local"};
@@ -56,6 +57,22 @@ TeranocL1NocRouter::TeranocL1NocRouter(vp::ComponentConf &config)
         this->stats.register_stat(&this->stat_out_stall[direction], "out_" + d + "_stall",
             "Cycles this output held a ready flit while back-pressured");
     }
+    static const char *res_names[nb_res_buckets] =
+        {"1", "2", "3", "4", "5", "6_8", "9_12", "13_16", "17_32", "33plus"};
+    for (int b = 0; b < nb_res_buckets; b++) {
+        this->stats.register_stat(&this->stat_in_res[b], std::string("res_in_") + res_names[b],
+            "Flits whose input-queue wait fell in this bucket");
+        this->stats.register_stat(&this->stat_out_res[b], std::string("res_out_") + res_names[b],
+            "Flits whose output-queue wait fell in this bucket");
+    }
+    this->stats.register_stat(&this->stat_res_sum_in, "res_in_sum", "Total input-queue wait");
+    this->stats.register_stat(&this->stat_res_n_in, "res_in_n", "Flits granted");
+    this->stats.register_stat(&this->stat_res_max_in, "res_in_max", "Worst input-queue wait");
+    this->stats.register_stat(&this->stat_res_sum_out, "res_out_sum", "Total output-queue wait");
+    this->stats.register_stat(&this->stat_res_n_out, "res_out_n", "Flits sent");
+    this->stats.register_stat(&this->stat_res_max_out, "res_out_max", "Worst output-queue wait");
+    vp::StatsEngine *engine = this->stats.get_engine();
+    this->stats_enabled = engine != nullptr && engine->is_enabled();
 #endif
 
     for (int direction = 0; direction < DIR_NB; direction++) {
@@ -77,6 +94,23 @@ TeranocL1NocRouter::~TeranocL1NocRouter() {
     }
 }
 
+#ifdef CONFIG_GVSOC_STATS_ACTIVE
+void TeranocL1NocRouter::account_residency(vp::StatScalar *buckets, vp::StatScalar &sum,
+    vp::StatScalar &count, vp::StatScalar &peak, int64_t wait) {
+    if (wait < 0) {
+        return;
+    }
+    sum += (uint64_t)wait;
+    count++;
+    if ((uint64_t)wait > peak.get()) {
+        peak.set((uint64_t)wait);
+    }
+    int b = wait <= 5 ? (int)(wait <= 1 ? 0 : wait - 1)
+          : wait <= 8 ? 5 : wait <= 12 ? 6 : wait <= 16 ? 7 : wait <= 32 ? 8 : 9;
+    buckets[b]++;
+}
+#endif
+
 bool TeranocL1NocRouter::link_req(vp::Block *__this, FloonocReqV2 *req, int input) {
     auto *_this = static_cast<TeranocL1NocRouter *>(__this);
 
@@ -88,6 +122,11 @@ bool TeranocL1NocRouter::link_req(vp::Block *__this, FloonocReqV2 *req, int inpu
     _this->signal_req_is_write.set_and_release(req->get_is_write());
 
     vp::Queue *queue = _this->input_queues[input];
+#ifdef CONFIG_GVSOC_STATS_ACTIVE
+    if (_this->stats_enabled) {
+        _this->arrival_cycle[req] = _this->clock.get_cycles();
+    }
+#endif
     queue->push_back(req, 0);
     return queue->size() >= _this->input_queue_size;
 }
@@ -123,6 +162,16 @@ void TeranocL1NocRouter::fsm_handler(vp::Block *__this, vp::ClockEvent *) {
                     progressed = true;
 #ifdef CONFIG_GVSOC_STATS_ACTIVE
                     _this->stat_in_busy[input]++;
+                    if (_this->stats_enabled) {
+                        int64_t now = _this->clock.get_cycles();
+                        auto it = _this->arrival_cycle.find(req);
+                        if (it != _this->arrival_cycle.end()) {
+                            _this->account_residency(_this->stat_in_res, _this->stat_res_sum_in,
+                                _this->stat_res_n_in, _this->stat_res_max_in, now - it->second);
+                            _this->arrival_cycle.erase(it);
+                        }
+                        _this->grant_cycle[req] = now;
+                    }
 #endif
                     _this->current_input[output] = (input + 1) % DIR_NB;
                     _this->output_owner[output] = req->is_last ? -1 : input;
@@ -230,6 +279,14 @@ bool TeranocL1NocRouter::drain_output(int output) {
     this->last_output_cycle[output] = cycles;
 #ifdef CONFIG_GVSOC_STATS_ACTIVE
     this->stat_out_busy[output]++;
+    if (this->stats_enabled) {
+        auto it = this->grant_cycle.find(req);
+        if (it != this->grant_cycle.end()) {
+            this->account_residency(this->stat_out_res, this->stat_res_sum_out,
+                this->stat_res_n_out, this->stat_res_max_out, cycles - it->second);
+            this->grant_cycle.erase(it);
+        }
+    }
 #endif
     if (this->output_ports[output].req(req)) {
         this->stalled_outputs[output] = true;
