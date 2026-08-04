@@ -44,6 +44,20 @@ TeranocL1NocRouter::TeranocL1NocRouter(vp::ComponentConf &config)
     this->input_queue_size = this->get_js_config()->get_int("input_queue_size");
     this->output_queue_size = this->get_js_config()->get_int("output_queue_size");
 
+#ifdef CONFIG_GVSOC_STATS_ACTIVE
+    for (int direction = 0; direction < DIR_NB; direction++) {
+        std::string d = dir_names[direction];
+        this->stats.register_stat(&this->stat_in_busy[direction], "in_" + d + "_busy",
+            "Cycles a flit was accepted from this input");
+        this->stats.register_stat(&this->stat_in_stall[direction], "in_" + d + "_stall",
+            "Cycles this input presented a flit that was not accepted");
+        this->stats.register_stat(&this->stat_out_busy[direction], "out_" + d + "_busy",
+            "Cycles a flit was put on this output link");
+        this->stats.register_stat(&this->stat_out_stall[direction], "out_" + d + "_stall",
+            "Cycles this output held a ready flit while back-pressured");
+    }
+#endif
+
     for (int direction = 0; direction < DIR_NB; direction++) {
         this->input_queues[direction] =
             new vp::Queue(this, "input_queue_" + std::to_string(direction), &this->fsm_event);
@@ -107,6 +121,9 @@ void TeranocL1NocRouter::fsm_handler(vp::Block *__this, vp::ClockEvent *) {
                     output_queue->push_back(req);
                     input_elected[input] = true;
                     progressed = true;
+#ifdef CONFIG_GVSOC_STATS_ACTIVE
+                    _this->stat_in_busy[input]++;
+#endif
                     _this->current_input[output] = (input + 1) % DIR_NB;
                     _this->output_owner[output] = req->is_last ? -1 : input;
                     if (was_full) {
@@ -124,6 +141,25 @@ void TeranocL1NocRouter::fsm_handler(vp::Block *__this, vp::ClockEvent *) {
     for (int output = 0; output < DIR_NB; output++) {
         progressed |= _this->drain_output(output);
     }
+
+#ifdef CONFIG_GVSOC_STATS_ACTIVE
+    // NOTE the two are not the same quantity. The OUTPUT counter is the RTL
+    // "valid without ready": this port holds a flit the downstream will not
+    // take, so it is directly comparable with interco_perf.py. The INPUT
+    // counter is "head present but not granted by the arbiter", whereas RTL's
+    // input stall is "the input FIFO is full and back-pressures upstream" --
+    // compare inputs only against each other, not against the RTL numbers.
+    // Both are sampled per FSM pass, which runs every cycle while the router
+    // makes progress; a fully blocked router can under-count.
+    for (int port = 0; port < DIR_NB; port++) {
+        if (!input_elected[port] && !_this->input_queues[port]->empty()) {
+            _this->stat_in_stall[port]++;
+        }
+        if (_this->stalled_outputs[port] && !_this->output_queues[port]->empty()) {
+            _this->stat_out_stall[port]++;
+        }
+    }
+#endif
 
     // All input and output FIFOs share this event. A later queue wake-up can
     // be coalesced with the event currently being handled, so explicitly
@@ -192,6 +228,9 @@ bool TeranocL1NocRouter::drain_output(int output) {
     }
     auto *req = static_cast<FloonocReqV2 *>(queue->pop());
     this->last_output_cycle[output] = cycles;
+#ifdef CONFIG_GVSOC_STATS_ACTIVE
+    this->stat_out_busy[output]++;
+#endif
     if (this->output_ports[output].req(req)) {
         this->stalled_outputs[output] = true;
     }

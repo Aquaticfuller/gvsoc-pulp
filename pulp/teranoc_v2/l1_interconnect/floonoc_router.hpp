@@ -9,6 +9,7 @@
 #include <array>
 
 #include <vp/signal.hpp>
+#include <vp/stats/stats.hpp>
 #include <vp/vp.hpp>
 
 #include "pulp/floonoc_v2/floonoc_link_v2.hpp"
@@ -61,6 +62,16 @@ class TeranocL1NocRouter : public vp::Component {
     // triggered by an unstall cannot exceed one flit per cycle.
     int64_t last_output_cycle[DIR_NB];
     std::array<vp::Signal<bool>, DIR_NB> stalled_outputs;
+#ifdef CONFIG_GVSOC_STATS_ACTIVE
+    // Per-port occupancy. busy = accepted handshakes on that port, which is
+    // the RTL noc_profiling definition and diffs directly against
+    // scripts/interco_perf.py. For stall see the note in fsm_handler: the
+    // output counter matches RTL, the input one does not.
+    vp::StatScalar stat_in_busy[DIR_NB];
+    vp::StatScalar stat_in_stall[DIR_NB];
+    vp::StatScalar stat_out_busy[DIR_NB];
+    vp::StatScalar stat_out_stall[DIR_NB];
+#endif
     vp::Signal<uint64_t> signal_req;
     vp::Signal<uint64_t> signal_req_size;
     vp::Signal<bool> signal_req_is_write;
