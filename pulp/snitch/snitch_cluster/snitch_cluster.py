@@ -226,7 +226,15 @@ class SnitchCluster(gvsoc.systree.Component):
                     # data_width=32) → 4 lanes × 4 B = 16 B/cycle aggregate. The old
                     # spatz_lane_width=8 made the model's VLSU 2x too wide (32 B/cycle) —
                     # a first-order issue-side cause of the "model too fast" kernel family.
-                    spatz_lane_width=int(os.environ.get('CACHEPOOL_VLSU_LANE_BYTES', '4'))
+                    spatz_lane_width=int(os.environ.get('CACHEPOOL_VLSU_LANE_BYTES', '4')),
+                    # J1: scalar-LSU outstanding depth — RTL snitch_max_trans=16
+                    # (cachepool_fpu_512.mk:87 → NumIntOutstandingLoads/Mem). The ISS default
+                    # (1) serializes every scalar load behind the one in flight; with the
+                    # scoreboard's stall-on-use + 16 outstanding, independent scalar loads
+                    # pipeline like the RTL LSU. Cachepool-only (other targets unchanged);
+                    # CACHEPOOL_LSU_OUTSTANDING=1 reproduces the pre-J1 behaviour.
+                    nb_outstanding=(int(os.environ.get('CACHEPOOL_LSU_OUTSTANDING', '16'))
+                        if getattr(arch, 'cachepool_num_tiles', None) is not None else 1)
                 ))
 
             else:
