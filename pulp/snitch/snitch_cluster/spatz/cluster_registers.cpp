@@ -49,7 +49,11 @@ private:
 
     vp::Trace     trace;
     bool          cachepool_mode = false;
-    uint32_t      cp_l1d[16] = {0};   // CachePool L1D-config block (0x28..0x4c) RW scratch
+    // CachePool L1D-config scratch. Two layouts share it: the older block (0x28..0x4c -> idx 0..9)
+    // and the newer block (0x58..0xa4 -> idx 10..29). MUST be >= 30: the old 16-entry array let
+    // newer-block writes (idx up to 29, e.g. the XBAR_OFFSET write at 0x98) run off the end and
+    // corrupt nb_flush / flush_busy_until_ / flush_out_itf / flush_req_ (the F1 flush machinery).
+    uint32_t      cp_l1d[30] = {0};
 
     // F1 flush: on a COMMIT (0x38) write, fan a flush request out to every insitu-cache cell
     // (each computes its own walk duration from its dirty-line count and stamps it back);
@@ -327,8 +331,8 @@ bool ClusterRegisters::cachepool_access(uint64_t offset, int size, uint8_t *data
     }
     if (offset >= 0x58 && offset <= 0xa4)
     {
-        // NOTE: indices are offset by 10 to stay clear of the 0x28..0x4c block above. The original form
-        // (offset-0x58)/4 reaches 19, which overran the 16-entry cp_l1d[] array.
+        // NOTE: indices are offset by 10 to stay clear of the 0x28..0x4c block above; cp_l1d
+        // is sized 30, so idx 10..29 are in-bounds (the old 16-entry array was overrun here).
         int idx = 10 + (int)((offset - 0x58) / 4);     // 10..29
         int n = size < 4 ? (int)size : 4;
         if (is_write)
@@ -370,6 +374,11 @@ void ClusterRegisters::reset(bool active)
     {
         this->waiting_cores = 0;
         this->stall_core = false;
+        // RTL reset values for the partition registers in the older block (0x28..0x4c):
+        // L1D_PRIVATE (0x40) = 0, L1D_ADDR (0x44) = 0xA0000000, XBAR_OFFSET (0x48) = 0.
+        cp_l1d[(0x40 - 0x28) / 4] = 0;
+        cp_l1d[(0x44 - 0x28) / 4] = 0xA0000000;
+        cp_l1d[(0x48 - 0x28) / 4] = 0;
     }
 }
 
