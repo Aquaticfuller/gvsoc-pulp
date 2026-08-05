@@ -77,9 +77,11 @@ private:
     uint32_t bootaddr;
     uint32_t status;
     int nb_cores;
-    // 64-bit: the barrier tracks one bit per core; at NB_CORE>32 a 32-bit reg can't hold the
-    // arrivals (and `1ULL << 64` is UB → mask 0 → the barrier never completed — the 16x4=64-core
-    // hangs: all cores parked at the boot/kernel barrier forever, zero program output).
+    // The HW barrier is a COUNTING barrier (like the RTL). Arrival state used to be a bitmask in
+    // this reg: 32-bit broke at NB_CORE>32 (UB shifts; mask (1ULL<<64)-1 == 0 → never completes
+    // → 64-core hang), 64-bit still breaks at NB_CORE>64 (1ULL<<id aliases → the mask completes
+    // early AND parked cores are lost → NULL waiting_reqs deref → SIGSEGV at 256 cores). The reg
+    // now holds the arrival COUNT for debug visibility; completion is count == nb_cores.
     vp::reg_64 barrier_status;
 
     std::vector<vp::WireSlave<bool>> barrier_req_itf;
@@ -89,7 +91,7 @@ private:
 
     int core_access;
     bool stall_core;
-    uint64_t waiting_cores;   // one bit per core — >32-bit at NB_CORE>32 (see barrier_status)
+    uint64_t waiting_cores;   // debug bitmask (valid < 64 cores); not used for barrier logic
 
     std::vector<vp::IoReq *> waiting_reqs;
 
@@ -461,9 +463,10 @@ void ClusterRegisters::hw_barrier_req(uint64_t reg_offset, int size, uint8_t *va
 {
     if (this->core_access != -1)
     {
-        this->barrier_status.set(this->barrier_status.get() | (1ULL << this->core_access));
+        const uint64_t count = this->barrier_status.get() + 1;
+        this->barrier_status.set(count);
 
-        if (this->barrier_status.get() == core_mask(this->nb_cores))
+        if (count >= (uint64_t)this->nb_cores)
         {
             this->trace.msg(vp::Trace::LEVEL_DEBUG, "Barrier reached\n");
 
@@ -471,13 +474,14 @@ void ClusterRegisters::hw_barrier_req(uint64_t reg_offset, int size, uint8_t *va
 
             for (int i=0; i<this->nb_cores; i++)
             {
-                if ((this->waiting_cores >> i) & 1)
+                if (this->waiting_reqs[i] != nullptr)
                 {
                     this->trace.msg(vp::Trace::LEVEL_DEBUG, "Wakeup core waiting on barrier (core: %d)\n",
                         i);
                     // Barrier insert 10 cycle stall even for last one to wake-up, seem the request go through AXI
                     this->waiting_reqs[i]->inc_latency(11);
                     this->waiting_reqs[i]->get_resp_port()->resp(this->waiting_reqs[i]);
+                    this->waiting_reqs[i] = nullptr;
                 }
             }
 
@@ -488,7 +492,7 @@ void ClusterRegisters::hw_barrier_req(uint64_t reg_offset, int size, uint8_t *va
             this->trace.msg(vp::Trace::LEVEL_DEBUG, "Stall core due to barrier not reached (core: %d)\n",
                 this->core_access);
 
-            this->waiting_cores |= 1ULL << this->core_access;
+            if (this->core_access < 64) this->waiting_cores |= 1ULL << this->core_access;
             this->stall_core = true;
             return;
         }
