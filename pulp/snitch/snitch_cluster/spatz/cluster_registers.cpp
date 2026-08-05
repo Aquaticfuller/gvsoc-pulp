@@ -77,7 +77,10 @@ private:
     uint32_t bootaddr;
     uint32_t status;
     int nb_cores;
-    vp::reg_32 barrier_status;
+    // 64-bit: the barrier tracks one bit per core; at NB_CORE>32 a 32-bit reg can't hold the
+    // arrivals (and `1ULL << 64` is UB → mask 0 → the barrier never completed — the 16x4=64-core
+    // hangs: all cores parked at the boot/kernel barrier forever, zero program output).
+    vp::reg_64 barrier_status;
 
     std::vector<vp::WireSlave<bool>> barrier_req_itf;
     vp::WireMaster<bool> barrier_ack_itf;
@@ -86,9 +89,13 @@ private:
 
     int core_access;
     bool stall_core;
-    uint32_t waiting_cores;
+    uint64_t waiting_cores;   // one bit per core — >32-bit at NB_CORE>32 (see barrier_status)
 
     std::vector<vp::IoReq *> waiting_reqs;
+
+    static inline uint64_t core_mask(int nb_cores) {
+        return nb_cores >= 64 ? ~0ULL : ((1ULL << nb_cores) - 1);
+    }
 };
 
 ClusterRegisters::ClusterRegisters(vp::ComponentConf &config)
@@ -402,11 +409,12 @@ bool ClusterRegisters::cachepool_access(uint64_t offset, int size, uint8_t *data
 void ClusterRegisters::barrier_sync(vp::Block *__this, bool value, int id)
 {
     ClusterRegisters *_this = (ClusterRegisters *)__this;
-    _this->barrier_status.set(_this->barrier_status.get() | (value << id));
+    _this->barrier_status.set(_this->barrier_status.get() | ((uint64_t)value << id));
 
-    _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Barrier sync (id: %d, status: 0x%x)\n", id, _this->barrier_status.get());
+    _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Barrier sync (id: %d, status: 0x%llx)\n", id,
+        (unsigned long long)_this->barrier_status.get());
 
-    if (_this->barrier_status.get() == (1ULL << _this->nb_cores) - 1)
+    if (_this->barrier_status.get() == core_mask(_this->nb_cores))
     {
         _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Barrier reached\n");
 
@@ -435,7 +443,11 @@ void ClusterRegisters::reset(bool active)
 void ClusterRegisters::cl_clint_set_req(uint64_t reg_offset, int size, uint8_t *value, bool is_write)
 {
     this->regmap.cl_clint_set.update(reg_offset, size, value, is_write);
-    for (int i=0; i<this->nb_cores; i++)
+    // The CL_CLINT register is one 32-bit word: harts >= 32 have no bit here (shifting a 32-bit
+    // value by >=32 is UB). Nothing in the cachepool suite uses clint IPIs at >32 cores; if a
+    // future kernel needs them this needs a second word (the RTL header has HART_SELECT_0/1 but
+    // a single CL_CLINT_SET).
+    for (int i=0; i<this->nb_cores && i<32; i++)
     {
         int irq_status = (this->regmap.cl_clint_set.get() >> i) & 1;
         if (irq_status == 1)
@@ -449,9 +461,9 @@ void ClusterRegisters::hw_barrier_req(uint64_t reg_offset, int size, uint8_t *va
 {
     if (this->core_access != -1)
     {
-        this->barrier_status.set(this->barrier_status.get() | (1 << this->core_access));
+        this->barrier_status.set(this->barrier_status.get() | (1ULL << this->core_access));
 
-        if (this->barrier_status.get() == (1ULL << this->nb_cores) - 1)
+        if (this->barrier_status.get() == core_mask(this->nb_cores))
         {
             this->trace.msg(vp::Trace::LEVEL_DEBUG, "Barrier reached\n");
 
@@ -476,7 +488,7 @@ void ClusterRegisters::hw_barrier_req(uint64_t reg_offset, int size, uint8_t *va
             this->trace.msg(vp::Trace::LEVEL_DEBUG, "Stall core due to barrier not reached (core: %d)\n",
                 this->core_access);
 
-            this->waiting_cores |= 1 << this->core_access;
+            this->waiting_cores |= 1ULL << this->core_access;
             this->stall_core = true;
             return;
         }
@@ -489,7 +501,7 @@ void ClusterRegisters::hw_barrier_req(uint64_t reg_offset, int size, uint8_t *va
 void ClusterRegisters::cl_clint_clear_req(uint64_t reg_offset, int size, uint8_t *value, bool is_write)
 {
     this->regmap.cl_clint_clear.update(reg_offset, size, value, is_write);
-    for (int i=0; i<this->nb_cores; i++)
+    for (int i=0; i<this->nb_cores && i<32; i++)   // 32-bit register — see cl_clint_set_req
     {
         int irq_status = (this->regmap.cl_clint_clear.get() >> i) & 1;
         if (irq_status == 1)
