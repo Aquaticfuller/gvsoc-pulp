@@ -378,9 +378,10 @@ bool TeranocL1TcdmBankInterco::wide_response_ready(int superbank, int64_t cycle)
 }
 
 void TeranocL1TcdmBankInterco::schedule_now() {
-    if (!this->fsm_event.is_enqueued()) {
-        this->fsm_event.enqueue(0);
-    }
+    // Pull an already-scheduled next-cycle tick back to the current cycle.
+    // ClockEvent::enqueue() keeps an existing event only when it is already
+    // earlier, so this is also safe when no reschedule is needed.
+    this->fsm_event.enqueue(0);
 }
 
 void TeranocL1TcdmBankInterco::schedule_next() {
