@@ -150,7 +150,9 @@ class TeranocSystem(st.Component):
         loader = ElfLoader(self, 'loader', binary=binary, entry=0x80000000)
         self.loader = loader
 
-        # L2 loader converter
+        # L2 loader converter. Keep the dedicated single-request splitter here:
+        # unlike the live-fabric interleaver, it preserves the loader request's
+        # ownership and data pointer across every granule of a large ELF write.
         l2_loader_converter = IoV2SingleReqWidthAdapter(self, 'l2_loader_converter',
             width=axi_data_width * arch.l2_axi_interleave)
 
@@ -170,9 +172,11 @@ class TeranocSystem(st.Component):
 
         ext_ico = Router(self, 'ext_ico', config=RouterConfig(kind=KIND_BANDWIDTH, bandwidth=4))
 
-        # Binary Loader Router
+        # Binary Loader Router. Bandwidth 0 = unshaped: the ELF load is a back
+        # door with no hardware counterpart (the RTL testbench preloads L2
+        # directly at t=0), so shaping it only inflates the pre-boot phase.
         loader_router = Router(self, 'loader_router', config=RouterConfig(
-                kind=KIND_BANDWIDTH, bandwidth=32, latency=1))
+                kind=KIND_BANDWIDTH, bandwidth=0, latency=1))
 
         ################################################################
         ##########               Design Bindings              ##########

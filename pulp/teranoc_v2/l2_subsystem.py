@@ -94,7 +94,7 @@ class L2_subsystem(gvsoc.systree.Component):
         # The loader path is a back door in the v1 model: it only decodes and
         # rebases the contiguous bank slices. Its latency and bandwidth are
         # deliberately both zero; the top-level loader router supplies the
-        # legacy latency-1 / 32-byte-per-cycle shaping.
+        # latency-1 pipeline delay (it is unshaped in bandwidth as well).
         loader_router = Router(self, 'loader_router', config=RouterConfig(kind=KIND_BANDWIDTH,
                 bandwidth=0, latency=0, shared_rw_channel=True,),)
         for i in range(0, nb_banks):
