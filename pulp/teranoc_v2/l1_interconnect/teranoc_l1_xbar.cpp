@@ -96,9 +96,9 @@ private:
         std::deque<StageEntry> stage;
         bool stage_blocked = false;
 
-        // Response direction. pending_responses counts responses the requester
-        // has REFUSED -- not responses in flight -- so the cap is a real buffer
-        // depth. next_response_cycle, not the counter, models the lane rate.
+        // Response direction. pending_responses counts requester-refused beats,
+        // not all responses in flight, so it is a modeled held-response credit.
+        // next_response_cycle, not the counter, models the lane rate.
         std::deque<Item *> ready_responses;
         bool response_blocked = false;
         int64_t next_response_cycle = 0;
@@ -810,9 +810,9 @@ void TeranocL1Xbar::queue_response(Item *item)
     this->response_event.enqueue(0);
 }
 
-// A response in flight holds no slot, so this deque is bounded only by arrival
-// rate versus next_response_cycle. Track its depth: while it stays within the
-// RTL's 1-3 entries of lane storage no explicit buffer is needed.
+// ready_responses preserves per-lane completion order; only its front is
+// visible to the response xbar. next_response_cycle models the lane rate,
+// while held-response capacity and backpressure are approximated separately.
 void TeranocL1Xbar::note_ready_response(Output &output, int output_id)
 {
     if (output.ready_responses.size() <= output.ready_responses_hwm)
@@ -829,38 +829,27 @@ void TeranocL1Xbar::deliver_responses()
     int64_t cycle = this->clock.get_cycles();
     std::vector<bool> output_used(this->nb_outputs, false);
 
-    // The RTL response crossbar arbitrates per destination, so a requester
-    // that cannot take its response holds up only its own. Serve this input's
-    // oldest response rather than the lane's oldest: otherwise one blocked
-    // requester head-of-line blocks every other requester on the lane.
+    // The fall-through register in front of each RTL response-crossbar input
+    // exposes only that physical lane's head. A later response on the same
+    // lane cannot bypass it, even when it targets a different requester.
     for (int input_id = 0; input_id < this->nb_inputs; input_id++)
     {
         int output_id = this->current_response_output[input_id];
         for (int count = 0; count < this->nb_outputs; count++)
         {
             Output &output = this->outputs[output_id];
-            auto entry = output.ready_responses.end();
-            if (!output_used[output_id] && cycle >= output.next_response_cycle)
-            {
-                for (auto it = output.ready_responses.begin();
-                     it != output.ready_responses.end(); ++it)
-                {
-                    if ((*it)->input == input_id && this->blocked_responses[input_id] == nullptr)
-                    {
-                        entry = it;
-                        break;
-                    }
-                }
-            }
-            if (entry == output.ready_responses.end())
+            if (output_used[output_id] || cycle < output.next_response_cycle ||
+                output.ready_responses.empty() ||
+                output.ready_responses.front()->input != input_id ||
+                this->blocked_responses[input_id] != nullptr)
             {
                 output_id = (output_id + 1) % this->nb_outputs;
                 continue;
             }
 
             output_used[output_id] = true;
-            Item *item = *entry;
-            output.ready_responses.erase(entry);
+            Item *item = output.ready_responses.front();
+            output.ready_responses.pop_front();
             this->response_items.erase(item->req);
             output.next_response_cycle =
                 cycle + std::max<int64_t>(1, this->duration(item->size));
@@ -886,7 +875,7 @@ void TeranocL1Xbar::deliver_responses()
                 output.response_blocked = true;
                 this->blocked_responses[input_id] = item;
                 // The refused beat now occupies the lane register: this is the
-                // only thing that consumes a response slot.
+                // only thing that consumes a modeled held-response credit.
                 output.pending_responses++;
                 this->trace.msg(vp::Trace::LEVEL_TRACE, "XBAR_RESP_BLOCK out=%d in=%d pend=%d\n",
                     output_id, input_id, output.pending_responses);
@@ -964,14 +953,11 @@ bool TeranocL1Xbar::has_ready_responses() const
 {
     for (const Output &output : this->outputs)
     {
-        // Any response whose requester is free can move, not just the lane's
-        // oldest one (see deliver_responses).
-        for (const Item *item : output.ready_responses)
+        // Only the fall-through register's visible head can request the xbar.
+        if (!output.ready_responses.empty() &&
+            this->blocked_responses[output.ready_responses.front()->input] == nullptr)
         {
-            if (this->blocked_responses[item->input] == nullptr)
-            {
-                return true;
-            }
+            return true;
         }
     }
     return false;
@@ -1034,10 +1020,10 @@ void TeranocL1Xbar::input_resp_retry(vp::Block *__this, int input_id, vp::IoRetr
     }
 
     Output &output = _this->outputs[item->output];
-    // The held response is this input's oldest, but other inputs' responses
-    // may sit ahead of it in the lane, so find it by identity.
-    auto entry = std::find(output.ready_responses.begin(), output.ready_responses.end(), item);
-    vp_assert(output.response_blocked && entry != output.ready_responses.end(),
+    // A denied response is restored at the physical lane head, and no later
+    // response on that lane can bypass it before this retry is accepted.
+    vp_assert(output.response_blocked && !output.ready_responses.empty() &&
+            output.ready_responses.front() == item,
         &_this->trace, "TeraNoC L1 input %d lost its denied response\n", input_id);
 
     auto response = _this->response_items.find(item->req);
@@ -1053,7 +1039,7 @@ void TeranocL1Xbar::input_resp_retry(vp::Block *__this, int input_id, vp::IoRetr
         return;
     }
 
-    output.ready_responses.erase(entry);
+    output.ready_responses.pop_front();
     output.response_blocked = false;
     output.next_response_cycle =
         _this->clock.get_cycles() +
