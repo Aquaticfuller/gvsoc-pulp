@@ -142,7 +142,15 @@ class SnitchMempool(RiscvCommon):
                 "SnitchMempool with Spatz requires a private floating-point register file "
                 "(vector=True requires zfinx=False)")
 
-        cache_key = ('vector_' if config.vector else 'scalar_') + config.isa
+        # The Isa instance owns the generated ISA header, and that header
+        # carries the module defines (CONFIG_GVSOC_ISS_LSU, ...). Two configs
+        # sharing an instance therefore share one header, and the last one
+        # elaborated wins: a target built with the v1 Lsu would compile
+        # lsu.cpp against a header declaring LsuV2, giving `iss.lsu` the wrong
+        # layout and a SIGSEGV on the first port access. Key on everything that
+        # changes those defines.
+        cache_key = (('vector_' if config.vector else 'scalar_')
+                     + ('lsuv2_' if config.lsu_v2 else 'lsuv1_') + config.isa)
         isa_instance: Isa | None = _isa_instances.get(cache_key)
 
         if isa_instance is None:
