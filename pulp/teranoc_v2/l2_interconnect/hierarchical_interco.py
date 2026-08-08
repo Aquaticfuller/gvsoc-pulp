@@ -50,7 +50,7 @@ class Hierarchical_Interco(gvsoc.systree.Component):
         # and DMA inputs. Keep independent AXI read/write arbitration and
         # release each request channel once its request has crossed.
         input_itf = Router(self, 'input_itf', config=RouterConfig(kind=KIND_BEAT, width=bandwidth,
-                shared_rw_channel=False, max_input_pending_size=bandwidth,
+                shared_rw_channel=False, max_input_pending_size=2 * bandwidth,
                 max_pending_bursts_per_input=8, lock_read_output=False, lock_write_output=False,),)
 
         filter = CacheFilter(self, 'filter', bypass=False, cache_rules=cache_rules,
