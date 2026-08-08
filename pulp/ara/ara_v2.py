@@ -129,7 +129,8 @@ def extend_isa(isa_instance: Isa):
 
 def attach(component: Component, vlen: int, nb_lanes: int, use_spatz: bool=False,
         spatz_nb_ports: int|None=None, lane_width=8, vlsu_v2: bool=False,
-        nb_outstanding_reqs: int=8):
+        nb_outstanding_reqs: int=8, reduction_is_serial: bool=False,
+        reduction_step_latency: int=1):
     component.add_sources([
         "cpu/iss_v2/src/vector_unit/vector_unit.cpp",
         "cpu/iss_v2/src/vector_unit/vector_unit_compute.cpp",
@@ -169,6 +170,13 @@ def attach(component: Component, vlen: int, nb_lanes: int, use_spatz: bool=False
 
     component.add_property('vu/nb_lanes', nb_lanes)
     component.add_property('vu/lane_width', lane_width)
+    # How the unit reduces a vred*/vfred*. Serial = one element per FU round
+    # trip (MemPool-Spatz); otherwise across the lanes, like Ara and upstream
+    # Spatz (per-lane partials + log tree) -- still costs the lane-wide chunk
+    # rate, it is just not an element rate. The step latency applies to the
+    # serial form only. Emitted as ints: js::ConfigBool has no get_int().
+    component.add_property('vu/reduction_is_serial', int(reduction_is_serial))
+    component.add_property('vu/reduction_step_latency', reduction_step_latency)
     if use_spatz:
         component.add_property('vu/nb_ports', nb_lanes if spatz_nb_ports is None else spatz_nb_ports)
         component.add_property('vu/nb_outstanding_reqs', nb_outstanding_reqs)

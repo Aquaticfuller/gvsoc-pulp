@@ -188,9 +188,12 @@ class SnitchMempool(RiscvCommon):
 
         if config.vector:
             self._lsu_v2 = config.lsu_v2
+            # MemPool-Spatz reduces one element per FPU round trip (3 cycles for
+            # FP32: ADDMUL PipeRegs=1 plus the Reduction_Reduce handshake).
             pulp.ara.ara_v2.attach(self, config.vlen, nb_lanes=config.nb_lanes,
                 use_spatz=True, lane_width=config.lane_width,
-                vlsu_v2=config.lsu_v2, nb_outstanding_reqs=config.vlsu_nb_outstanding)
+                vlsu_v2=config.lsu_v2, nb_outstanding_reqs=config.vlsu_nb_outstanding,
+                reduction_is_serial=True, reduction_step_latency=3)
 
     def o_VLSU(self, port: int, itf: gvsoc.systree.SlaveItf):
         self.itf_bind(f'vlsu_{port}', itf,
