@@ -96,6 +96,7 @@ class TeranocL1TcdmBankInterco : public vp::Component {
     void prepare_async_response(vp::IoReq *req);
     void retry_narrow_input(int bank, int input);
     void try_capture_wide(int64_t cycle);
+    void capture_wide(vp::IoReq *req, int superbank, bool partial);
     void accept_narrow(int bank, int input, vp::IoReq *req);
     void accept_wide_lane(int bank, WideTransaction *transaction);
     vp::IoRespStatus access_wide_lane(int bank, WideTransaction *transaction);
@@ -459,26 +460,21 @@ vp::IoReqStatus TeranocL1TcdmBankInterco::wide_req(vp::Block *__this, vp::IoReq 
 
     int superbank = _this->wide_superbank(req->get_addr(), partial);
     if (_this->accepting_wide && _this->wide_pending_superbank == superbank) {
-        auto transaction = std::make_unique<WideTransaction>();
-        transaction->req = req;
-        transaction->superbank = superbank;
-        transaction->rotation = _this->wide_rotation(req->get_addr(), partial);
-        transaction->row = _this->bank_row(
-            partial ? req->get_addr() & ~((uint64_t)_this->wide_width - 1) : req->get_addr());
-        transaction->request_addr = req->get_addr();
-        transaction->request_size = req->get_size();
-        transaction->partial = partial;
-        transaction->active_offset =
-            partial ? req->get_addr() & ((uint64_t)_this->wide_width - 1) : 0;
-        transaction->pending_banks.assign(_this->banks_per_superbank, true);
-        _this->prepare_async_response(req);
-        _this->active_wide = std::move(transaction);
+        _this->capture_wide(req, superbank, partial);
         _this->wide_pending = false;
         _this->wide_pending_superbank = -1;
         _this->accepting_wide_consumed = true;
-        _this->trace.msg(vp::Trace::LEVEL_TRACE,
-            "WIDE_CAPTURE sb=%d rot=%d addr=0x%lx size=0x%lx\n", superbank,
-            _this->active_wide->rotation, req->get_addr(), req->get_size());
+        return vp::IO_REQ_GRANTED;
+    }
+
+    // The tile's wide ready is combinational in hardware: the master holds
+    // valid and is taken on any cycle the port is free. Take the beat on first
+    // presentation whenever the fork slot is free. The fork itself still runs
+    // from the FSM, so bank arbitration order is unchanged.
+    if (!_this->wide_pending && _this->active_wide == nullptr &&
+        _this->wide_fifo_can_capture(superbank, _this->clock.get_cycles())) {
+        _this->capture_wide(req, superbank, partial);
+        _this->schedule_now();
         return vp::IO_REQ_GRANTED;
     }
 
@@ -491,6 +487,24 @@ vp::IoReqStatus TeranocL1TcdmBankInterco::wide_req(vp::Block *__this, vp::IoReq 
     }
     _this->schedule_now();
     return vp::IO_REQ_DENIED;
+}
+
+void TeranocL1TcdmBankInterco::capture_wide(vp::IoReq *req, int superbank, bool partial) {
+    auto transaction = std::make_unique<WideTransaction>();
+    transaction->req = req;
+    transaction->superbank = superbank;
+    transaction->rotation = this->wide_rotation(req->get_addr(), partial);
+    transaction->row = this->bank_row(
+        partial ? req->get_addr() & ~((uint64_t)this->wide_width - 1) : req->get_addr());
+    transaction->request_addr = req->get_addr();
+    transaction->request_size = req->get_size();
+    transaction->partial = partial;
+    transaction->active_offset = partial ? req->get_addr() & ((uint64_t)this->wide_width - 1) : 0;
+    transaction->pending_banks.assign(this->banks_per_superbank, true);
+    this->prepare_async_response(req);
+    this->active_wide = std::move(transaction);
+    this->trace.msg(vp::Trace::LEVEL_TRACE, "WIDE_CAPTURE sb=%d rot=%d addr=0x%lx size=0x%lx\n",
+        superbank, this->active_wide->rotation, req->get_addr(), req->get_size());
 }
 
 void TeranocL1TcdmBankInterco::wide_resp_retry(vp::Block *__this, vp::IoRetryChannel) {
