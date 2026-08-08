@@ -12,8 +12,15 @@
  * `rr_arb_tree` per output, ONE transfer per output per cycle, ZERO cycles of
  * latency and NO storage -- `OutSpillReg` is 0 everywhere in TeraNoC, which
  * makes the crossbar's internal spill register `Bypass=1`, i.e. a wire. So the
- * only per-output state is the round-robin pointer and, with `lock_in`
- * (`LockIn=1`), the frozen winner.
+ * only per-output state is the round-robin pointer.
+ *
+ * `LockIn` is NOT uniform across the instances this class stands in for, so it
+ * is a property rather than a constant:
+ *   - `i_remote_req_interco` (mempool_tile.sv:721) overrides it off;
+ *   - `i_remote_resp_interco` (mempool_tile.sv:753) and the group-level
+ *     `i_local_req_interco` / `i_local_resp_interco`
+ *     (mempool_group_floonoc_wrapper.sv:516, 690) take the `stream_xbar`
+ *     default, which is `LockIn=1`.
  *
  * Output stage: the RTL register that follows the crossbar, modelled as a
  * queue with a release delay rather than an A/B slot FSM.
@@ -49,6 +56,7 @@
 #include <vp/itf/io_v2.hpp>
 
 #include "floonoc.hpp"
+#include "arbiter.hpp"
 
 class TeranocL1Xbar : public vp::Component
 {
@@ -148,7 +156,10 @@ private:
     std::vector<std::unique_ptr<vp::IoMaster>> output_itfs;
     std::vector<Input> inputs;
     std::vector<Output> outputs;
-    std::vector<int> current_input;          // per-output round-robin pointer
+    // Per-output request arbiter (RTL rr_arb_tree). Kept beside outputs, not
+    // inside Output: reset() rebuilds each Output by assigning a default-
+    // constructed one, which would wipe the arbiter's configured width.
+    std::vector<Arbiter> request_arb;
     std::vector<Item *> blocked_responses;   // per input
     std::vector<int> current_response_output;
     std::map<vp::IoReq *, Item *> response_items;
@@ -246,7 +257,11 @@ TeranocL1Xbar::TeranocL1Xbar(vp::ComponentConf &config)
 
     this->inputs.resize(this->nb_inputs);
     this->outputs.resize(this->nb_outputs);
-    this->current_input.resize(this->nb_outputs, 0);
+    this->request_arb.resize(this->nb_outputs);
+    for (Arbiter &arb : this->request_arb)
+    {
+        arb.init(this->nb_inputs, ArbPolicy::RrArbTree, /*lock_in=*/false);
+    }
     this->blocked_responses.resize(this->nb_inputs, nullptr);
     this->current_response_output.resize(this->nb_inputs, 0);
 }
@@ -294,7 +309,10 @@ void TeranocL1Xbar::reset(bool active)
         items.insert(item);
     }
     this->response_items.clear();
-    std::fill(this->current_input.begin(), this->current_input.end(), 0);
+    for (Arbiter &arb : this->request_arb)
+    {
+        arb.reset();
+    }
     std::fill(this->blocked_responses.begin(), this->blocked_responses.end(), nullptr);
     std::fill(this->current_response_output.begin(), this->current_response_output.end(), 0);
     for (Item *item : items)
@@ -439,7 +457,7 @@ void TeranocL1Xbar::release_winner(Item *item)
     input.next_cycle = cycle + this->duration(item->size);
     output.next_cycle = cycle + this->duration(item->size);
     output.elected = nullptr;
-    this->current_input[item->output] = (item->input + 1) % this->nb_inputs;
+    this->request_arb[item->output].grant(item->input);
     this->retry_input(item->input);
 }
 
@@ -603,20 +621,23 @@ void TeranocL1Xbar::arbiter_handler(vp::Block *__this, vp::ClockEvent *)
             continue;
         }
 
-        int input_id = _this->current_input[output_id];
-        for (int count = 0; count < _this->nb_inputs; count++)
+        uint64_t requests = 0;
+        for (int input_id = 0; input_id < _this->nb_inputs; input_id++)
         {
             Input &input = _this->inputs[input_id];
             if (!input_elected[input_id] && !input.stalled &&
                 cycles >= input.next_cycle && input.pending != nullptr &&
                 input.pending->output == output_id)
             {
-                output.elected = input.pending;
-                input_elected[input_id] = true;
-                elected = true;
-                break;
+                requests |= 1ULL << input_id;
             }
-            input_id = (input_id + 1) % _this->nb_inputs;
+        }
+        int input_id = _this->request_arb[output_id].select(requests);
+        if (input_id != -1)
+        {
+            output.elected = _this->inputs[input_id].pending;
+            input_elected[input_id] = true;
+            elected = true;
         }
     }
 
@@ -707,22 +728,26 @@ void TeranocL1Xbar::output_retry(vp::Block *__this, int output_id, vp::IoRetryCh
     // LockIn=0: the grant is not frozen, so re-arbitrate now that the output
     // is free again.
     output.stalled = false;
-    int input_id = _this->current_input[output_id];
-    for (int count = 0; count < _this->nb_inputs; count++)
+    uint64_t requests = 0;
+    for (int input_id = 0; input_id < _this->nb_inputs; input_id++)
     {
         Input &input = _this->inputs[input_id];
         if (!input.stalled && input.pending != nullptr && input.pending->output == output_id)
         {
-            Item *candidate = input.pending;
-            output.elected = candidate;
-            input.denied = true;
-            _this->retry_input(input_id);
-            vp_assert(output.elected != candidate || output.stalled, &_this->trace,
-                "TeraNoC L1 input %d did not synchronously resend its " "re-elected request\n",
-                input_id);
-            break;
+            requests |= 1ULL << input_id;
         }
-        input_id = (input_id + 1) % _this->nb_inputs;
+    }
+    int input_id = _this->request_arb[output_id].select(requests);
+    if (input_id != -1)
+    {
+        Input &input = _this->inputs[input_id];
+        Item *candidate = input.pending;
+        output.elected = candidate;
+        input.denied = true;
+        _this->retry_input(input_id);
+        vp_assert(output.elected != candidate || output.stalled, &_this->trace,
+            "TeraNoC L1 input %d did not synchronously resend its " "re-elected request\n",
+            input_id);
     }
     if (output.elected == nullptr && !output.stalled)
     {
