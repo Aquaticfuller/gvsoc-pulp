@@ -161,7 +161,10 @@ private:
     // constructed one, which would wipe the arbiter's configured width.
     std::vector<Arbiter> request_arb;
     std::vector<Item *> blocked_responses;   // per input
-    std::vector<int> current_response_output;
+    // Per-input response arbiter. LockIn is expressed by blocked_responses,
+    // which empties this input's contender mask while a refused beat holds the
+    // lane, so the arbiter itself must not also freeze it.
+    std::vector<Arbiter> response_arb;
     std::map<vp::IoReq *, Item *> response_items;
 
     int64_t bandwidth;
@@ -263,7 +266,11 @@ TeranocL1Xbar::TeranocL1Xbar(vp::ComponentConf &config)
         arb.init(this->nb_inputs, ArbPolicy::RrArbTree, /*lock_in=*/false);
     }
     this->blocked_responses.resize(this->nb_inputs, nullptr);
-    this->current_response_output.resize(this->nb_inputs, 0);
+    this->response_arb.resize(this->nb_inputs);
+    for (Arbiter &arb : this->response_arb)
+    {
+        arb.init(this->nb_outputs, ArbPolicy::RrArbTree, /*lock_in=*/false);
+    }
 }
 
 void TeranocL1Xbar::reset(bool active)
@@ -314,7 +321,10 @@ void TeranocL1Xbar::reset(bool active)
         arb.reset();
     }
     std::fill(this->blocked_responses.begin(), this->blocked_responses.end(), nullptr);
-    std::fill(this->current_response_output.begin(), this->current_response_output.end(), 0);
+    for (Arbiter &arb : this->response_arb)
+    {
+        arb.reset();
+    }
     for (Item *item : items)
     {
         if (this->request_only && item->accepted)
@@ -834,53 +844,61 @@ void TeranocL1Xbar::deliver_responses()
     // lane cannot bypass it, even when it targets a different requester.
     for (int input_id = 0; input_id < this->nb_inputs; input_id++)
     {
-        int output_id = this->current_response_output[input_id];
-        for (int count = 0; count < this->nb_outputs; count++)
+        uint64_t requests = 0;
+        for (int output_id = 0; output_id < this->nb_outputs; output_id++)
         {
             Output &output = this->outputs[output_id];
-            if (output_used[output_id] || cycle < output.next_response_cycle ||
-                output.ready_responses.empty() ||
-                output.ready_responses.front()->input != input_id ||
-                this->blocked_responses[input_id] != nullptr)
+            if (!output_used[output_id] && cycle >= output.next_response_cycle &&
+                !output.ready_responses.empty() &&
+                output.ready_responses.front()->input == input_id &&
+                this->blocked_responses[input_id] == nullptr)
             {
-                output_id = (output_id + 1) % this->nb_outputs;
-                continue;
+                requests |= 1ULL << output_id;
             }
+        }
 
-            output_used[output_id] = true;
-            Item *item = output.ready_responses.front();
-            output.ready_responses.pop_front();
-            this->response_items.erase(item->req);
-            output.next_response_cycle =
-                cycle + std::max<int64_t>(1, this->duration(item->size));
-            uint64_t resp_addr = item->req->get_addr();
-            vp::IoRespAck ack = this->input_itfs[input_id]->resp(item->req);
-            this->trace.msg(vp::Trace::LEVEL_TRACE,
-                "XBAR_RESP in=%d out=%d req=%p addr=0x%llx ack=%d\n",
-                input_id, output_id, item->req, (unsigned long long)resp_addr, (int)ack);
-            if (ack == vp::IO_RESP_ACCEPTED)
-            {
-                // Nothing to release: a response the requester takes when
-                // offered never occupied the lane register.
-                delete item;
-                this->current_response_output[input_id] =
-                    (output_id + 1) % this->nb_outputs;
-            }
-            else
-            {
-                vp_assert(this->response_items.find(item->req) == this->response_items.end(),
-                    &this->trace, "TeranocL1Xbar upstream reused a response it denied\n");
-                this->response_items[item->req] = item;
-                output.ready_responses.push_front(item);
-                output.response_blocked = true;
-                this->blocked_responses[input_id] = item;
-                // The refused beat now occupies the lane register: this is the
-                // only thing that consumes a modeled held-response credit.
-                output.pending_responses++;
-                this->trace.msg(vp::Trace::LEVEL_TRACE, "XBAR_RESP_BLOCK out=%d in=%d pend=%d\n",
-                    output_id, input_id, output.pending_responses);
-            }
-            break;
+        int output_id = this->response_arb[input_id].select(requests);
+        if (output_id == -1)
+        {
+            continue;
+        }
+
+        Output &output = this->outputs[output_id];
+        vp_assert(!output.ready_responses.empty() &&
+                output.ready_responses.front()->input == input_id,
+            &this->trace, "TeraNoC L1 response arbiter selected the wrong lane head\n");
+
+        output_used[output_id] = true;
+        Item *item = output.ready_responses.front();
+        output.ready_responses.pop_front();
+        this->response_items.erase(item->req);
+        output.next_response_cycle =
+            cycle + std::max<int64_t>(1, this->duration(item->size));
+        uint64_t resp_addr = item->req->get_addr();
+        vp::IoRespAck ack = this->input_itfs[input_id]->resp(item->req);
+        this->trace.msg(vp::Trace::LEVEL_TRACE,
+            "XBAR_RESP in=%d out=%d req=%p addr=0x%llx ack=%d\n",
+            input_id, output_id, item->req, (unsigned long long)resp_addr, (int)ack);
+        if (ack == vp::IO_RESP_ACCEPTED)
+        {
+            // Nothing to release: a response the requester takes when
+            // offered never occupied the lane register.
+            delete item;
+            this->response_arb[input_id].grant(output_id);
+        }
+        else
+        {
+            vp_assert(this->response_items.find(item->req) == this->response_items.end(),
+                &this->trace, "TeranocL1Xbar upstream reused a response it denied\n");
+            this->response_items[item->req] = item;
+            output.ready_responses.push_front(item);
+            output.response_blocked = true;
+            this->blocked_responses[input_id] = item;
+            // The refused beat now occupies the lane register: this is the
+            // only thing that consumes a modeled held-response credit.
+            output.pending_responses++;
+            this->trace.msg(vp::Trace::LEVEL_TRACE, "XBAR_RESP_BLOCK out=%d in=%d pend=%d\n",
+                output_id, input_id, output.pending_responses);
         }
     }
 }
@@ -1052,8 +1070,7 @@ void TeranocL1Xbar::input_resp_retry(vp::Block *__this, int input_id, vp::IoRetr
     {
         output.response_retry_cycle = _this->clock.get_cycles() + 1;
     }
-    _this->current_response_output[input_id] =
-        (item->output + 1) % _this->nb_outputs;
+    _this->response_arb[input_id].grant(item->output);
     delete item;
     _this->response_event.enqueue(1);
 }
