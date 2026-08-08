@@ -15,6 +15,8 @@
 #include <vp/vp.hpp>
 #include <vp/itf/io_v2.hpp>
 
+#include "arbiter.hpp"
+
 class TeranocL1TcdmBankInterco : public vp::Component {
   public:
     TeranocL1TcdmBankInterco(vp::ComponentConf &config);
@@ -43,8 +45,8 @@ class TeranocL1TcdmBankInterco : public vp::Component {
 
     struct BankState {
         std::deque<BankResponse> responses;
-        int request_rr_next = 0;
-        int request_locked_input = -1;
+        // RTL i_narrow_req_xbar: one rr_arb_tree per bank (stream_xbar, LockIn=1).
+        Arbiter request_arb;
         int64_t last_accept_cycle = -1;
         int64_t last_response_cycle = -1;
         int64_t no_accept_before = 0;
@@ -81,7 +83,7 @@ class TeranocL1TcdmBankInterco : public vp::Component {
     int physical_bank(uint64_t address);
     int wide_superbank(uint64_t address, bool partial);
     int wide_rotation(uint64_t address, bool partial);
-    int pick_request_winner(int bank) const;
+    int pick_request_winner(int bank);
     int pick_response_bank(int input);
     bool bank_can_accept(int bank, int64_t cycle) const;
     bool bank_has_old_response(int bank, int64_t cycle) const;
@@ -102,7 +104,6 @@ class TeranocL1TcdmBankInterco : public vp::Component {
     bool try_wide_response();
     bool resend_narrow_response(int input);
     bool resend_wide_response();
-    void pop_narrow_response(int bank, int input);
     void pop_wide_response(int superbank);
     void update_bank_after_pop(int bank, const BankResponse &response, int64_t cycle);
 
@@ -116,8 +117,8 @@ class TeranocL1TcdmBankInterco : public vp::Component {
 
     std::vector<NarrowInput> narrow_inputs;
     std::vector<BankState> banks;
-    std::vector<int> response_rr_next;
-    std::vector<int> response_locked_bank;
+    // RTL i_narrow_resp_xbar: one rr_arb_tree per narrow input.
+    std::vector<Arbiter> response_arb;
     std::vector<int64_t> response_sent_cycle;
     std::vector<int64_t> input_accept_cycle;
 
@@ -212,8 +213,13 @@ TeranocL1TcdmBankInterco::TeranocL1TcdmBankInterco(vp::ComponentConf &config)
     }
 
     this->banks.resize(this->nb_banks);
-    this->response_rr_next.assign(this->nb_narrow_inputs, 0);
-    this->response_locked_bank.assign(this->nb_narrow_inputs, -1);
+    this->response_arb.resize(this->nb_narrow_inputs);
+    for (Arbiter &arb : this->response_arb) {
+        arb.init(this->nb_banks);
+    }
+    for (BankState &bank : this->banks) {
+        bank.request_arb.init(this->nb_narrow_inputs);
+    }
     this->response_sent_cycle.assign(this->nb_narrow_inputs, -1);
     this->input_accept_cycle.assign(this->nb_narrow_inputs, -1);
     this->wide_fifos.resize(this->nb_superbanks);
@@ -232,15 +238,15 @@ void TeranocL1TcdmBankInterco::reset(bool active) {
     }
     for (BankState &bank : this->banks) {
         bank.responses.clear();
-        bank.request_rr_next = 0;
-        bank.request_locked_input = -1;
+        bank.request_arb.reset();
         bank.last_accept_cycle = -1;
         bank.last_response_cycle = -1;
         bank.no_accept_before = 0;
         bank.amo_block_until = 0;
     }
-    std::fill(this->response_rr_next.begin(), this->response_rr_next.end(), 0);
-    std::fill(this->response_locked_bank.begin(), this->response_locked_bank.end(), -1);
+    for (Arbiter &arb : this->response_arb) {
+        arb.reset();
+    }
     std::fill(this->response_sent_cycle.begin(), this->response_sent_cycle.end(), -1);
     std::fill(this->input_accept_cycle.begin(), this->input_accept_cycle.end(), -1);
     for (auto &fifo : this->wide_fifos) {
@@ -308,37 +314,29 @@ int TeranocL1TcdmBankInterco::wide_rotation(uint64_t address, bool partial) {
 
 // RTL i_narrow_req_xbar: one rr_arb_tree per bank, LockIn=1 (a stalled winner
 // keeps the grant and holds the pointer).
-int TeranocL1TcdmBankInterco::pick_request_winner(int bank) const {
-    const BankState &state = this->banks[bank];
-    if (state.request_locked_input != -1) {
-        return state.request_locked_input;
-    }
-
-    for (int count = 0; count < this->nb_narrow_inputs; count++) {
-        int input = (state.request_rr_next + count) % this->nb_narrow_inputs;
+int TeranocL1TcdmBankInterco::pick_request_winner(int bank) {
+    uint64_t requests = 0;
+    for (int input = 0; input < this->nb_narrow_inputs; input++) {
         if (this->narrow_inputs[input].pending && this->narrow_inputs[input].target_bank == bank) {
-            return input;
+            requests |= 1ULL << input;
         }
     }
-    return -1;
+    return this->banks[bank].request_arb.select(requests);
 }
 
 int TeranocL1TcdmBankInterco::pick_response_bank(int input) {
-    if (this->response_locked_bank[input] != -1) {
-        return this->response_locked_bank[input];
-    }
     int64_t cycle = this->clock.get_cycles();
-    for (int count = 0; count < this->nb_banks; count++) {
-        int bank = (this->response_rr_next[input] + count) % this->nb_banks;
+    uint64_t requests = 0;
+    for (int bank = 0; bank < this->nb_banks; bank++) {
         if (this->banks[bank].last_response_cycle != cycle &&
             !this->banks[bank].responses.empty()) {
             const BankResponse &response = this->banks[bank].responses.front();
             if (!response.is_wide() && response.input == input && response.ready_cycle <= cycle) {
-                return bank;
+                requests |= 1ULL << bank;
             }
         }
     }
-    return -1;
+    return this->response_arb[input].select(requests);
 }
 
 bool TeranocL1TcdmBankInterco::bank_has_old_response(int bank, int64_t cycle) const {
@@ -434,7 +432,7 @@ vp::IoReqStatus TeranocL1TcdmBankInterco::narrow_req(vp::Block *__this, vp::IoRe
 
 void TeranocL1TcdmBankInterco::narrow_resp_retry(vp::Block *__this, int input, vp::IoRetryChannel) {
     auto *_this = static_cast<TeranocL1TcdmBankInterco *>(__this);
-    int bank = _this->response_locked_bank[input];
+    int bank = _this->response_arb[input].locked_winner();
     vp_assert_always(bank != -1 && !_this->banks[bank].responses.empty() &&
         _this->banks[bank].responses.front().input == input,
         &_this->trace, "unexpected narrow response retry on input %d\n", input);
@@ -645,18 +643,9 @@ void TeranocL1TcdmBankInterco::update_bank_after_pop(int bank, const BankRespons
     }
 }
 
-void TeranocL1TcdmBankInterco::pop_narrow_response(int bank, int input) {
-    BankResponse response = this->banks[bank].responses.front();
-    this->banks[bank].responses.pop_front();
-    this->banks[bank].last_response_cycle = this->clock.get_cycles();
-    this->update_bank_after_pop(bank, response, this->clock.get_cycles());
-    this->response_rr_next[input] = (bank + 1) % this->nb_banks;
-    this->response_locked_bank[input] = -1;
-}
-
 bool TeranocL1TcdmBankInterco::try_narrow_response(int input) {
     int64_t cycle = this->clock.get_cycles();
-    if (this->response_sent_cycle[input] == cycle || this->response_locked_bank[input] != -1) {
+    if (this->response_sent_cycle[input] == cycle || this->response_arb[input].locked_winner() != -1) {
         return false;
     }
     int bank = this->pick_response_bank(input);
@@ -670,8 +659,8 @@ bool TeranocL1TcdmBankInterco::try_narrow_response(int input) {
     vp::IoRespAck ack = this->narrow_itfs[response.input]->resp(response.req);
     this->response_sent_cycle[input] = cycle;
     if (ack == vp::IO_RESP_DENIED) {
+        // No grant, so the arbiter keeps the selection frozen for the resend.
         this->banks[bank].responses.push_front(response);
-        this->response_locked_bank[input] = bank;
         this->trace.msg(vp::Trace::LEVEL_TRACE,
             "NARROW_RESP_DENIED bank=%d input=%d addr=0x%lx\n", bank, input, address);
         return false;
@@ -679,14 +668,14 @@ bool TeranocL1TcdmBankInterco::try_narrow_response(int input) {
 
     this->update_bank_after_pop(bank, response, cycle);
     this->banks[bank].last_response_cycle = cycle;
-    this->response_rr_next[input] = (bank + 1) % this->nb_banks;
+    this->response_arb[input].grant(bank);
     this->trace.msg(vp::Trace::LEVEL_TRACE, "NARROW_RESP bank=%d input=%d addr=0x%lx\n", bank,
         input, address);
     return true;
 }
 
 bool TeranocL1TcdmBankInterco::resend_narrow_response(int input) {
-    int bank = this->response_locked_bank[input];
+    int bank = this->response_arb[input].locked_winner();
     BankResponse response = this->banks[bank].responses.front();
     this->banks[bank].responses.pop_front();
     uint64_t address = response.req->get_addr();
@@ -699,8 +688,7 @@ bool TeranocL1TcdmBankInterco::resend_narrow_response(int input) {
 
     this->update_bank_after_pop(bank, response, this->clock.get_cycles());
     this->banks[bank].last_response_cycle = this->clock.get_cycles();
-    this->response_rr_next[input] = (bank + 1) % this->nb_banks;
-    this->response_locked_bank[input] = -1;
+    this->response_arb[input].grant(bank);
     this->trace.msg(vp::Trace::LEVEL_TRACE, "NARROW_RESP bank=%d input=%d addr=0x%lx retry=1\n",
         bank, input, address);
     return true;
@@ -792,7 +780,7 @@ bool TeranocL1TcdmBankInterco::has_work_requiring_tick(int64_t cycle) const {
                 if (this->wide_response_locked_superbank != superbank) {
                     return true;
                 }
-            } else if (this->response_locked_bank[response.input] != bank) {
+            } else if (this->response_arb[response.input].locked_winner() != bank) {
                 return true;
             }
         }
@@ -841,7 +829,6 @@ void TeranocL1TcdmBankInterco::fsm_handler(vp::Block *__this, vp::ClockEvent *) 
             continue;
         }
         BankState &state = _this->banks[bank];
-        state.request_locked_input = input;
         bool wide_priority =
             _this->active_wide != nullptr &&
             bank >= _this->active_wide->superbank * _this->banks_per_superbank &&
@@ -854,8 +841,7 @@ void TeranocL1TcdmBankInterco::fsm_handler(vp::Block *__this, vp::ClockEvent *) 
         }
 
         _this->retry_narrow_input(bank, input);
-        state.request_rr_next = (input + 1) % _this->nb_narrow_inputs;
-        state.request_locked_input = -1;
+        state.request_arb.grant(input);
         _this->input_accept_cycle[input] = cycle;
     }
 
