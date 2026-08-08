@@ -728,11 +728,13 @@ void TeranocL1Xbar::output_retry(vp::Block *__this, int output_id, vp::IoRetryCh
     // LockIn=0: the grant is not frozen, so re-arbitrate now that the output
     // is free again.
     output.stalled = false;
+    int64_t cycles = _this->clock.get_cycles();
     uint64_t requests = 0;
     for (int input_id = 0; input_id < _this->nb_inputs; input_id++)
     {
         Input &input = _this->inputs[input_id];
-        if (!input.stalled && input.pending != nullptr && input.pending->output == output_id)
+        if (!input.stalled && cycles >= input.next_cycle && input.pending != nullptr &&
+            input.pending->output == output_id)
         {
             requests |= 1ULL << input_id;
         }
