@@ -121,10 +121,13 @@ class TeranocGroup(st.Component):
                 beat_width=arch.axi_data_width))
 
         # Group AXI boundary. Read and write request channels are released
-        # after their request beats, as in the RTL AXI mux.
+        # after their request beats, as in the RTL AXI mux. The boundary is a
+        # spill register in hardware, so a beat may enter on the cycle another
+        # leaves: two beats of input budget, not the one-beat default.
         axi_itf = Router(self, 'axi_itf', config=RouterConfig(kind=KIND_BEAT,
                 width=arch.axi_data_width, latency=2, shared_rw_channel=False,
-                max_pending_bursts_per_input=8, lock_read_output=False, lock_write_output=False))
+                max_pending_bursts_per_input=8, lock_read_output=False, lock_write_output=False,
+                max_input_pending_size=2 * arch.axi_data_width))
 
         # Hardware-aligned post-backend routing: preserve the public iDMA's AXI
         # burst until the address has selected the local TCDM or external AXI
@@ -132,9 +135,11 @@ class TeranocGroup(st.Component):
         # signature selects the existing OOO-defensive IoV2BeatAdapter. It
         # performs the RTL axi_to_reqrsp-like conversion into independent
         # wide TCDM beats while returning them to iDMA in AXI order.
+        # The hardware crossbar here is cut on every channel, so this input gets
+        # a spill register's depth too.
         dma_router = Router(self, 'dma_router', config=RouterConfig(
                 kind=KIND_BEAT, width=self._dma_width, shared_rw_channel=False,
-                max_pending_bursts_per_input=8))
+                max_pending_bursts_per_input=8, max_input_pending_size=2 * self._dma_width))
         dma_router.o_MAP(dma_tcdm_interleaver.i_DMA_INPUT(0), mapping=RouterMapping(
                 name='l1', base=0, size=arch.l1_total_bytes, remove_base=False))
         dma_router.o_MAP_DEFAULT(axi_ico.i_INPUT(arch.nb_tiles_per_group), name='axi')
