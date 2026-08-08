@@ -185,14 +185,14 @@ class TeranocSystem(st.Component):
 
             l2_noc.o_WIDE_BIND(l2_mem.i_BANK_INPUT(0), x=0, y=1)  # HBM bank 0
             l2_noc.o_WIDE_BIND(l2_mem.i_BANK_INPUT(1), x=0, y=2)  # HBM bank 1
-            l2_noc.o_WIDE_BIND(l2_mem.i_BANK_INPUT(2), x=3, y=2)  # HBM bank 2
-            l2_noc.o_WIDE_BIND(l2_mem.i_BANK_INPUT(3), x=3, y=1)  # HBM bank 3
+            l2_noc.o_WIDE_BIND(l2_mem.i_BANK_INPUT(2), x=3, y=1)  # HBM bank 2
+            l2_noc.o_WIDE_BIND(l2_mem.i_BANK_INPUT(3), x=3, y=2)  # HBM bank 3
             l2_noc.o_WIDE_BIND(soc_demux.i_INPUT(0),   x=1, y=0)  # soc
 
             l2_noc.o_MAP(base=0x80000000+l2_bank_size*0, size=l2_bank_size, x=0, y=1, name='hbm0', rm_base=True)
             l2_noc.o_MAP(base=0x80000000+l2_bank_size*1, size=l2_bank_size, x=0, y=2, name='hbm1', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*2, size=l2_bank_size, x=3, y=2, name='hbm2', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*3, size=l2_bank_size, x=3, y=1, name='hbm3', rm_base=True)
+            l2_noc.o_MAP(base=0x80000000+l2_bank_size*2, size=l2_bank_size, x=3, y=1, name='hbm2', rm_base=True)
+            l2_noc.o_MAP(base=0x80000000+l2_bank_size*3, size=l2_bank_size, x=3, y=2, name='hbm3', rm_base=True)
             l2_noc.o_MAP(base=0x00000000,                size=0x80000000,   x=1, y=0, name='soc1', rm_base=False)
             l2_noc.o_MAP(base=0xA0000000,                size=0x30000000,   x=1, y=0, name='soc2', rm_base=False)
 
