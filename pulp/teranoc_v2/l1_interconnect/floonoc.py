@@ -29,11 +29,11 @@ class TeranocL1NocRouter(gvsoc.systree.Component):
         self.add_property('output_queue_size', output_queue_size)
 
     def i_INPUT(self, direction: int) -> gvsoc.systree.SlaveItf:
-        names = ['right', 'left', 'up', 'down', 'local']
+        names = ['up', 'right', 'down', 'left', 'local']
         return gvsoc.systree.SlaveItf(self, f'input_{names[direction]}', signature='floonoc_link')
 
     def o_OUTPUT(self, direction: int, itf: gvsoc.systree.SlaveItf):
-        names = ['right', 'left', 'up', 'down', 'local']
+        names = ['up', 'right', 'down', 'left', 'local']
         self.itf_bind(f'output_{names[direction]}', itf, signature='floonoc_link')
 
 

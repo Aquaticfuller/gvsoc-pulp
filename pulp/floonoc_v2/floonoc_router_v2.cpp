@@ -19,7 +19,7 @@
 #include "floonoc_v2.hpp"
 #include "floonoc_router_v2.hpp"
 
-static const char *dir_names[RouterV2::DIR_NB] = {"right", "left", "up", "down", "local"};
+static const char *dir_names[RouterV2::DIR_NB] = {"up", "right", "down", "left", "local"};
 
 RouterV2::RouterV2(vp::ComponentConf &config)
     : vp::Component(config),
@@ -28,24 +28,24 @@ RouterV2::RouterV2(vp::ComponentConf &config)
       signal_req_size(*this, "req_size", 64, vp::SignalCommon::ResetKind::HighZ),
       signal_req_is_write(*this, "req_is_write", 1, vp::SignalCommon::ResetKind::HighZ),
       stalled_queues{{
-        vp::Signal<bool>(*this, "stalled_queue_right", 1),
-        vp::Signal<bool>(*this, "stalled_queue_left", 1),
         vp::Signal<bool>(*this, "stalled_queue_up", 1),
+        vp::Signal<bool>(*this, "stalled_queue_right", 1),
         vp::Signal<bool>(*this, "stalled_queue_down", 1),
+        vp::Signal<bool>(*this, "stalled_queue_left", 1),
         vp::Signal<bool>(*this, "stalled_queue_local", 1)
       }},
       input_ports{{
-        FloonocLinkSlave(DIR_RIGHT, &RouterV2::link_req),
-        FloonocLinkSlave(DIR_LEFT, &RouterV2::link_req),
         FloonocLinkSlave(DIR_UP, &RouterV2::link_req),
+        FloonocLinkSlave(DIR_RIGHT, &RouterV2::link_req),
         FloonocLinkSlave(DIR_DOWN, &RouterV2::link_req),
+        FloonocLinkSlave(DIR_LEFT, &RouterV2::link_req),
         FloonocLinkSlave(DIR_LOCAL, &RouterV2::link_req)
       }},
       output_ports{{
-        FloonocLinkMaster(DIR_RIGHT, &RouterV2::link_unstall),
-        FloonocLinkMaster(DIR_LEFT, &RouterV2::link_unstall),
         FloonocLinkMaster(DIR_UP, &RouterV2::link_unstall),
+        FloonocLinkMaster(DIR_RIGHT, &RouterV2::link_unstall),
         FloonocLinkMaster(DIR_DOWN, &RouterV2::link_unstall),
+        FloonocLinkMaster(DIR_LEFT, &RouterV2::link_unstall),
         FloonocLinkMaster(DIR_LOCAL, &RouterV2::link_unstall)
       }}
 {

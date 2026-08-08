@@ -25,11 +25,13 @@
  */
 class TeranocL1NocRouter : public vp::Component {
   public:
-    static constexpr int DIR_RIGHT = 0;
-    static constexpr int DIR_LEFT = 1;
-    static constexpr int DIR_UP = 2;
-    static constexpr int DIR_DOWN = 3;
-    static constexpr int DIR_LOCAL = 4;
+    // floo_pkg.sv route_direction_e: North = y increasing, East = x increasing,
+    // South = y decreasing, West = x decreasing, Eject = local.
+    static constexpr int DIR_UP    = 0;  // North
+    static constexpr int DIR_RIGHT = 1;  // East
+    static constexpr int DIR_DOWN  = 2;  // South
+    static constexpr int DIR_LEFT  = 3;  // West
+    static constexpr int DIR_LOCAL = 4;  // Eject
     static constexpr int DIR_NB = 5;
 
     TeranocL1NocRouter(vp::ComponentConf &config);

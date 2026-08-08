@@ -10,7 +10,7 @@
 #include <vp/stats/stats_engine.hpp>
 #include <cstdint>
 
-static const char *dir_names[TeranocL1NocRouter::DIR_NB] = {"right", "left", "up", "down", "local"};
+static const char *dir_names[TeranocL1NocRouter::DIR_NB] = {"up", "right", "down", "left", "local"};
 
 TeranocL1NocRouter::TeranocL1NocRouter(vp::ComponentConf &config)
     : vp::Component(config), fsm_event(this, &TeranocL1NocRouter::fsm_handler),
@@ -18,24 +18,24 @@ TeranocL1NocRouter::TeranocL1NocRouter(vp::ComponentConf &config)
       signal_req_size(*this, "req_size", 64, vp::SignalCommon::ResetKind::HighZ),
       signal_req_is_write(*this, "req_is_write", 1, vp::SignalCommon::ResetKind::HighZ),
       stalled_outputs{{
-          vp::Signal<bool>(*this, "stalled_output_right", 1),
-          vp::Signal<bool>(*this, "stalled_output_left", 1),
           vp::Signal<bool>(*this, "stalled_output_up", 1),
+          vp::Signal<bool>(*this, "stalled_output_right", 1),
           vp::Signal<bool>(*this, "stalled_output_down", 1),
+          vp::Signal<bool>(*this, "stalled_output_left", 1),
           vp::Signal<bool>(*this, "stalled_output_local", 1),
       }},
       input_ports{{
-          FloonocLinkSlave(DIR_RIGHT, &TeranocL1NocRouter::link_req),
-          FloonocLinkSlave(DIR_LEFT, &TeranocL1NocRouter::link_req),
           FloonocLinkSlave(DIR_UP, &TeranocL1NocRouter::link_req),
+          FloonocLinkSlave(DIR_RIGHT, &TeranocL1NocRouter::link_req),
           FloonocLinkSlave(DIR_DOWN, &TeranocL1NocRouter::link_req),
+          FloonocLinkSlave(DIR_LEFT, &TeranocL1NocRouter::link_req),
           FloonocLinkSlave(DIR_LOCAL, &TeranocL1NocRouter::link_req),
       }},
       output_ports{{
-          FloonocLinkMaster(DIR_RIGHT, &TeranocL1NocRouter::link_unstall),
-          FloonocLinkMaster(DIR_LEFT, &TeranocL1NocRouter::link_unstall),
           FloonocLinkMaster(DIR_UP, &TeranocL1NocRouter::link_unstall),
+          FloonocLinkMaster(DIR_RIGHT, &TeranocL1NocRouter::link_unstall),
           FloonocLinkMaster(DIR_DOWN, &TeranocL1NocRouter::link_unstall),
+          FloonocLinkMaster(DIR_LEFT, &TeranocL1NocRouter::link_unstall),
           FloonocLinkMaster(DIR_LOCAL, &TeranocL1NocRouter::link_unstall),
       }} {
     this->traces.new_trace("trace", &this->trace, vp::DEBUG);

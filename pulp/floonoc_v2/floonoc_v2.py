@@ -28,13 +28,13 @@ class FlooNocV2Direction(IntEnum):
 
 # Direction indices of the router link ports. Must match RouterV2::DIR_* in
 # floonoc_router_v2.hpp.
-DIR_RIGHT = 0
-DIR_LEFT = 1
-DIR_UP = 2
-DIR_DOWN = 3
+DIR_UP = 0
+DIR_RIGHT = 1
+DIR_DOWN = 2
+DIR_LEFT = 3
 DIR_LOCAL = 4
 
-_DIR_NAMES = ['right', 'left', 'up', 'down', 'local']
+_DIR_NAMES = ['up', 'right', 'down', 'left', 'local']
 _DIR_OPPOSITE = {DIR_RIGHT: DIR_LEFT, DIR_LEFT: DIR_RIGHT, DIR_UP: DIR_DOWN, DIR_DOWN: DIR_UP}
 
 # Network indices of the NI link ports. Must match NetworkInterfaceV2::NW_* in

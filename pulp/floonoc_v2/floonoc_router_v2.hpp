@@ -38,10 +38,10 @@ class RouterV2 : public vp::Component
 public:
     // Direction constants, used as indices for the input/output ports and
     // queues. Must match the _DIRS list in floonoc_v2.py.
-    static constexpr int DIR_RIGHT = 0;
-    static constexpr int DIR_LEFT = 1;
-    static constexpr int DIR_UP   = 2;
-    static constexpr int DIR_DOWN = 3;
+    static constexpr int DIR_UP    = 0;
+    static constexpr int DIR_RIGHT = 1;
+    static constexpr int DIR_DOWN  = 2;
+    static constexpr int DIR_LEFT  = 3;
     static constexpr int DIR_LOCAL = 4;
     static constexpr int DIR_NB = 5;
 
