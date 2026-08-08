@@ -80,6 +80,7 @@ TeranocL1NocRouter::TeranocL1NocRouter(vp::ComponentConf &config)
             new vp::Queue(this, "input_queue_" + std::to_string(direction), &this->fsm_event);
         this->output_queues[direction] =
             new vp::Queue(this, "output_queue_" + std::to_string(direction), &this->fsm_event);
+        this->arbiters[direction].init(DIR_NB, ArbPolicy::RrArbTree, /*lock_in=*/false);
         this->new_slave_port(std::string("input_") + dir_names[direction],
             &this->input_ports[direction]);
         this->new_master_port(std::string("output_") + dir_names[direction],
@@ -144,44 +145,56 @@ void TeranocL1NocRouter::fsm_handler(vp::Block *__this, vp::ClockEvent *) {
             continue;
         }
 
-        int input = _this->current_input[output];
-        for (int count = 0; count < DIR_NB; count++) {
+        uint64_t requests = 0;
+        for (int input = 0; input < DIR_NB; input++) {
             vp::Queue *input_queue = _this->input_queues[input];
-            if (!input_elected[input] && !input_queue->empty()) {
-                auto *req = static_cast<FloonocReqV2 *>(input_queue->head());
-                int next_x;
-                int next_y;
-                _this->get_next_router_pos(req->dest_x, req->dest_y, next_x, next_y);
-
-                if (_this->get_output(next_x, next_y) == output &&
-                    (_this->output_owner[output] == -1 || _this->output_owner[output] == input)) {
-                    bool was_full = input_queue->size() >= _this->input_queue_size;
-                    input_queue->pop();
-                    output_queue->push_back(req);
-                    input_elected[input] = true;
-                    progressed = true;
-#ifdef CONFIG_GVSOC_STATS_ACTIVE
-                    _this->stat_in_busy[input]++;
-                    if (_this->stats_enabled) {
-                        int64_t now = _this->clock.get_cycles();
-                        auto it = _this->arrival_cycle.find(req);
-                        if (it != _this->arrival_cycle.end()) {
-                            _this->account_residency(_this->stat_in_res, _this->stat_res_sum_in,
-                                _this->stat_res_n_in, _this->stat_res_max_in, now - it->second);
-                            _this->arrival_cycle.erase(it);
-                        }
-                        _this->grant_cycle[req] = now;
-                    }
-#endif
-                    _this->current_input[output] = (input + 1) % DIR_NB;
-                    _this->output_owner[output] = req->is_last ? -1 : input;
-                    if (was_full) {
-                        _this->input_ports[input].unstall();
-                    }
-                    break;
-                }
+            if (input_elected[input] || input_queue->empty()) {
+                continue;
             }
-            input = (input + 1) % DIR_NB;
+            if (_this->output_owner[output] != -1 && _this->output_owner[output] != input) {
+                continue;
+            }
+            auto *req = static_cast<FloonocReqV2 *>(input_queue->head());
+            int next_x;
+            int next_y;
+            _this->get_next_router_pos(req->dest_x, req->dest_y, next_x, next_y);
+            if (_this->get_output(next_x, next_y) == output) {
+                requests |= 1ULL << input;
+            }
+        }
+
+        int input = _this->arbiters[output].select(requests);
+        if (input < 0) {
+            continue;
+        }
+
+        vp::Queue *input_queue = _this->input_queues[input];
+        auto *req = static_cast<FloonocReqV2 *>(input_queue->head());
+        bool was_full = input_queue->size() >= _this->input_queue_size;
+        input_queue->pop();
+        output_queue->push_back(req);
+        input_elected[input] = true;
+        progressed = true;
+#ifdef CONFIG_GVSOC_STATS_ACTIVE
+        _this->stat_in_busy[input]++;
+        if (_this->stats_enabled) {
+            int64_t now = _this->clock.get_cycles();
+            auto it = _this->arrival_cycle.find(req);
+            if (it != _this->arrival_cycle.end()) {
+                _this->account_residency(_this->stat_in_res, _this->stat_res_sum_in,
+                    _this->stat_res_n_in, _this->stat_res_max_in, now - it->second);
+                _this->arrival_cycle.erase(it);
+            }
+            _this->grant_cycle[req] = now;
+        }
+#endif
+        _this->arbiters[output].grant(input);
+        _this->output_owner[output] = req->is_last ? -1 : input;
+        if (was_full) {
+            // Queue::push_back makes a newly accepted flit visible at M+1.
+            // Reopen the upstream now so its retry is registered for that
+            // next cycle, matching the spill FIFO's post-edge ready signal.
+            _this->input_ports[input].unstall();
         }
     }
 
@@ -320,7 +333,7 @@ void TeranocL1NocRouter::reset(bool active) {
     if (active) {
         for (int direction = 0; direction < DIR_NB; direction++) {
             this->stalled_outputs[direction] = false;
-            this->current_input[direction] = 0;
+            this->arbiters[direction].reset();
             this->output_owner[direction] = -1;
             this->last_output_cycle[direction] = -1;
         }

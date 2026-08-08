@@ -15,6 +15,7 @@
 
 #include "pulp/floonoc_v2/floonoc_link_v2.hpp"
 #include "pulp/floonoc_v2/floonoc_v2.hpp"
+#include "arbiter.hpp"
 
 /**
  * TeraNoC L1 mesh router.
@@ -59,7 +60,8 @@ class TeranocL1NocRouter : public vp::Component {
     std::array<FloonocLinkSlave, DIR_NB> input_ports;
     std::array<FloonocLinkMaster, DIR_NB> output_ports;
     vp::ClockEvent fsm_event;
-    int current_input[DIR_NB];
+    // One floo_wormhole_arbiter per output.
+    Arbiter arbiters[DIR_NB];
     int output_owner[DIR_NB];
     // Last cycle each output put a flit on its link, so a synchronous drain
     // triggered by an unstall cannot exceed one flit per cycle.
