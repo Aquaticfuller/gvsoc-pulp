@@ -80,7 +80,7 @@ TeranocL1NocRouter::TeranocL1NocRouter(vp::ComponentConf &config)
             new vp::Queue(this, "input_queue_" + std::to_string(direction), &this->fsm_event);
         this->output_queues[direction] =
             new vp::Queue(this, "output_queue_" + std::to_string(direction), &this->fsm_event);
-        this->arbiters[direction].init(DIR_NB, ArbPolicy::RrArbTree, /*lock_in=*/false);
+        this->arbiters[direction].init(DIR_NB, ArbPolicy::RrArbTree, /*lock_in=*/true);
         this->new_slave_port(std::string("input_") + dir_names[direction],
             &this->input_ports[direction]);
         this->new_master_port(std::string("output_") + dir_names[direction],
@@ -135,41 +135,56 @@ bool TeranocL1NocRouter::link_req(vp::Block *__this, FloonocReqV2 *req, int inpu
 void TeranocL1NocRouter::fsm_handler(vp::Block *__this, vp::ClockEvent *) {
     auto *_this = static_cast<TeranocL1NocRouter *>(__this);
     bool input_elected[DIR_NB] = {false};
+    FloonocReqV2 *input_heads[DIR_NB] = {nullptr};
+    int input_outputs[DIR_NB] = {-1, -1, -1, -1, -1};
     bool progressed = false;
+
+    // All five RTL output arbiters see the same registered input-FIFO heads
+    // during a clock cycle. Snapshot them before granting anything.
+    for (int input = 0; input < DIR_NB; input++) {
+        vp::Queue *input_queue = _this->input_queues[input];
+        if (input_queue->empty()) {
+            continue;
+        }
+        auto *req = static_cast<FloonocReqV2 *>(input_queue->head());
+        int next_x;
+        int next_y;
+        _this->get_next_router_pos(req->dest_x, req->dest_y, next_x, next_y);
+        input_heads[input] = req;
+        input_outputs[input] = _this->get_output(next_x, next_y);
+    }
 
     // The RTL has one fair arbiter per output. Each input can win at most one
     // output in a cycle, and each output can accept at most one input flit.
     for (int output = 0; output < DIR_NB; output++) {
         vp::Queue *output_queue = _this->output_queues[output];
-        if (output_queue->size() >= _this->output_queue_size) {
-            continue;
-        }
-
-        uint64_t requests = 0;
+        uint64_t live_requests = 0;
         for (int input = 0; input < DIR_NB; input++) {
-            vp::Queue *input_queue = _this->input_queues[input];
-            if (input_elected[input] || input_queue->empty()) {
-                continue;
-            }
-            if (_this->output_owner[output] != -1 && _this->output_owner[output] != input) {
-                continue;
-            }
-            auto *req = static_cast<FloonocReqV2 *>(input_queue->head());
-            int next_x;
-            int next_y;
-            _this->get_next_router_pos(req->dest_x, req->dest_y, next_x, next_y);
-            if (_this->get_output(next_x, next_y) == output) {
-                requests |= 1ULL << input;
+            if (input_heads[input] != nullptr && input_outputs[input] == output) {
+                live_requests |= 1ULL << input;
             }
         }
 
-        int input = _this->arbiters[output].select(requests);
-        if (input < 0) {
+        // LockIn: valid_q in floo_wormhole_arbiter captures the contenders as
+        // soon as a packet is selected, even if the output FIFO is full, and
+        // req_d stays frozen until the selected tail flit is accepted.
+        int input = _this->arbiters[output].select(live_requests);
+        if (input < 0 || output_queue->size() >= _this->output_queue_size) {
+            continue;
+        }
+        if (input_elected[input]) {
+            continue;
+        }
+        vp::Queue *input_queue = _this->input_queues[input];
+        auto *req = input_heads[input];
+        if (req == nullptr) {
+            continue;
+        }
+        if (input_outputs[input] != output ||
+            (_this->output_owner[output] != -1 && _this->output_owner[output] != input)) {
             continue;
         }
 
-        vp::Queue *input_queue = _this->input_queues[input];
-        auto *req = static_cast<FloonocReqV2 *>(input_queue->head());
         bool was_full = input_queue->size() >= _this->input_queue_size;
         input_queue->pop();
         output_queue->push_back(req);
@@ -188,8 +203,14 @@ void TeranocL1NocRouter::fsm_handler(vp::Block *__this, vp::ClockEvent *) {
             _this->grant_cycle[req] = now;
         }
 #endif
-        _this->arbiters[output].grant(input);
-        _this->output_owner[output] = req->is_last ? -1 : input;
+        if (req->is_last) {
+            // gnt_i only pulses for an accepted tail flit, so the pointer moves
+            // once per packet, over the mask the grant was taken from.
+            _this->arbiters[output].grant(input);
+            _this->output_owner[output] = -1;
+        } else {
+            _this->output_owner[output] = input;
+        }
         if (was_full) {
             // Queue::push_back makes a newly accepted flit visible at M+1.
             // Reopen the upstream now so its retry is registered for that
