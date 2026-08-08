@@ -220,8 +220,16 @@ class TeranocSystem(st.Component):
             soc_demux.o_MAP_DEFAULT(soc_ico.i_INPUT(), name='soc')
 
         elif arch.nb_x_groups == 4 and arch.nb_y_groups == 4:
+            # HBM bank 5 shares this node with the host and the peripherals, so
+            # it is the only L2 bank behind an extra hop -- and the distributed
+            # DMA middle end is a stream_fork, so whatever paces group 5 paces
+            # all sixteen groups. The hardware split is combinational and allows
+            # four outstanding transactions per port. The router's stage floors
+            # at one cycle, so the input budget is two beats: the minimum that
+            # keeps that mandatory stage transparent.
             hbm5_soc_demux = Router(self, 'hbm5_soc_demux', config=RouterConfig(kind=KIND_BEAT,
-                    width=axi_data_width, latency=4, max_pending_bursts_per_input=32))
+                    width=axi_data_width, latency=0, max_pending_bursts_per_input=4,
+                    max_input_pending_size=2 * axi_data_width))
             hbm5_soc_beat_adapter = IoV2BeatToSingleReqAdapter(self, 'hbm5_soc_beat_adapter',
                 beat_width=axi_data_width, max_read_bursts=32)
 
