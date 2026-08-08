@@ -125,8 +125,9 @@ class TeranocL1TcdmBankInterco : public vp::Component {
     std::unique_ptr<WideTransaction> active_wide;
     std::vector<std::deque<std::unique_ptr<WideTransaction>>> wide_fifos;
     std::vector<int64_t> wide_fifo_start_blocked_until;
-    int wide_response_rr_next = 0;
-    int wide_response_locked_superbank = -1;
+    // RTL i_wide_resp_mux (mempool_tcdm_bank_interco.sv:399): stream_xbar
+    // NumSuperbanks -> 1, no overrides, so LockIn=1 and FairArb=1.
+    Arbiter wide_response_arb;
     int64_t wide_response_sent_cycle = -1;
     bool wide_pending = false;
     int wide_pending_superbank = -1;
@@ -220,6 +221,7 @@ TeranocL1TcdmBankInterco::TeranocL1TcdmBankInterco(vp::ComponentConf &config)
     for (BankState &bank : this->banks) {
         bank.request_arb.init(this->nb_narrow_inputs);
     }
+    this->wide_response_arb.init(this->nb_superbanks);
     this->response_sent_cycle.assign(this->nb_narrow_inputs, -1);
     this->input_accept_cycle.assign(this->nb_narrow_inputs, -1);
     this->wide_fifos.resize(this->nb_superbanks);
@@ -255,8 +257,7 @@ void TeranocL1TcdmBankInterco::reset(bool active) {
     std::fill(this->wide_fifo_start_blocked_until.begin(),
         this->wide_fifo_start_blocked_until.end(), 0);
     this->active_wide.reset();
-    this->wide_response_rr_next = 0;
-    this->wide_response_locked_superbank = -1;
+    this->wide_response_arb.reset();
     this->wide_response_sent_cycle = -1;
     this->wide_pending = false;
     this->wide_pending_superbank = -1;
@@ -494,7 +495,7 @@ vp::IoReqStatus TeranocL1TcdmBankInterco::wide_req(vp::Block *__this, vp::IoReq 
 
 void TeranocL1TcdmBankInterco::wide_resp_retry(vp::Block *__this, vp::IoRetryChannel) {
     auto *_this = static_cast<TeranocL1TcdmBankInterco *>(__this);
-    vp_assert_always(_this->wide_response_locked_superbank != -1, &_this->trace,
+    vp_assert_always(_this->wide_response_arb.locked_winner() != -1, &_this->trace,
         "unexpected wide response retry\n");
     _this->resend_wide_response();
     _this->schedule_now();
@@ -714,24 +715,23 @@ void TeranocL1TcdmBankInterco::pop_wide_response(int superbank) {
     if (was_full) {
         this->wide_fifo_start_blocked_until[superbank] = cycle + 1;
     }
-    this->wide_response_rr_next = (superbank + 1) % this->nb_superbanks;
-    this->wide_response_locked_superbank = -1;
+    this->wide_response_arb.grant(superbank);
 }
 
 bool TeranocL1TcdmBankInterco::try_wide_response() {
     int64_t cycle = this->clock.get_cycles();
-    if (this->wide_response_sent_cycle == cycle || this->wide_response_locked_superbank != -1) {
+    if (this->wide_response_sent_cycle == cycle ||
+        this->wide_response_arb.locked_winner() != -1) {
         return false;
     }
 
-    int candidate = -1;
-    for (int count = 0; count < this->nb_superbanks; count++) {
-        int superbank = (this->wide_response_rr_next + count) % this->nb_superbanks;
+    uint64_t requests = 0;
+    for (int superbank = 0; superbank < this->nb_superbanks; superbank++) {
         if (this->wide_response_ready(superbank, cycle)) {
-            candidate = superbank;
-            break;
+            requests |= 1ULL << superbank;
         }
     }
+    int candidate = this->wide_response_arb.select(requests);
     if (candidate == -1) {
         return false;
     }
@@ -741,7 +741,7 @@ bool TeranocL1TcdmBankInterco::try_wide_response() {
     vp::IoRespAck ack = this->wide_itf.resp(transaction->req);
     this->wide_response_sent_cycle = cycle;
     if (ack == vp::IO_RESP_DENIED) {
-        this->wide_response_locked_superbank = candidate;
+        // No grant: LockIn keeps this superbank selected for the resend.
         return false;
     }
     this->pop_wide_response(candidate);
@@ -749,7 +749,7 @@ bool TeranocL1TcdmBankInterco::try_wide_response() {
 }
 
 bool TeranocL1TcdmBankInterco::resend_wide_response() {
-    int superbank = this->wide_response_locked_superbank;
+    int superbank = this->wide_response_arb.locked_winner();
     WideTransaction *transaction = this->wide_fifos[superbank].front().get();
     vp::IoRespAck ack = this->wide_itf.resp(transaction->req);
     this->wide_response_sent_cycle = this->clock.get_cycles();
@@ -777,7 +777,7 @@ bool TeranocL1TcdmBankInterco::has_work_requiring_tick(int64_t cycle) const {
             }
             if (response.is_wide()) {
                 int superbank = bank / this->banks_per_superbank;
-                if (this->wide_response_locked_superbank != superbank) {
+                if (this->wide_response_arb.locked_winner() != superbank) {
                     return true;
                 }
             } else if (this->response_arb[response.input].locked_winner() != bank) {
