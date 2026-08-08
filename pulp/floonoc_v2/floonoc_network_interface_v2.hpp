@@ -20,6 +20,7 @@
 #include <vp/vp.hpp>
 #include <list>
 #include <map>
+#include <tuple>
 #include "floonoc_v2.hpp"
 #include "floonoc_link_v2.hpp"
 
@@ -116,6 +117,7 @@ private:
     // stalled slot and stalls the link it came in on).
     bool send_to_target(vp::IoReq *to_send, bool wide);
     static void fsm_handler(vp::Block *__this, vp::ClockEvent *event);
+    void release_pending(bool wide, bool is_write);
     int get_req_nw(bool is_wide, bool is_write);
     int get_rsp_nw(bool is_wide, bool is_write);
     EntryV2 *get_entry(uint64_t base, uint64_t size);
@@ -241,4 +243,17 @@ private:
     vp::Queue response_queue;
 
     int nb_pending_bursts[2];
+
+    // Destination side, per-burst write completion: the beats handed to the
+    // local target are counted here and the B flit only leaves once the burst's
+    // last beat has arrived and every beat has been written. Keyed by source
+    // position, port and burst id. Lone beats and split beats keep their
+    // per-beat ack and stay out.
+    struct DstWrTrack
+    {
+        int nb_pending = 0;
+        bool seen_last = false;
+        bool error = false;
+    };
+    std::map<std::tuple<int, int, bool, int64_t>, DstWrTrack> dst_wr_bursts;
 };

@@ -75,7 +75,15 @@ void NetworkQueueV2::handle_req(vp::IoReq *req, bool wide)
     // chimney, where the id-less AXI W beats must not interleave), while the
     // address header and any entry-boundary-crossing fragments become their own
     // single-flit packets. Reads (AR) are single-flit and never lock.
-    this->enqueue_router_req(req, true, wide, true);
+    //
+    // The hardware sends one address header per BURST. A write burst is
+    // submitted here one beat at a time, so only its first beat emits one.
+    // Reads and atomics carry the request itself in the address flit.
+
+    if (req->is_first || req->get_opcode() != vp::WRITE)
+    {
+        this->enqueue_router_req(req, true, wide, true);
+    }
     if (req->get_is_write())
     {
         this->enqueue_router_req(req, false, wide, true);
@@ -133,6 +141,7 @@ void NetworkQueueV2::enqueue_router_req(vp::IoReq *req, bool is_address, bool wi
         // copies these — is all that comes back to account the ack from.
         router_req->burst_id = req->burst_id;
         router_req->initiator = req->initiator;
+        router_req->burst_last = req->is_last;
 
         if (wide)
         {
@@ -240,6 +249,7 @@ void NetworkQueueV2::enqueue_router_rsp(FloonocReqV2 *req, bool is_address)
     router_req->burst_id = req->burst_id;
     router_req->initiator = req->initiator;
     router_req->owns_beat = req->owns_beat;
+    router_req->burst_last = req->burst_last;
     router_req->set_size(req->get_size());
     // A read-data response flit carries its data slice BY VALUE across the
     // mesh (like the RTL chimney's R flits): the incoming req's data points
@@ -660,7 +670,13 @@ void NetworkInterfaceV2::reset(bool active)
         this->narrow_stalled_link_nw = -1;
         this->wr_bursts[0].clear();
         this->wr_bursts[1].clear();
+        this->dst_wr_bursts.clear();
     }
+}
+
+void NetworkInterfaceV2::release_pending(bool wide, bool is_write)
+{
+    this->nb_pending_bursts[wide]--;
 }
 
 int NetworkInterfaceV2::get_req_nw(bool is_wide, bool is_write)
@@ -743,7 +759,12 @@ vp::IoReqStatus NetworkInterfaceV2::handle_req(vp::IoReq *req, bool wide)
     // back-pressured (a hotspot), starving the sources closest to the jam in
     // periodic bubbles the RTL does not have. The per-burst pointer below is
     // kept only as an aggregate drain-wakeup helper (see fsm_handler).
-    if (this->nb_pending_bursts[wide] >= this->ni_outstanding_reqs)
+    // The budget counts TRANSACTIONS, like the hardware: a write burst is
+    // submitted beat by beat but takes a single slot, taken on its first beat
+    // and released by its single write ack.
+    bool new_transaction = req->get_opcode() != vp::WRITE || req->is_first;
+
+    if (new_transaction && this->nb_pending_bursts[wide] >= this->ni_outstanding_reqs)
     {
         // v2 deny: do not queue. Remember that the master is owed a retry()
         // when capacity returns.
@@ -759,18 +780,18 @@ vp::IoReqStatus NetworkInterfaceV2::handle_req(vp::IoReq *req, bool wide)
     }
     else
     {
-        this->nb_pending_bursts[wide]++;
+        if (new_transaction)
+        {
+            this->nb_pending_bursts[wide]++;
+        }
 
         // Per-burst write acknowledgement (io_v2 write-ack contract): the mesh
-        // machinery below still treats every accepted beat as its own
-        // mini-burst (its own AW+W flits and its own B flit back, so the
-        // router traffic — and the calibration — is unchanged), but the
-        // endpoint acknowledges once per BURST: a beat that fits one W flit
-        // travels the mesh encapsulated in it and is consumed and freed by
-        // the destination target (a split beat stays alive until its B flit
-        // returns, as before), and a single data-less pool ack answers the
-        // whole burst once every B flit is back. Atomics keep the classic
-        // round-trip (keyed on opcode == WRITE, not get_is_write()).
+        // machinery below carries a burst the way the hardware does — one
+        // address header, one acknowledgement — and the endpoint answers the
+        // master once per BURST: a beat that fits one W flit travels the mesh
+        // encapsulated in it and is consumed and freed by the destination
+        // target (a split beat stays alive until its B flit returns). Atomics
+        // keep the classic round-trip (keyed on opcode == WRITE).
         if (req->get_opcode() == vp::WRITE)
         {
             this->traces.assert(req->allocator != nullptr,
@@ -976,7 +997,7 @@ bool NetworkInterfaceV2::link_req(vp::Block *__this, FloonocReqV2 *req, int nw)
             vp::IoReq *burst = req->burst;
             _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Received atomic response (burst: %p)\n",
                 burst);
-            _this->nb_pending_bursts[wide]--;
+            _this->release_pending(wide, req->get_is_write());
 
             burst->set_resp_status(req->get_resp_status());
             stall_link = _this->send_input_response(
@@ -989,9 +1010,8 @@ bool NetworkInterfaceV2::link_req(vp::Block *__this, FloonocReqV2 *req, int nw)
             // The B still fires where the old per-beat resp() used to, so
             // the ack timing is unchanged.
             _this->trace.msg(vp::Trace::LEVEL_DEBUG,
-                "Received write beat response (flit: %p, burst_id: %ld)\n",
+                "Received write response (flit: %p, burst_id: %ld)\n",
                 req, (long)req->burst_id);
-            _this->nb_pending_bursts[wide]--;
 
             bool error = req->get_resp_status() == vp::IO_RESP_INVALID;
 
@@ -1041,6 +1061,7 @@ bool NetworkInterfaceV2::link_req(vp::Block *__this, FloonocReqV2 *req, int nw)
                 ack->burst_id = -1;
                 ack->initiator = initiator;
                 ack->set_resp_status(error ? vp::IO_RESP_INVALID : vp::IO_RESP_OK);
+                _this->release_pending(wide, req->get_is_write());
                 stall_link = _this->send_input_response(
                     ack, wide, nw, true);
             }
@@ -1051,13 +1072,20 @@ bool NetworkInterfaceV2::link_req(vp::Block *__this, FloonocReqV2 *req, int nw)
                     "write beat response for untracked burst (burst_id: %ld)",
                     (long)burst_id);
                 WrTrack &track = it->second;
-                track.acked_bytes += beat_size;
                 track.error |= error;
 
-                // Order-robust close: B flits may return out of order, so the
-                // burst completes when the is_last beat has been submitted AND
-                // every issued byte has been acked.
-                if (track.seen_last && track.acked_bytes == track.issued_bytes)
+                // An encapsulated beat's burst gets one ack, sent only once
+                // every beat is written, so it completes the burst. A split
+                // beat is still acked per beat and its acks may return out of
+                // order, so it closes on the last beat plus every issued byte.
+                bool complete = true;
+                if (!req->owns_beat)
+                {
+                    track.acked_bytes += beat_size;
+                    complete = track.seen_last && track.acked_bytes == track.issued_bytes;
+                }
+
+                if (complete)
                 {
                     vp::IoReq *ack = _this->ack_allocator->alloc();
                     ack->prepare();
@@ -1071,6 +1099,7 @@ bool NetworkInterfaceV2::link_req(vp::Block *__this, FloonocReqV2 *req, int nw)
                     ack->initiator = track.initiator;
                     ack->set_resp_status(track.error ? vp::IO_RESP_INVALID : vp::IO_RESP_OK);
                     _this->wr_bursts[wide].erase(it);
+                    _this->release_pending(wide, req->get_is_write());
                     stall_link = _this->send_input_response(
                         ack, wide, nw, true);
                 }
@@ -1112,7 +1141,7 @@ bool NetworkInterfaceV2::link_req(vp::Block *__this, FloonocReqV2 *req, int nw)
             if (burst->remaining_size == 0)
             {
                 _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Finished burst (burst: %p)\n", burst);
-                _this->nb_pending_bursts[wide]--;
+                _this->release_pending(wide, req->get_is_write());
             }
             stall_link = _this->send_input_response(
                 beat, wide, nw, true);
@@ -1139,6 +1168,16 @@ bool NetworkInterfaceV2::link_req(vp::Block *__this, FloonocReqV2 *req, int nw)
             _this->trace.msg(vp::Trace::LEVEL_DEBUG,
                 "Sending request to target (req: %p, base: 0x%x, size: 0x%x)\n",
                 req, req->get_addr(), req->get_size());
+
+            // Per-burst write ack: count the beats handed to the target so the
+            // burst's single ack can wait for all of them.
+            if (req->get_opcode() == vp::WRITE && req->owns_beat && req->burst_id >= 0)
+            {
+                DstWrTrack &track = _this->dst_wr_bursts[
+                    std::make_tuple(req->src_x, req->src_y, req->wide, req->burst_id)];
+                track.nb_pending++;
+                track.seen_last |= req->burst_last;
+            }
 
             vp::IoReq *to_send = _this->make_target_req(req);
 
@@ -1299,11 +1338,34 @@ void NetworkInterfaceV2::handle_response(FloonocReqV2 *req)
     {
         // Write ack for an encapsulated beat: the beat was consumed and
         // freed by the target, so nothing may be dereferenced through
-        // req->burst. The flit covered the whole beat, so this ack completes
-        // the mini-burst — send the B flit back to the source NI immediately.
+        // req->burst. A burst is answered by a SINGLE ack, so the beat stays
+        // silent until its burst's last beat has arrived and every beat has
+        // been written; the beat that completes it carries the B flit. A lone
+        // beat has no burst id and completes on its own.
         req->dest_x = req->src_x;
         req->dest_y = req->src_y;
-        this->rsp_queue.handle_rsp(req, true);
+
+        if (req->burst_id < 0)
+        {
+            this->rsp_queue.handle_rsp(req, true);
+        }
+        else
+        {
+            auto key = std::make_tuple(req->src_x, req->src_y, req->wide, req->burst_id);
+            auto it = this->dst_wr_bursts.find(key);
+            this->traces.assert(it != this->dst_wr_bursts.end(),
+                "write ack for an untracked burst (burst_id: %ld)", (long)req->burst_id);
+            DstWrTrack &track = it->second;
+            track.nb_pending--;
+            track.error |= req->get_resp_status() == vp::IO_RESP_INVALID;
+
+            if (track.seen_last && track.nb_pending == 0)
+            {
+                req->set_resp_status(track.error ? vp::IO_RESP_INVALID : vp::IO_RESP_OK);
+                this->dst_wr_bursts.erase(it);
+                this->rsp_queue.handle_rsp(req, true);
+            }
+        }
     }
     else
     {

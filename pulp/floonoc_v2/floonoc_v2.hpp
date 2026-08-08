@@ -69,6 +69,9 @@ public:
     // ownership (see `burst` above). Decided at enqueue time on the source
     // side, copied onto the B flit for the return-path accounting.
     bool owns_beat;
+    // True on the W flit of the external write burst's last beat. The
+    // destination NI needs it to answer a burst with a single write ack.
+    bool burst_last;
     // True if the request travels on the wide network, false for narrow.
     bool wide;
     // True if this is the AR/AW (address) phase of a split request, false if it
@@ -145,6 +148,7 @@ public:
         req->set_second_data(NULL);
         req->burst = NULL;
         req->owns_beat = false;
+        req->burst_last = false;
         req->is_rsp = false;
         req->is_address = false;
         req->wide = false;
