@@ -97,7 +97,14 @@ def _make_cache_config():
     # AraVlsu::data_response segfaults in the 4-tile group context (fmatmul), a latent bug in the
     # coalescer's response path that the single-tile calib path never exercises. Tracked separately;
     # do not turn this on for v3 without fixing that first.
-    cfg.controller.inline_sync_miss        = True   # synchronous slave — the Spatz VLSU needs OK
+    # ASYNC THROUGHOUT (user decision 2026-08-10): the cache core runs its per-cycle FSM and answers
+    # IO_REQ_PENDING + resp(), matching the async, queue-based interconnect. The VLSU does handle async
+    # (spatz_vlsu.cpp handles PENDING/DENIED with a data_response callback) — the old
+    # "VLSU requires OK" comment elsewhere is inaccurate. CAVEAT: this path is UNCALIBRATED and is
+    # documented to over-predict under saturation, so the sync-path results (RLC +-4%, fdotp +1.6%)
+    # do NOT carry over; re-calibration is a prerequisite before quoting any v3 number.
+    # A/B: CACHEPOOL_V3_SYNC_CACHE=1 restores the calibrated synchronous slave.
+    cfg.controller.inline_sync_miss        = int(os.environ.get('CACHEPOOL_V3_SYNC_CACHE', '0')) != 0
     cfg.controller.functional_writethrough = True
     cfg.interco.dynamic_offset = int(math.log2(cfg.controller.cache_line_bytes))
     # Remote ports are needed for ANY off-tile traffic (cross-tile in-group or cross-group over the

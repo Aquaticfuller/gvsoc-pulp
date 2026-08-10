@@ -328,6 +328,13 @@ class SnitchCluster(gvsoc.systree.Component):
             cache_cfg.interco.num_outputs = cache_cfg.num_controllers
             cache_cfg.structural_tile = True
             cache_cfg.amo_lane = True       # cross-core atomic mutex (scalar re-laned to n_ppc-1 below)
+            # C1 par_coalescer (RTL i_par_coalescer_for_spatz, cachepool_cache_ctrl.sv:354): merge the
+            # 4 VLSU lanes' same-cycle same-16B-part accesses into ONE wide bank access. This was
+            # previously set ONLY on the single-tile path below, so every multi-tile (16-core) number
+            # in the project was produced WITHOUT a structure the RTL has. Enabled here after fixing
+            # the duplicate-member double-response crash it hit at >1 tile (see
+            # insitu_cache_cell_coalescer.cpp). A/B: CACHEPOOL_CELL_COALESCER=0.
+            cache_cfg.cell_coalescer = (int(os.environ.get('CACHEPOOL_CELL_COALESCER', '1')) != 0)
             cache_cfg.controller.inline_sync_miss = True       # synchronous-slave (VLSU requires OK)
             cache_cfg.controller.functional_writethrough = True
             import math
