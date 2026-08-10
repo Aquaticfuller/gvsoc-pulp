@@ -79,7 +79,10 @@ def _patch_bootrom(base_path):
 def _make_cache_config():
     """Per-tile structural cache config — the same recipe v1 uses for its calibrated group."""
     cfg = make_cachepool_fpu_512_config()
-    cfg.num_tiles           = _TILES_PER_GROUP     # tiles sharing L1 within a group
+    # num_tiles is the CLUSTER-GLOBAL tile count, because that is what the address's TileID field
+    # encodes: the top bits of that field are the group id. A tile's xbar therefore already emits
+    # "remote" for any off-tile target, and the group's remote crossbar decides local-group vs L1 NoC.
+    cfg.num_tiles           = _NB_GROUPS * _TILES_PER_GROUP
     cfg.num_cores           = _CORES_PER_TILE
     cfg.num_controllers     = _BANKS_PER_TILE
     cfg.tcdm_ports_per_core = 1 + SPATZ_NB_LANES
@@ -87,6 +90,7 @@ def _make_cache_config():
     cfg.interco.num_outputs = cfg.num_controllers
     cfg.structural_tile     = True
     cfg.amo_lane            = True                 # one AMO per bank, on the scalar lane
+    cfg.cell_coalescer = int(os.environ.get('CACHEPOOL_V3_CELL_COALESCER', '0')) != 0
     # NOTE: cell_coalescer stays OFF, matching v1's deployed group config exactly (the factory
     # default is False and v1's group path never sets it — the ±4% RLC calibration was achieved
     # WITHOUT it). Enabling it here also crashes: InsituCacheCellCoalescer::split_and_resp →
@@ -96,8 +100,9 @@ def _make_cache_config():
     cfg.controller.inline_sync_miss        = True   # synchronous slave — the Spatz VLSU needs OK
     cfg.controller.functional_writethrough = True
     cfg.interco.dynamic_offset = int(math.log2(cfg.controller.cache_line_bytes))
-    # Single tile per group ⇒ no cross-tile remote traffic; keep the ports out of the build.
-    if _TILES_PER_GROUP == 1:
+    # Remote ports are needed for ANY off-tile traffic (cross-tile in-group or cross-group over the
+    # L1 NoC). Only a single tile in the whole cluster has none.
+    if _NB_GROUPS * _TILES_PER_GROUP == 1:
         cfg.num_remote_port_core = 0
     return cfg
 

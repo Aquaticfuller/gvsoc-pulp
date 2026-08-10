@@ -19,7 +19,10 @@
 # the SoC, plus loader/barrier fan-out. With one group this is a complete, runnable system — which
 # is exactly the R1/R2 gate.
 
+import math
+
 import gvsoc.systree as st
+from pulp.floonoc.floonoc import FlooNoc2dMeshNarrowWide
 from pulp.cachepool_v3.cachepool_v3_group import CachepoolV3Group
 
 
@@ -31,7 +34,10 @@ class CachepoolV3Cluster(st.Component):
                  nb_tiles_per_group: int = 4,
                  nb_cores_per_tile: int = 4,
                  spatz_nb_lanes: int = 4,
-                 axi_data_width: int = 64):
+                 axi_data_width: int = 64,
+                 dram_bases=(0x8000_0000, 0xA000_0000),
+                 ni_outstanding_reqs: int = 32,
+                 router_input_queue_size: int = 2):
         super().__init__(parent, name)
 
         nb_groups = nb_x_groups * nb_y_groups
@@ -55,7 +61,60 @@ class CachepoolV3Cluster(st.Component):
                     nb_groups=nb_groups,
                     nb_cores_per_tile=nb_cores_per_tile,
                     spatz_nb_lanes=spatz_nb_lanes,
-                    axi_data_width=axi_data_width))
+                    axi_data_width=axi_data_width,
+                    global_tiles=nb_groups * nb_tiles_per_group))
+
+        # ---------------- NoC 1 · core → L1 · the cross-group mesh ----------------
+        # One mesh instance per port class (the five TCDM port classes are physically separate wires,
+        # so they must not arbitrate against each other) — mirrors v2's one-NoC-per-remote-lane.
+        #
+        # No address converter is needed here, unlike v2. Our native layout puts the routing fields in
+        # ascending contiguous bits — [5:0] line offset, then BankSel, then a CLUSTER-GLOBAL TileID
+        # whose top bits are the group — so a group's addresses are the set with a fixed value in that
+        # field: one contiguous window of `group_window` bytes repeating every `noc_period` bytes.
+        # FlooNoc's `period` mapping expresses exactly that (it exists so target-selecting bits can sit
+        # below unrelated tag bits), so base/size/period routes on the real address.
+        self.l1_noc_list = []
+        if nb_groups > 1:
+            bank_bits = max(0, (cache_config.num_controllers - 1).bit_length())
+            line_off  = cache_config.interco.dynamic_offset
+            group_window = (1 << (line_off + bank_bits)) * nb_tiles_per_group
+            noc_period   = group_window * nb_groups
+            self._group_window, self._noc_period = group_window, noc_period
+
+            n_remote = cache_config.num_remote_port_core
+            for j in range(self._n_ppc):
+                noc = FlooNoc2dMeshNarrowWide(
+                    self, f'l1_noc_{j}', narrow_width=4, wide_width=0,
+                    dim_x=nb_x_groups, dim_y=nb_y_groups,
+                    ni_outstanding_reqs=ni_outstanding_reqs,
+                    router_input_queue_size=router_input_queue_size)
+                for gx in range(nb_x_groups):
+                    for gy in range(nb_y_groups):
+                        noc.add_router(gx, gy)
+                        noc.add_network_interface(gx, gy)
+                self.l1_noc_list.append(noc)
+
+            for j in range(self._n_ppc):
+                noc = self.l1_noc_list[j]
+                for gx in range(nb_x_groups):
+                    for gy in range(nb_y_groups):
+                        gid = gx * nb_y_groups + gy
+                        grp = self.group_list[gid]
+                        # Egress: this group's off-group requests inject at its own mesh node.
+                        for r in range(n_remote):
+                            grp.o_NOC_OUT(j, r, noc.i_NARROW_INPUT(gx, gy))
+                        # Ingress: every DRAM window's slice belonging to group gid lands on gid's NI.
+                        # BOTH windows must be mapped — an unmatched window makes FlooNoc drop the
+                        # burst silently and wedge the NI's in-flight slot forever (v2's hard-won
+                        # lesson, architecture doc §13.2.3).
+                        for dram_base in dram_bases:
+                            noc.o_NARROW_MAP(
+                                grp.i_NOC_IN(j, 0),
+                                base=dram_base + gid * group_window,
+                                size=group_window,
+                                x=gx, y=gy, period=noc_period,
+                                name=f'g{gid}_j{j}_{dram_base:#x}')
 
         # ---------------- egress: one wide + one narrow port per group ----------------
         # P4 replaces the wide fan-out with the L2 mesh; keeping one port per group now means the

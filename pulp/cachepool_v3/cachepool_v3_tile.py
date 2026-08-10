@@ -146,8 +146,11 @@ class CachepoolV3Tile(st.Component):
         self.bind(icache, 'refill', axi_ico, 'input')
         self.bind(axi_ico, 'output', self, 'axi_out')
 
-        # ---------------- cross-tile remote ports ----------------
-        if self._n_remote > 0 and nb_tiles_per_group > 1:
+        # ---------------- off-tile remote ports ----------------
+        # Needed for ANY off-tile target: another tile in this group, or (P1) a tile in another group
+        # over the L1 NoC. So the condition is the CLUSTER-GLOBAL tile count, not this group's —
+        # a 1-tile-per-group multi-group build still needs these ports.
+        if self._n_remote > 0 and nb_tiles_per_group * nb_groups > 1:
             for j in range(self._n_ppc):
                 for r in range(self._n_remote):
                     self.bind(cache, f'remote_out_{j}_{r}', self, f'remote_out_{j}_{r}')

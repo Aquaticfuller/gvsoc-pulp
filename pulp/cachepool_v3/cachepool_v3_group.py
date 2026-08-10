@@ -38,8 +38,11 @@ class CachepoolV3Group(st.Component):
                  nb_groups: int = 1,
                  nb_cores_per_tile: int = 4,
                  spatz_nb_lanes: int = 4,
-                 axi_data_width: int = 64):
+                 axi_data_width: int = 64,
+                 global_tiles: int = 0):
         super().__init__(parent, name)
+        if global_tiles == 0:
+            global_tiles = nb_tiles_per_group * nb_groups
 
         self._nb_tiles = nb_tiles_per_group
         self._nb_cores_per_tile = nb_cores_per_tile
@@ -53,7 +56,13 @@ class CachepoolV3Group(st.Component):
         self._tiles = []
         for t in range(nb_tiles_per_group):
             tcfg = copy.deepcopy(cache_config)
-            tcfg.tile_id = t
+            # CLUSTER-GLOBAL tile id. The address's TileID field spans the whole cluster (its top bits
+            # are the group), and the xbar compares that field against tile_id to tell local from
+            # remote. With a local 0..tiles_per_group-1 id, a tile in group>0 never recognises its own
+            # lines: it re-emits them as remote, the group's crossbar sees the target group as its own
+            # and sends them back to that tile — an infinite request loop (observed as a livelock with
+            # the engine spinning in NetworkInterface::handle_request → InsituCacheXbar::req_handler).
+            tcfg.tile_id = group_id * nb_tiles_per_group + t
             tile = CachepoolV3Tile(
                 self, f'tile_{t}', parser=parser, cache_config=tcfg,
                 tile_id=t, group_id=group_id,
@@ -66,16 +75,21 @@ class CachepoolV3Group(st.Component):
 
         # ---------------- narrow plane: intra-group remote crossbars ----------------
         # One per port class; slot index = tile*num_remote_port_core + r (matches InsituCacheGroup).
+        # Built whenever there is ANY off-tile traffic: cross-tile within the group, or cross-group
+        # through the L1 NoC. num_tiles here is the CLUSTER-GLOBAL tile count, because that is what
+        # the address's TileID field encodes.
         self._rxbars = []
-        if nb_tiles_per_group > 1 and self._n_remote > 0:
+        self._has_noc = nb_groups > 1
+        if (nb_tiles_per_group > 1 or self._has_noc) and self._n_remote > 0:
             for j in range(self._n_ppc):
                 rx = InsituCacheRemoteXbar(
                     self, f'rxbar_{j}',
-                    num_tiles=nb_tiles_per_group, num_cores=nb_cores_per_tile,
+                    num_tiles=global_tiles, num_cores=nb_cores_per_tile,
                     num_cache=self._nb_banks, num_remote_port_core=self._n_remote,
                     dynamic_offset=cache_config.interco.dynamic_offset,
                     addr_width=cache_config.addr_width,
-                    hop_latency_cycles=getattr(cache_config, 'hop_latency_cycles', 0))
+                    hop_latency_cycles=getattr(cache_config, 'hop_latency_cycles', 0),
+                    num_groups=nb_groups, tiles_per_group=nb_tiles_per_group, group_id=group_id)
                 self._rxbars.append(rx)
 
             for j in range(self._n_ppc):
@@ -86,6 +100,12 @@ class CachepoolV3Group(st.Component):
                     for r in range(self._n_remote):
                         self._rxbars[j].o_OUTPUT(tgt * self._n_remote + r,
                                                  self._tiles[tgt].i_REMOTE_IN(j, r))
+                # L1 NoC: off-group egress out of the group, ingress back into the crossbar so it can
+                # be delivered to whichever local tile owns the line.
+                if self._has_noc:
+                    for r in range(self._n_remote):
+                        self._rxbars[j].o_NOC_OUT(r, self.i_NOC_OUT_FWD(j, r))
+                        self.bind(self, f'noc_in_{j}_{r}', self._rxbars[j], f'noc_in_{r}')
 
         # ---------------- wide plane: refill egress ----------------
         # P0/P1: every tile's wide egress fans into the group's single 'refill' master.
@@ -141,6 +161,17 @@ class CachepoolV3Group(st.Component):
 
     def i_CONFIG_RXBAR(self, j: int) -> st.SlaveItf:
         return st.SlaveItf(self, f'config_rxbar_{j}', signature='io')
+
+    def i_NOC_OUT_FWD(self, j: int, r: int) -> st.SlaveItf:
+        return st.SlaveItf(self, f'noc_out_{j}_{r}', signature='io')
+
+    def o_NOC_OUT(self, j: int, r: int, itf: st.SlaveItf):
+        """Off-group L1 request leaving this group on port class j, slot r → the L1 NoC."""
+        self.itf_bind(f'noc_out_{j}_{r}', itf, signature='io')
+
+    def i_NOC_IN(self, j: int, r: int) -> st.SlaveItf:
+        """Off-group L1 request arriving from the L1 NoC for a bank in this group."""
+        return st.SlaveItf(self, f'noc_in_{j}_{r}', signature='io')
 
     def i_BARRIER_ACK(self, tile: int, core: int) -> st.SlaveItf:
         return st.SlaveItf(self, f'barrier_ack_{tile}_{core}', signature='wire<bool>')
