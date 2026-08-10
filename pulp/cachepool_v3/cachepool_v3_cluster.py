@@ -101,9 +101,9 @@ class CachepoolV3Cluster(st.Component):
                     for gy in range(nb_y_groups):
                         gid = gx * nb_y_groups + gy
                         grp = self.group_list[gid]
-                        # Egress: this group's off-group requests inject at its own mesh node.
-                        for r in range(n_remote):
-                            grp.o_NOC_OUT(j, r, noc.i_NARROW_INPUT(gx, gy))
+                        # Egress: this group's off-group requests inject at its own mesh node through
+                        # ONE port (slot 0) — one master per NI input, as in v2.
+                        grp.o_NOC_OUT(j, 0, noc.i_NARROW_INPUT(gx, gy))
                         # Ingress: every DRAM window's slice belonging to group gid lands on gid's NI.
                         # BOTH windows must be mapped — an unmatched window makes FlooNoc drop the
                         # burst silently and wedge the NI's in-flight slot forever (v2's hard-won

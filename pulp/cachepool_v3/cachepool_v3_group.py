@@ -103,9 +103,10 @@ class CachepoolV3Group(st.Component):
                 # L1 NoC: off-group egress out of the group, ingress back into the crossbar so it can
                 # be delivered to whichever local tile owns the line.
                 if self._has_noc:
-                    for r in range(self._n_remote):
-                        self._rxbars[j].o_NOC_OUT(r, self.i_NOC_OUT_FWD(j, r))
-                        self.bind(self, f'noc_in_{j}_{r}', self._rxbars[j], f'noc_in_{r}')
+                    # Slot 0 only: one egress master and one ingress slave per port class (the NI is a
+                    # single injection point). The extra rxbar noc slots stay unused.
+                    self._rxbars[j].o_NOC_OUT(0, self.i_NOC_OUT_FWD(j, 0))
+                    self.bind(self, f'noc_in_{j}_0', self._rxbars[j], 'noc_in_0')
 
         # ---------------- wide plane: refill egress ----------------
         # P0/P1: every tile's wide egress fans into the group's single 'refill' master.
