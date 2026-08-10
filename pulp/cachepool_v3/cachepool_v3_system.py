@@ -87,7 +87,12 @@ def _make_cache_config():
     cfg.interco.num_outputs = cfg.num_controllers
     cfg.structural_tile     = True
     cfg.amo_lane            = True                 # one AMO per bank, on the scalar lane
-    cfg.cell_coalescer      = True                 # 16 B part coalescer on the 4 VLSU lanes
+    # NOTE: cell_coalescer stays OFF, matching v1's deployed group config exactly (the factory
+    # default is False and v1's group path never sets it — the ±4% RLC calibration was achieved
+    # WITHOUT it). Enabling it here also crashes: InsituCacheCellCoalescer::split_and_resp →
+    # AraVlsu::data_response segfaults in the 4-tile group context (fmatmul), a latent bug in the
+    # coalescer's response path that the single-tile calib path never exercises. Tracked separately;
+    # do not turn this on for v3 without fixing that first.
     cfg.controller.inline_sync_miss        = True   # synchronous slave — the Spatz VLSU needs OK
     cfg.controller.functional_writethrough = True
     cfg.interco.dynamic_offset = int(math.log2(cfg.controller.cache_line_bytes))

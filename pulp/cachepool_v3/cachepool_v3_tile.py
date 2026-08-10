@@ -99,7 +99,7 @@ class CachepoolV3Tile(st.Component):
             # Scalar data port: stack stays direct; the whole cached DRAM PMA goes through the
             # cache on the LAST lane; the peripheral gets its OWN per-core port (the barrier needs
             # to know which core is asking — cluster_registers::i_CORE_INPUT); the rest to the AXI.
-            ico = Router(self, f'ico{c}', bandwidth=4, latency=0)
+            ico = Router(self, f"ico{c}", bandwidth=8, latency=0)
             ico.add_mapping('stack', base=STACK_BASE, remove_offset=STACK_BASE, size=STACK_SIZE)
             ico.add_mapping('cache', base=DRAM_BASE, size=PERIPH_BASE - DRAM_BASE)
             ico.add_mapping('periph', base=PERIPH_BASE, remove_offset=PERIPH_BASE, size=PERIPH_SIZE)
@@ -118,7 +118,7 @@ class CachepoolV3Tile(st.Component):
             # VLSU lanes: same address split, one router per lane so a lane can reach the stack
             # and the SoC as well as the cache.
             for lane in range(spatz_nb_lanes):
-                vico = Router(self, f'pe{c}_vlsu{lane}_ico', bandwidth=4, latency=0)
+                vico = Router(self, f"pe{c}_vlsu{lane}_ico", bandwidth=8, latency=0)
                 vico.add_mapping('cache', base=DRAM_BASE, size=PERIPH_BASE - DRAM_BASE)
                 vico.add_mapping('stack', base=STACK_BASE, remove_offset=STACK_BASE, size=STACK_SIZE)
                 vico.add_mapping('axi')
