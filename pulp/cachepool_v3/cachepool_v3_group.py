@@ -132,8 +132,12 @@ class CachepoolV3Group(st.Component):
                     self._tiles[t].o_REFILL_BANK(
                         cb, self._refill_mux.i_INPUT(t * self._nb_banks + cb))
 
-            if use_l2_i:
-                # ---- instruction path: tiles' L1 I$ refills -> 4->1 mux -> group L2 I$ ----
+        # ---- instruction path: tiles' L1 I$ refills -> 4->1 mux -> group L2 I$ ----
+        # Independent of the wide refill mux: the L2 I$ exists on the synchronous path too, so that the
+        # sync arm stays a fair reference for the cache rather than differing by a whole cache level.
+        # Its own refill joins the 17->1 mux when that exists, and otherwise leaves on the group's
+        # refill egress directly.
+        if getattr(cache_config, 'group_l2_icache', False):
                 # Round-robin over the tiles (no priority among them); the priority only matters
                 # where instruction traffic meets data traffic, i.e. at the wide mux below.
                 self._icache_mux = InsituCacheRefillMux(
@@ -151,11 +155,16 @@ class CachepoolV3Group(st.Component):
                     line_size_bits=int(math.log2(line)), refill_latency=0,
                     enabled=True, cache_v2=True)
                 self._icache_mux.o_OUTPUT(self._l2_icache.i_INPUT())
-                # its miss refill is the priority input of the wide mux
-                self._l2_icache.o_REFILL(self._refill_mux.i_INPUT(n_data))
+                # its miss refill is the priority input of the wide mux when there is one
+                if self._refill_mux is not None:
+                    self._l2_icache.o_REFILL(self._refill_mux.i_INPUT(
+                        nb_tiles_per_group * self._nb_banks))
+                else:
+                    self._l2_icache.o_REFILL(self.i_REFILL_FWD())
 
+        if self._refill_mux is not None:
             self._refill_mux.o_OUTPUT(self.i_REFILL_FWD())
-        else:
+        if not getattr(cache_config, 'per_bank_l2_ports', False):
             for t in range(nb_tiles_per_group):
                 self.bind(self._tiles[t], 'refill', self, 'refill')
 

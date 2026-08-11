@@ -110,7 +110,13 @@ def _make_cache_config():
     # isolated; byte-enable within 1% of the calibrated synchronous path). Sweep with INSITU_RESP_LAT.
     cfg.controller.resp_latency_cycles = 0 if cfg.controller.inline_sync_miss else 8
     # P3: banks leave their tile on separate wide ports so the group can arbitrate all of them.
-    cfg.per_bank_l2_ports = int(os.environ.get('CACHEPOOL_V3_REFILL_MUX', '1')) != 0
+    # ASYNC ONLY. The 17->1 refill mux always answers IO_REQ_PENDING, but the synchronous-slave cache
+    # requires its refill to answer OK inside the same call — inline_sync_miss completes the miss there
+    # and then returns OK to the core. Putting a queueing arbiter in that path breaks it: the ISS aborts
+    # with "Trying to decrease zero stalled counter". The synchronous path is a CALIBRATION REFERENCE,
+    # so it keeps the flat fan-in it was measured with; the same reasoning applies to the L2 mesh below.
+    cfg.per_bank_l2_ports = (not cfg.controller.inline_sync_miss) and \
+                            int(os.environ.get('CACHEPOOL_V3_REFILL_MUX', '1')) != 0
     # P3: group L2 instruction cache. The tiles' L1 I$ refills aggregate 4->1 into it and its own
     # refill is the strict-priority input of the group's 17->1 wide mux.
     cfg.group_l2_icache = int(os.environ.get('CACHEPOOL_V3_L2_ICACHE', '1')) != 0
@@ -155,7 +161,8 @@ class CachepoolV3SoC(st.Component):
             nb_cores_per_tile=_CORES_PER_TILE,
             spatz_nb_lanes=SPATZ_NB_LANES,
             axi_data_width=axi_data_width,
-            l2_noc=int(os.environ.get('CACHEPOOL_V3_L2_NOC', '1')) != 0)
+            l2_noc=(not cache_config.controller.inline_sync_miss) and
+                    int(os.environ.get('CACHEPOOL_V3_L2_NOC', '1')) != 0)
 
         # ---------------- memories + peripherals ----------------
         w_log2 = (axi_data_width - 1).bit_length()
