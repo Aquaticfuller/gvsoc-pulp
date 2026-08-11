@@ -186,14 +186,18 @@ class FlooNoc2dMeshNarrowWide(gvsoc.systree.Component):
 
     def o_WIDE_MAP(self, itf: gvsoc.systree.SlaveItf | None, base: int, size: int,
             x: int | FlooNocDirection, y: int | FlooNocDirection, name: str | None=None,
-            rm_base: bool=False, remove_offset:int =0):
+            rm_base: bool=False, remove_offset:int =0, period: int =0):
         """This methods is deprecated
         """
         if name is None:
             name = itf.component.name
         if rm_base and remove_offset == 0:
             remove_offset =base
-        self.__add_mapping(f"wide_{name}", base=base, size=size, x=x, y=y, remove_offset=remove_offset)
+        # period: the window repeats every `period` bytes, so target-selecting bits can sit below
+        # unrelated address bits — the same option o_NARROW_MAP already offers. Used to interleave a
+        # memory-channel window across the perimeter nodes of a mesh.
+        self.__add_mapping(f"wide_{name}", base=base, size=size, x=x, y=y,
+                           remove_offset=remove_offset, period=period)
         self.itf_bind(f"ni_wide_{x}_{y}", itf, signature='io')
 
     def i_NARROW_INPUT(self, x: int, y: int) -> gvsoc.systree.SlaveItf:

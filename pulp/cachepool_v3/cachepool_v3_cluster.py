@@ -37,7 +37,11 @@ class CachepoolV3Cluster(st.Component):
                  axi_data_width: int = 64,
                  dram_bases=(0x8000_0000, 0xA000_0000),
                  ni_outstanding_reqs: int = 32,
-                 router_input_queue_size: int = 2):
+                 router_input_queue_size: int = 2,
+                 l2_noc: bool = True,
+                 l2_noc_width: int = 64,
+                 l2_channel_granule: int = 256,
+                 l2_noc_req_width: int = 8):
         super().__init__(parent, name)
 
         nb_groups = nb_x_groups * nb_y_groups
@@ -128,11 +132,71 @@ class CachepoolV3Cluster(st.Component):
                             x=gx, y=gy,
                             name=f'g{gid}_j{j}_tunnel')
 
+        # ---------------- P4: the L2 refill mesh ----------------
+        # Second NoC level. Each group's 17->1 refill mux (P3) injects at that group's node, and the
+        # MEMORY CHANNELS sit on the perimeter: the mesh is (nb_x+2) x (nb_y+2) with the groups on the
+        # interior nodes, so the boundary ring minus its four corners gives 2*(nb_x+nb_y) attach
+        # points — exactly 16 for a 4x4 group grid, one per outbound edge port.
+        #
+        # The channel map interleaves across the WHOLE address space: base = c*granule, size = granule,
+        # period = n_channels*granule. Full coverage is not optional — FlooNoc drops a burst with no
+        # matching entry silently and wedges the NI's in-flight slot forever. A granule of 256 B also
+        # guarantees a 64 B line never straddles two channels. Unlike the L1 mesh this map is static and
+        # correct: DRAM channel interleaving is fixed hardware, not the runtime-programmable XBAR_OFFSET.
+        self.l2_noc = None
+        self._n_channels = 0
+        use_l2_noc = (nb_groups > 1) and l2_noc
+        if use_l2_noc:
+            dim_x, dim_y = nb_x_groups + 2, nb_y_groups + 2
+            gran = l2_channel_granule
+            # perimeter ring minus corners, walked side by side
+            chan_nodes = []
+            for x in range(1, dim_x - 1):
+                chan_nodes.append((x, 0))            # bottom edge
+                chan_nodes.append((x, dim_y - 1))    # top edge
+            for y in range(1, dim_y - 1):
+                chan_nodes.append((0, y))            # left edge
+                chan_nodes.append((dim_x - 1, y))    # right edge
+            self._n_channels = len(chan_nodes)
+
+            # BOTH widths must be real. FlooNoc puts only wide WRITE DATA on the wide plane; every
+            # request/address — including a refill READ — rides the narrow "req" network, exactly like
+            # an AXI address channel (network_interface.cpp: `!is_write || !is_wide -> req_queue`).
+            # narrow_width=0 therefore starved every refill read on a zero-width queue.
+            noc = FlooNoc2dMeshNarrowWide(
+                self, 'l2_noc', narrow_width=l2_noc_req_width, wide_width=l2_noc_width,
+                dim_x=dim_x, dim_y=dim_y,
+                ni_outstanding_reqs=ni_outstanding_reqs,
+                router_input_queue_size=router_input_queue_size)
+            for x in range(dim_x):
+                for y in range(dim_y):
+                    noc.add_router(x, y)
+            for gx in range(nb_x_groups):
+                for gy in range(nb_y_groups):
+                    noc.add_network_interface(gx + 1, gy + 1)
+            for (x, y) in chan_nodes:
+                noc.add_network_interface(x, y)
+
+            # groups inject at their own interior node
+            for gx in range(nb_x_groups):
+                for gy in range(nb_y_groups):
+                    gid = gx * nb_y_groups + gy
+                    self.group_list[gid].o_REFILL(noc.i_WIDE_INPUT(gx + 1, gy + 1))
+
+            # each channel egresses to its own SoC-side port (address decode stays there)
+            for c, (x, y) in enumerate(chan_nodes):
+                noc.o_WIDE_MAP(self.i_CHANNEL_FWD(c),
+                               base=c * gran, size=gran,
+                               x=x, y=y, period=self._n_channels * gran,
+                               name=f'chan{c}')
+            self.l2_noc = noc
+
         # ---------------- egress: one wide + one narrow port per group ----------------
-        # P4 replaces the wide fan-out with the L2 mesh; keeping one port per group now means the
-        # mesh attaches without re-plumbing the SoC.
+        # Without the L2 mesh (single group, or CACHEPOOL_V3_L2_NOC=0) the wide side keeps one port
+        # per group straight to the SoC.
         for g in range(nb_groups):
-            self.group_list[g].o_REFILL(self.i_WIDE_FANIN(g))
+            if not use_l2_noc:
+                self.group_list[g].o_REFILL(self.i_WIDE_FANIN(g))
             self.group_list[g].o_AXI(self.i_NARROW_FANIN(g))
 
         # ---------------- boot + barrier fan-out ----------------
@@ -176,6 +240,19 @@ class CachepoolV3Cluster(st.Component):
         self.total_cores = total_cores
 
     # ---------------- port factories ----------------
+
+    def i_CHANNEL_FWD(self, chan: int) -> st.SlaveItf:
+        """Boundary slave carrying memory channel `chan`'s traffic out of the cluster (P4)."""
+        return st.SlaveItf(self, f'channel_{chan}', signature='io')
+
+    def o_CHANNEL(self, chan: int, itf: st.SlaveItf):
+        """Bind memory channel `chan` (a perimeter node of the L2 mesh) to the SoC."""
+        self.itf_bind(f'channel_{chan}', itf, signature='io')
+
+    @property
+    def nb_channels(self) -> int:
+        """Number of L2 memory channels on the mesh perimeter (0 = no L2 mesh)."""
+        return self._n_channels
 
     def i_WIDE_FANIN(self, g: int) -> st.SlaveItf:
         return st.SlaveItf(self, f'wide_{g}', signature='io')

@@ -146,7 +146,8 @@ class CachepoolV3SoC(st.Component):
             nb_tiles_per_group=_TILES_PER_GROUP,
             nb_cores_per_tile=_CORES_PER_TILE,
             spatz_nb_lanes=SPATZ_NB_LANES,
-            axi_data_width=axi_data_width)
+            axi_data_width=axi_data_width,
+            l2_noc=int(os.environ.get('CACHEPOOL_V3_L2_NOC', '0')) != 0)
 
         # ---------------- memories + peripherals ----------------
         w_log2 = (axi_data_width - 1).bit_length()
@@ -206,15 +207,33 @@ class CachepoolV3SoC(st.Component):
         # ---------------- per-group egress routing ----------------
         # Wide (refill/evict) and narrow (ROM/peripheral/UART) each get their own router per group,
         # so the two planes stay separable when P4 turns the wide side into a mesh.
+        # P4: with the L2 mesh in place the wide plane arrives per MEMORY CHANNEL (a perimeter node of
+        # the mesh) instead of per group. One router per channel keeps the same l2/pdcp/soc decode —
+        # including the catch-all, which is why the mesh only has to pick a channel and never has to
+        # cover every possible target itself. All channels share one backing store: the mesh models the
+        # channel paths and their contention, not separate DRAM arrays (per-channel storage / DRAMSys
+        # is a later step).
+        nb_chan = cluster.nb_channels
+        for c in range(nb_chan):
+            ch = Router(self, f'chan_ico_{c}', bandwidth=axi_data_width, latency=0)
+            ch.add_mapping('l2',   base=DRAM_BASE, remove_offset=DRAM_BASE, size=l2_size)
+            ch.add_mapping('pdcp', base=PDCP_BASE, remove_offset=PDCP_BASE, size=0x2000_0000)
+            ch.add_mapping('soc')
+            cluster.o_CHANNEL(c, ch.i_INPUT())
+            self.bind(ch, 'l2',   l2_mem,   'input')
+            self.bind(ch, 'pdcp', pdcp_mem, 'input')
+            self.bind(ch, 'soc',  soc_ico,  'input')
+
         for g in range(_NB_GROUPS):
-            wide = Router(self, f'wide_ico_{g}', bandwidth=axi_data_width, latency=0)
-            wide.add_mapping('l2',   base=DRAM_BASE, remove_offset=DRAM_BASE, size=l2_size)
-            wide.add_mapping('pdcp', base=PDCP_BASE, remove_offset=PDCP_BASE, size=0x2000_0000)
-            wide.add_mapping('soc')
-            cluster.o_WIDE(g, wide.i_INPUT())
-            self.bind(wide, 'l2',   l2_mem,   'input')
-            self.bind(wide, 'pdcp', pdcp_mem, 'input')
-            self.bind(wide, 'soc',  soc_ico,  'input')
+            if nb_chan == 0:
+                wide = Router(self, f'wide_ico_{g}', bandwidth=axi_data_width, latency=0)
+                wide.add_mapping('l2',   base=DRAM_BASE, remove_offset=DRAM_BASE, size=l2_size)
+                wide.add_mapping('pdcp', base=PDCP_BASE, remove_offset=PDCP_BASE, size=0x2000_0000)
+                wide.add_mapping('soc')
+                cluster.o_WIDE(g, wide.i_INPUT())
+                self.bind(wide, 'l2',   l2_mem,   'input')
+                self.bind(wide, 'pdcp', pdcp_mem, 'input')
+                self.bind(wide, 'soc',  soc_ico,  'input')
 
             narrow = Router(self, f'narrow_ico_{g}', bandwidth=8, latency=1)
             narrow.add_mapping('l2',   base=DRAM_BASE, remove_offset=DRAM_BASE, size=l2_size)
