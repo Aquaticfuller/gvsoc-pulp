@@ -114,7 +114,15 @@ def _make_cache_config():
     # P3: group L2 instruction cache. The tiles' L1 I$ refills aggregate 4->1 into it and its own
     # refill is the strict-priority input of the group's 17->1 wide mux.
     cfg.group_l2_icache = int(os.environ.get('CACHEPOOL_V3_L2_ICACHE', '1')) != 0
-    cfg.controller.functional_writethrough = int(os.environ.get('CACHEPOOL_V3_FUNCWT', '1')) != 0
+    # Functional write-through is OFF by default here. It is a non-RTL shortcut that mirrors every
+    # write hit straight to L2 using ONE shared request object, fire-and-forget with the status
+    # ignored. That is only safe while the downstream answers OK inside the call. Once anything in the
+    # path can queue — the P3 refill mux, and then the P4 mesh — the slave takes ownership of that
+    # object while the next write reuses it, and the network interface accumulates phantom
+    # outstanding bursts until it wedges at its cap (this is exactly what stalled the L2 mesh at cycle
+    # 21,105). It is also redundant: L2 gets the data through eviction and flush writebacks, both of
+    # which now carry per-line data snapshots. Verified data-correct without it, mesh on and off.
+    cfg.controller.functional_writethrough = int(os.environ.get('CACHEPOOL_V3_FUNCWT', '0')) != 0
     cfg.interco.dynamic_offset = int(math.log2(cfg.controller.cache_line_bytes))
     # Remote ports are needed for ANY off-tile traffic (cross-tile in-group or cross-group over the
     # L1 NoC). Only a single tile in the whole cluster has none.
@@ -147,7 +155,7 @@ class CachepoolV3SoC(st.Component):
             nb_cores_per_tile=_CORES_PER_TILE,
             spatz_nb_lanes=SPATZ_NB_LANES,
             axi_data_width=axi_data_width,
-            l2_noc=int(os.environ.get('CACHEPOOL_V3_L2_NOC', '0')) != 0)
+            l2_noc=int(os.environ.get('CACHEPOOL_V3_L2_NOC', '1')) != 0)
 
         # ---------------- memories + peripherals ----------------
         w_log2 = (axi_data_width - 1).bit_length()
