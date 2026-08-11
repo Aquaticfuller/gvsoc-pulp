@@ -113,6 +113,13 @@ def _make_cache_config():
     cfg.interco.dynamic_offset = int(math.log2(cfg.controller.cache_line_bytes))
     # Remote ports are needed for ANY off-tile traffic (cross-tile in-group or cross-group over the
     # L1 NoC). Only a single tile in the whole cluster has none.
+    #
+    # num_remote_port_core is the count PER PORT-CLASS crossbar, and all five of a core's master ports
+    # (scalar + 4 VLSU lanes) go to their own tile-level crossbar, so a tile has n * 5 remote ports in
+    # total. n is configurable and the default is 1, i.e. five remote ports per tile. (The canonical
+    # single-group config keeps n=2 because v1's calibrated numbers were measured with it; overriding
+    # here rather than there leaves those untouched.)
+    cfg.num_remote_port_core = int(os.environ.get('CACHEPOOL_V3_REMOTE_PORTS', '1'))
     if _NB_GROUPS * _TILES_PER_GROUP == 1:
         cfg.num_remote_port_core = 0
     return cfg
