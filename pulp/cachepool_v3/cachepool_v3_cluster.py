@@ -68,19 +68,30 @@ class CachepoolV3Cluster(st.Component):
         # One mesh instance per port class (the five TCDM port classes are physically separate wires,
         # so they must not arbitrate against each other) — mirrors v2's one-NoC-per-remote-lane.
         #
-        # No address converter is needed here, unlike v2. Our native layout puts the routing fields in
-        # ascending contiguous bits — [5:0] line offset, then BankSel, then a CLUSTER-GLOBAL TileID
-        # whose top bits are the group — so a group's addresses are the set with a fixed value in that
-        # field: one contiguous window of `group_window` bytes repeating every `noc_period` bytes.
-        # FlooNoc's `period` mapping expresses exactly that (it exists so target-selecting bits can sit
-        # below unrelated tag bits), so base/size/period routes on the real address.
+        # The mesh does NOT route on the real address. It cannot: which tile (hence which group) owns a
+        # line depends on the interleaving granularity, and that granularity is RUNTIME-programmable
+        # via XBAR_OFFSET — fdotp sets log2(dim*sizeof(float)) to match its working set. A map built at
+        # elaboration from the build-time granularity is then simply wrong: with the window sized for
+        # offset 6 (256 B) while the crossbars decode at offset 9 (2 KiB), the mesh delivered a group-7
+        # address to group 14, which correctly bounced it straight back out.
+        #
+        # So the remote crossbar, which already computes the destination group with the CURRENT runtime
+        # geometry, TUNNELS: it rewrites the address to `tunnel_base + tgt_group * tunnel_stride + addr`
+        # and the mesh routes on that. One static entry per group, and `remove_offset` strips the tunnel
+        # so the destination sees the untouched original address and re-decodes it with its own runtime
+        # geometry. Routing therefore follows the runtime configuration for free, and this is also what
+        # the hardware does — its L1 NoC routes on a TileID computed by the source, not by re-decoding
+        # the address at every hop.
+        #
+        # The stride is a full 32-bit address space per group so any address can ride the tunnel
+        # unchanged; the windows live above 4 GiB where nothing else is mapped (GVSoC addresses and
+        # FlooNoc map entries are 64-bit).
         self.l1_noc_list = []
         if nb_groups > 1:
-            bank_bits = max(0, (cache_config.num_controllers - 1).bit_length())
-            line_off  = cache_config.interco.dynamic_offset
-            group_window = (1 << (line_off + bank_bits)) * nb_tiles_per_group
-            noc_period   = group_window * nb_groups
-            self._group_window, self._noc_period = group_window, noc_period
+            from cache.insitu.insitu_cache_remote_xbar import (NOC_TUNNEL_BASE,
+                                                                NOC_TUNNEL_STRIDE)
+            tunnel_base, tunnel_stride = NOC_TUNNEL_BASE, NOC_TUNNEL_STRIDE
+            self._noc_tunnel_base, self._noc_tunnel_stride = tunnel_base, tunnel_stride
 
             n_remote = cache_config.num_remote_port_core
             for j in range(self._n_ppc):
@@ -104,17 +115,18 @@ class CachepoolV3Cluster(st.Component):
                         # Egress: this group's off-group requests inject at its own mesh node through
                         # ONE port (slot 0) — one master per NI input, as in v2.
                         grp.o_NOC_OUT(j, 0, noc.i_NARROW_INPUT(gx, gy))
-                        # Ingress: every DRAM window's slice belonging to group gid lands on gid's NI.
-                        # BOTH windows must be mapped — an unmatched window makes FlooNoc drop the
-                        # burst silently and wedge the NI's in-flight slot forever (v2's hard-won
+                        # Ingress: one tunnel window per group. remove_offset hands the destination
+                        # back the original address. A single entry covers every DRAM region at once,
+                        # so there is no way to leave a window unmapped — FlooNoc drops an unmatched
+                        # burst silently and wedges the NI's in-flight slot forever (v2's hard-won
                         # lesson, architecture doc §13.2.3).
-                        for dram_base in dram_bases:
-                            noc.o_NARROW_MAP(
-                                grp.i_NOC_IN(j, 0),
-                                base=dram_base + gid * group_window,
-                                size=group_window,
-                                x=gx, y=gy, period=noc_period,
-                                name=f'g{gid}_j{j}_{dram_base:#x}')
+                        noc.o_NARROW_MAP(
+                            grp.i_NOC_IN(j, 0),
+                            base=tunnel_base + gid * tunnel_stride,
+                            size=tunnel_stride,
+                            remove_offset=tunnel_base + gid * tunnel_stride,
+                            x=gx, y=gy,
+                            name=f'g{gid}_j{j}_tunnel')
 
         # ---------------- egress: one wide + one narrow port per group ----------------
         # P4 replaces the wide fan-out with the L2 mesh; keeping one port per group now means the
