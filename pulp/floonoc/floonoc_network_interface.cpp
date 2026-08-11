@@ -25,6 +25,8 @@
 #include <vp/itf/io.hpp>
 #include "floonoc.hpp"
 #include "floonoc_router.hpp"
+#include <cstdlib>
+
 #include "floonoc_network_interface.hpp"
 
 NetworkQueue::NetworkQueue(NetworkInterface &ni, std::string name, uint64_t width, bool is_wide)
@@ -403,6 +405,22 @@ vp::IoReqStatus NetworkInterface::handle_req(vp::IoReq *req)
             &this->narrow_denied_read_req;
     }
 
+    // FLOONOC_NI_DEBUG=N: budgeted trace of the admission decision and the per-class slot state.
+    // (see also the DEC prints at the two decrement sites)
+    // The interesting question at a stall is which burst still holds the slot and why nothing frees it.
+    {
+        static const int dbg = [](){ const char *e = getenv("FLOONOC_NI_DEBUG"); return e ? atoi(e) : 0; }();
+        static int budget = dbg;
+        if (dbg && budget > 0) {
+            budget--;
+            fprintf(stderr, "[NI %s] cyc=%ld admit req=%p addr=0x%lx wr=%d wide=%d held=%p nb_pend=%d/%d -> %s\n",
+                    this->get_path().c_str(), (long)this->clock.get_cycles(), req,
+                    (unsigned long)req->get_addr(), (int)req->get_is_write(), (int)is_wide,
+                    (void *)*queue, this->nb_pending_bursts[is_wide], this->ni_outstanding_reqs,
+                    (*queue || this->nb_pending_bursts[is_wide] >= this->ni_outstanding_reqs)
+                        ? "DENIED" : "accepted");
+        }
+    }
     if (*queue || this->nb_pending_bursts[is_wide] >= this->ni_outstanding_reqs)
     {
         denied_queue->push(req);
@@ -440,6 +458,10 @@ bool NetworkInterface::handle_request(FloonocNode *node, vp::IoReq *req, int fro
         {
             this->trace.msg(vp::Trace::LEVEL_DEBUG, "Received write burst response (burst: %p)\n",
                 burst);
+            if (getenv("FLOONOC_NI_DEBUG"))
+                fprintf(stderr, "[NI %s] cyc=%ld DEC write burst=%p wide=%d -> nb_pend=%d\n",
+                        this->get_path().c_str(), (long)this->clock.get_cycles(), burst, (int)wide,
+                        this->nb_pending_bursts[wide] - 1);
             this->nb_pending_bursts[wide]--;
 
             burst->get_resp_port()->resp(burst);
@@ -454,6 +476,10 @@ bool NetworkInterface::handle_request(FloonocNode *node, vp::IoReq *req, int fro
             if (*(int *)burst->arg_get_last(NetworkInterface::REQ_REM_SIZE) == 0)
             {
                 this->trace.msg(vp::Trace::LEVEL_DEBUG, "Finished burst (burst: %p)\n", burst);
+                if (getenv("FLOONOC_NI_DEBUG"))
+                    fprintf(stderr, "[NI %s] cyc=%ld DEC read burst=%p wide=%d -> nb_pend=%d\n",
+                            this->get_path().c_str(), (long)this->clock.get_cycles(), burst, (int)wide,
+                            this->nb_pending_bursts[wide] - 1);
                 this->nb_pending_bursts[wide]--;
                 burst->get_resp_port()->resp(burst);
             }
