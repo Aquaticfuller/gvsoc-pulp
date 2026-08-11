@@ -109,6 +109,10 @@ def _make_cache_config():
     # is discarded by the requester. Calibrated at 8 (measured served latency 10.8 vs the RTL's 10
     # isolated; byte-enable within 1% of the calibrated synchronous path). Sweep with INSITU_RESP_LAT.
     cfg.controller.resp_latency_cycles = 0 if cfg.controller.inline_sync_miss else 8
+    # Miss-side term: measured isolated costs were HIT 10 (exactly the RTL reference) and MISS 62
+    # against the RTL's MemLatency + 17 = 67, so 5 closes the miss side and leaves the hit side alone.
+    # Sweep with INSITU_MISS_EXTRA.
+    cfg.controller.miss_extra_cycles = 0 if cfg.controller.inline_sync_miss else 5
     # P3: banks leave their tile on separate wide ports so the group can arbitrate all of them.
     # ASYNC ONLY. The 17->1 refill mux always answers IO_REQ_PENDING, but the synchronous-slave cache
     # requires its refill to answer OK inside the same call — inline_sync_miss completes the miss there
