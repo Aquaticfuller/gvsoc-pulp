@@ -148,7 +148,13 @@ class CachepoolV3Tile(st.Component):
                 cache.o_L2_BANK(cb, self.i_REFILL_BANK_FWD(cb))
         else:
             self.bind(cache, 'l2', self, 'refill')
-        self.bind(icache, 'refill', axi_ico, 'input')
+        # P3: the L1 I$ refill leaves the tile so the group can aggregate the tiles' instruction
+        # refills into its L2 I$ (4->1), whose own refill is then the priority input of the group's
+        # 17->1 wide mux. Falls back to the tile AXI when the group does not provide an L2 I$.
+        if getattr(cache_config, 'group_l2_icache', False):
+            self.bind(icache, 'refill', self, 'icache_refill')
+        else:
+            self.bind(icache, 'refill', axi_ico, 'input')
         self.bind(axi_ico, 'output', self, 'axi_out')
 
         # ---------------- off-tile remote ports ----------------
@@ -169,6 +175,10 @@ class CachepoolV3Tile(st.Component):
             self.bind(self, f'config_xbar_{j}', cache, f'config_xbar_{j}')
 
     # ---------------- port factories ----------------
+
+    def o_ICACHE_REFILL(self, itf: st.SlaveItf):
+        """Bind this tile's L1 I$ refill egress (→ the group's 4→1 icache mux)."""
+        self.itf_bind('icache_refill', itf, signature='io')
 
     def i_REFILL_BANK_FWD(self, bank: int) -> st.SlaveItf:
         """Boundary slave carrying bank `bank`'s wide egress out of the tile (P3)."""

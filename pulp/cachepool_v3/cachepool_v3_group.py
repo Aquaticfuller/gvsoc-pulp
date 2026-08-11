@@ -23,9 +23,12 @@
 
 import copy
 
+import math
+
 import gvsoc.systree as st
 from cache.insitu.insitu_cache_remote_xbar import InsituCacheRemoteXbar
 from cache.insitu.insitu_cache_refill_mux import InsituCacheRefillMux
+from cache.cache import Cache
 from pulp.cachepool_v3.cachepool_v3_tile import CachepoolV3Tile
 
 
@@ -115,14 +118,42 @@ class CachepoolV3Group(st.Component):
         # round-robin, one request per cycle. The instruction port becomes the last input once the
         # group L2 I$ lands, making it a 17->1 mux with strict priority for instructions.
         self._refill_mux = None
+        self._l2_icache = None
+        self._icache_mux = None
         if getattr(cache_config, 'per_bank_l2_ports', False):
             n_data = nb_tiles_per_group * self._nb_banks
+            # The instruction port is the LAST input and takes strict priority over all data ports.
+            use_l2_i = getattr(cache_config, 'group_l2_icache', False)
             self._refill_mux = InsituCacheRefillMux(
-                self, 'refill_mux', num_inputs=n_data, nb_priority_inputs=0)
+                self, 'refill_mux', num_inputs=n_data + (1 if use_l2_i else 0),
+                nb_priority_inputs=1 if use_l2_i else 0)
             for t in range(nb_tiles_per_group):
                 for cb in range(self._nb_banks):
                     self._tiles[t].o_REFILL_BANK(
                         cb, self._refill_mux.i_INPUT(t * self._nb_banks + cb))
+
+            if use_l2_i:
+                # ---- instruction path: tiles' L1 I$ refills -> 4->1 mux -> group L2 I$ ----
+                # Round-robin over the tiles (no priority among them); the priority only matters
+                # where instruction traffic meets data traffic, i.e. at the wide mux below.
+                self._icache_mux = InsituCacheRefillMux(
+                    self, 'icache_mux', num_inputs=nb_tiles_per_group, nb_priority_inputs=0)
+                for t in range(nb_tiles_per_group):
+                    self._tiles[t].o_ICACHE_REFILL(self._icache_mux.i_INPUT(t))
+
+                size  = int(getattr(cache_config, 'group_l2_icache_size', 8192))
+                ways  = int(getattr(cache_config, 'group_l2_icache_ways', 4))
+                line  = int(cache_config.controller.cache_line_bytes)
+                sets  = max(1, size // (line * ways))
+                self._l2_icache = Cache(
+                    self, 'l2_icache',
+                    nb_sets_bits=int(math.log2(sets)), nb_ways_bits=int(math.log2(ways)),
+                    line_size_bits=int(math.log2(line)), refill_latency=0,
+                    enabled=True, cache_v2=True)
+                self._icache_mux.o_OUTPUT(self._l2_icache.i_INPUT())
+                # its miss refill is the priority input of the wide mux
+                self._l2_icache.o_REFILL(self._refill_mux.i_INPUT(n_data))
+
             self._refill_mux.o_OUTPUT(self.i_REFILL_FWD())
         else:
             for t in range(nb_tiles_per_group):

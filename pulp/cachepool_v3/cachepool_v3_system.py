@@ -111,6 +111,9 @@ def _make_cache_config():
     cfg.controller.resp_latency_cycles = 0 if cfg.controller.inline_sync_miss else 8
     # P3: banks leave their tile on separate wide ports so the group can arbitrate all of them.
     cfg.per_bank_l2_ports = int(os.environ.get('CACHEPOOL_V3_REFILL_MUX', '1')) != 0
+    # P3: group L2 instruction cache. The tiles' L1 I$ refills aggregate 4->1 into it and its own
+    # refill is the strict-priority input of the group's 17->1 wide mux.
+    cfg.group_l2_icache = int(os.environ.get('CACHEPOOL_V3_L2_ICACHE', '1')) != 0
     cfg.controller.functional_writethrough = int(os.environ.get('CACHEPOOL_V3_FUNCWT', '1')) != 0
     cfg.interco.dynamic_offset = int(math.log2(cfg.controller.cache_line_bytes))
     # Remote ports are needed for ANY off-tile traffic (cross-tile in-group or cross-group over the
