@@ -142,7 +142,12 @@ class CachepoolV3Tile(st.Component):
         # The cache's wide egress (refill + eviction) leaves the tile on its own port so the group
         # can aggregate it (v3-P3: 17→1 mux). The icache refill rides the tile AXI for now.
         # Two-level composite-master chaining, same idiom as InsituCacheGroup's tile→group 'l2'.
-        self.bind(cache, 'l2', self, 'refill')
+        if getattr(cache_config, 'per_bank_l2_ports', False):
+            # P3: one wide egress per bank, so the group can arbitrate all 4 x nb_banks of them.
+            for cb in range(self._nb_banks):
+                cache.o_L2_BANK(cb, self.i_REFILL_BANK_FWD(cb))
+        else:
+            self.bind(cache, 'l2', self, 'refill')
         self.bind(icache, 'refill', axi_ico, 'input')
         self.bind(axi_ico, 'output', self, 'axi_out')
 
@@ -164,6 +169,14 @@ class CachepoolV3Tile(st.Component):
             self.bind(self, f'config_xbar_{j}', cache, f'config_xbar_{j}')
 
     # ---------------- port factories ----------------
+
+    def i_REFILL_BANK_FWD(self, bank: int) -> st.SlaveItf:
+        """Boundary slave carrying bank `bank`'s wide egress out of the tile (P3)."""
+        return st.SlaveItf(self, f'refill_{bank}', signature='io')
+
+    def o_REFILL_BANK(self, bank: int, itf: st.SlaveItf):
+        """Bind bank `bank`'s wide refill/eviction egress (→ the group's 17→1 mux)."""
+        self.itf_bind(f'refill_{bank}', itf, signature='io')
 
     def o_REFILL(self, itf: st.SlaveItf):
         """Bind this tile's wide refill/eviction egress (→ group aggregation)."""

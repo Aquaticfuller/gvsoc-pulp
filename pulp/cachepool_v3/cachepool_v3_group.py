@@ -25,6 +25,7 @@ import copy
 
 import gvsoc.systree as st
 from cache.insitu.insitu_cache_remote_xbar import InsituCacheRemoteXbar
+from cache.insitu.insitu_cache_refill_mux import InsituCacheRefillMux
 from pulp.cachepool_v3.cachepool_v3_tile import CachepoolV3Tile
 
 
@@ -108,11 +109,24 @@ class CachepoolV3Group(st.Component):
                     self._rxbars[j].o_NOC_OUT(0, self.i_NOC_OUT_FWD(j, 0))
                     self.bind(self, f'noc_in_{j}_0', self._rxbars[j], 'noc_in_0')
 
-        # ---------------- wide plane: refill egress ----------------
-        # P0/P1: every tile's wide egress fans into the group's single 'refill' master.
-        # P3 replaces this with: 16 bank ports + L2 I$ port → 17→1 mux → L2 NoC router.
-        for t in range(nb_tiles_per_group):
-            self.bind(self._tiles[t], 'refill', self, 'refill')
+        # ---------------- wide plane: refill egress (P3) ----------------
+        # Every bank's wide egress gets its own input on a real arbiter instead of fanning into one
+        # port with no arbitration: nb_tiles * nb_banks data inputs (16 in the intended 4x4 design),
+        # round-robin, one request per cycle. The instruction port becomes the last input once the
+        # group L2 I$ lands, making it a 17->1 mux with strict priority for instructions.
+        self._refill_mux = None
+        if getattr(cache_config, 'per_bank_l2_ports', False):
+            n_data = nb_tiles_per_group * self._nb_banks
+            self._refill_mux = InsituCacheRefillMux(
+                self, 'refill_mux', num_inputs=n_data, nb_priority_inputs=0)
+            for t in range(nb_tiles_per_group):
+                for cb in range(self._nb_banks):
+                    self._tiles[t].o_REFILL_BANK(
+                        cb, self._refill_mux.i_INPUT(t * self._nb_banks + cb))
+            self._refill_mux.o_OUTPUT(self.i_REFILL_FWD())
+        else:
+            for t in range(nb_tiles_per_group):
+                self.bind(self._tiles[t], 'refill', self, 'refill')
 
         # ---------------- narrow AXI egress (ROM / peripheral / UART) ----------------
         for t in range(nb_tiles_per_group):
@@ -176,6 +190,10 @@ class CachepoolV3Group(st.Component):
 
     def i_BARRIER_ACK(self, tile: int, core: int) -> st.SlaveItf:
         return st.SlaveItf(self, f'barrier_ack_{tile}_{core}', signature='wire<bool>')
+
+    def i_REFILL_FWD(self) -> st.SlaveItf:
+        """Boundary slave carrying the group's aggregated wide refill egress out."""
+        return st.SlaveItf(self, 'refill', signature='io')
 
     def i_PERIPH_FWD(self, tile: int, core: int) -> st.SlaveItf:
         return st.SlaveItf(self, f'periph_{tile}_{core}', signature='io')
