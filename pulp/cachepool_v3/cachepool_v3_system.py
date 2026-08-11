@@ -105,6 +105,10 @@ def _make_cache_config():
     # do NOT carry over; re-calibration is a prerequisite before quoting any v3 number.
     # A/B: CACHEPOOL_V3_SYNC_CACHE=1 restores the calibrated synchronous slave.
     cfg.controller.inline_sync_miss        = int(os.environ.get('CACHEPOOL_V3_SYNC_CACHE', '0')) != 0
+    # Async path: spend the RTL's warm read-hit cost as real simulated time, since stamped latency
+    # is discarded by the requester. Calibrated at 8 (measured served latency 10.8 vs the RTL's 10
+    # isolated; byte-enable within 1% of the calibrated synchronous path). Sweep with INSITU_RESP_LAT.
+    cfg.controller.resp_latency_cycles = 0 if cfg.controller.inline_sync_miss else 8
     cfg.controller.functional_writethrough = True
     cfg.interco.dynamic_offset = int(math.log2(cfg.controller.cache_line_bytes))
     # Remote ports are needed for ANY off-tile traffic (cross-tile in-group or cross-group over the
