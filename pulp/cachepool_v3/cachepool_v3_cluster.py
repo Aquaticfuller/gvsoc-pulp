@@ -151,7 +151,13 @@ class CachepoolV3Cluster(st.Component):
                 for j in range(self._n_ppc):
                     self.bind(self, f'config_xbar_{g}_{t}_{j}',
                               self.group_list[g], f'config_xbar_{t}_{j}')
-            if nb_tiles_per_group > 1:
+            # Same condition the group uses to instantiate the remote crossbars: they exist for ANY
+            # off-tile traffic, cross-group included. Gating on tiles-per-group alone orphaned this
+            # boundary port in a 1-tile-per-group cluster, so the rxbars never received the partition
+            # broadcast and kept dyn_offset at its build default (6) while the xbars moved to the
+            # runtime-programmed XBAR_OFFSET (9) -- and addr_tile() shifts by dyn_offset + bank_bits,
+            # so the two disagreed about which tile owns an address and bounced it forever.
+            if nb_tiles_per_group > 1 or nb_groups > 1:
                 for j in range(self._n_ppc):
                     self.bind(self, f'config_rxbar_{g}_{j}', self.group_list[g], f'config_rxbar_{j}')
 

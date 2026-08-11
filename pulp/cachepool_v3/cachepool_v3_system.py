@@ -150,8 +150,20 @@ class CachepoolV3SoC(st.Component):
         # xbar / bank / remote xbar — the numbers the peripheral's fan-outs are sized to.
         nb_banks_total = _NB_GROUPS * _TILES_PER_GROUP * _BANKS_PER_TILE
         n_ppc = 1 + SPATZ_NB_LANES
+        # The remote crossbars exist whenever there is ANY off-tile traffic — cross-tile within a
+        # group OR cross-group over the L1 NoC — so they must be counted here on the same condition
+        # the group uses to instantiate them. Gating on _TILES_PER_GROUP > 1 alone left every rxbar
+        # in a 1-tile-per-group cluster without a config endpoint, so they never saw the partition
+        # broadcast and kept dyn_offset at its build-time default while every xbar moved to the
+        # value the runtime programmed into XBAR_OFFSET. addr_tile() shifts by
+        # dyn_offset + bank_bits, so the two then disagreed about which tile owns an address: the
+        # rxbar routed 0x80003e0c to its own group (target 14) and that group's xbar computed
+        # target 7, called it foreign and sent it straight back — an unbounded
+        # rxbar->xbar->rxbar bounce that burned a whole cycle's event budget at 2x2 and overflowed
+        # the stack at 4x4.
+        _has_remote = (_TILES_PER_GROUP > 1) or (_NB_GROUPS > 1)
         nb_config = _NB_GROUPS * (_TILES_PER_GROUP * (n_ppc + _BANKS_PER_TILE)
-                                  + (n_ppc if _TILES_PER_GROUP > 1 else 0))
+                                  + (n_ppc if _has_remote else 0))
 
         peripheral = ClusterRegisters(self, 'peripheral', boot_addr=0x1000,
                                       nb_cores=_TOTAL_CORES, binary=binary, cachepool=True,
@@ -243,7 +255,7 @@ class CachepoolV3SoC(st.Component):
                     cfg_bcast.o_OUTPUT(_k, cluster.i_CONFIG_XBAR(g, t, j)); _k += 1
                 for cb in range(_BANKS_PER_TILE):
                     cfg_bcast.o_OUTPUT(_k, cluster.i_CONFIG_CORE(g, t, cb)); _k += 1
-            if _TILES_PER_GROUP > 1:
+            if _has_remote:
                 for j in range(n_ppc):
                     cfg_bcast.o_OUTPUT(_k, cluster.i_CONFIG_RXBAR(g, j)); _k += 1
         assert _k == nb_config, f'config endpoint count mismatch: wired {_k}, sized {nb_config}'
