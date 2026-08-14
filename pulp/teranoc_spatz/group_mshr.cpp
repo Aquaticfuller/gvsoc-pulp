@@ -185,6 +185,12 @@ private:
     // stats (mirror RTL [MSHR stats])
     uint64_t stat_reqs = 0, stat_merged = 0, stat_alloc = 0, stat_bypass = 0;
     uint64_t stat_resp_mshr = 0, stat_resp_bypass = 0, stat_cache_hits = 0;
+    uint64_t stat_reqs_single = 0, stat_reqs_burst = 0;
+    uint64_t stat_merged_single = 0, stat_merged_burst = 0;
+    uint64_t stat_ret_single_1 = 0, stat_ret_single_2p = 0;
+    uint64_t stat_ret_burst_1 = 0, stat_ret_burst_2p = 0;
+    uint64_t stat_alloc_single = 0, stat_alloc_burst = 0;
+    uint64_t stat_bypass_single = 0, stat_bypass_burst = 0;
 
     vp::Trace trace;
     vp::IoSlave *req_in_itfs = nullptr;
@@ -203,15 +209,25 @@ private:
 
 GroupMshr::~GroupMshr()
 {
-    FILE *f = fopen("/tmp/mshr_stats.log", "a");
+    FILE *f = fopen("mshr_stats.log", "a");
     if (f)
     {
-        fprintf(f, "[MSHR stats] %s reqs=%lu merged=%lu alloc=%lu bypass=%lu resp_mshr=%lu resp_bypass=%lu cache_hits=%lu\n",
+        unsigned long rs = this->stat_reqs_single, rb = this->stat_reqs_burst;
+        unsigned long ms = this->stat_merged_single, mb = this->stat_merged_burst;
+        fprintf(f, "[MSHR stats] %s reqs=%lu merged=%lu alloc=%lu bypass=%lu resp_mshr=%lu resp_bypass=%lu cache_hits=%lu single=%lu/%lu(%.1f%%) burst=%lu/%lu(%.1f%%)\n",
             this->get_path().c_str(),
             (unsigned long)this->stat_reqs, (unsigned long)this->stat_merged,
             (unsigned long)this->stat_alloc, (unsigned long)this->stat_bypass,
             (unsigned long)this->stat_resp_mshr, (unsigned long)this->stat_resp_bypass,
-            (unsigned long)this->stat_cache_hits);
+            (unsigned long)this->stat_cache_hits,
+            ms, (ms + this->stat_alloc_single + this->stat_bypass_single),
+            (ms + this->stat_alloc_single + this->stat_bypass_single) ? 100.0*ms/(ms + this->stat_alloc_single + this->stat_bypass_single) : 0.0,
+            mb, (mb + this->stat_alloc_burst + this->stat_bypass_burst),
+            (mb + this->stat_alloc_burst + this->stat_bypass_burst) ? 100.0*mb/(mb + this->stat_alloc_burst + this->stat_bypass_burst) : 0.0);
+        fprintf(f, "  %s ret_single_1=%lu ret_single_2p=%lu ret_burst_1=%lu ret_burst_2p=%lu\n",
+            this->get_path().c_str(),
+            (unsigned long)this->stat_ret_single_1, (unsigned long)this->stat_ret_single_2p,
+            (unsigned long)this->stat_ret_burst_1, (unsigned long)this->stat_ret_burst_2p);
         fclose(f);
     }
 }
@@ -354,6 +370,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
     uint64_t base_addr = is_burst ? addr : addr;
 
     this->stat_reqs++;
+    if (is_burst) this->stat_reqs_burst++; else if (is_load) this->stat_reqs_single++;
 
     if (mergeable)
     {
@@ -368,6 +385,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
                 (int)hit->subs.size());
             hit->subs.push_back(Sub{tile, port, flit, true, flit->burst, flit->src_x, flit->src_y, flit->initiator_addr});
             this->stat_merged++;
+            if (is_burst) this->stat_merged_burst++; else this->stat_merged_single++;
             // RESP_HOLD reaching its subscriber target re-activates the drain.
             // Re-arm the mask for the full subscriber set (it was armed for
             // the first subscriber only at capture time).
@@ -461,6 +479,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             e->served_cnt = 0;
             flit->mshr_tag = (int)(e - this->entries.data()) + 1;
             this->stat_alloc++;
+            if (is_burst) this->stat_alloc_burst++; else this->stat_alloc_single++;
             this->trace.msg(vp::Trace::LEVEL_TRACE,
                 "MSHR_ALLOC lane=%d addr=0x%lx entry=%d len=%d\n",
                 lane, (unsigned long)addr, (int)(e - this->entries.data()), burst_len);
@@ -499,6 +518,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
         {
             flit->mshr_tag = 0;
             this->stat_bypass++;
+            if (is_burst) this->stat_bypass_burst++; else this->stat_bypass_single++;
             this->trace.msg(vp::Trace::LEVEL_TRACE,
                 "MSHR_BYPASS lane=%d addr=0x%lx bank=%d\n",
                 lane, (unsigned long)addr, bank);
@@ -974,6 +994,15 @@ void GroupMshr::retire_if_done(Entry *e)
     if (e->beats_drained < e->burst_len)
     {
         return;
+    }
+    // Subscriber histogram at retire (merge-efficiency measure).
+    if (e->burst_len > 1)
+    {
+        if (e->subs.size() > 1) this->stat_ret_burst_2p++; else this->stat_ret_burst_1++;
+    }
+    else
+    {
+        if (e->subs.size() > 1) this->stat_ret_single_2p++; else this->stat_ret_single_1++;
     }
     // Every beat delivered to every subscriber. Free only MSHR-owned flits
     // (merged subscribers); the owner's flit was forwarded as the fetch and
