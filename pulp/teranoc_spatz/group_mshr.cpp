@@ -191,6 +191,8 @@ private:
     uint64_t stat_ret_burst_1 = 0, stat_ret_burst_2p = 0;
     uint64_t stat_alloc_single = 0, stat_alloc_burst = 0;
     uint64_t stat_bypass_single = 0, stat_bypass_burst = 0;
+    uint64_t stat_ret_burst_subs[9] = {0};
+    uint64_t stat_ret_single_subs[9] = {0};
 
     vp::Trace trace;
     vp::IoSlave *req_in_itfs = nullptr;
@@ -228,6 +230,11 @@ GroupMshr::~GroupMshr()
             this->get_path().c_str(),
             (unsigned long)this->stat_ret_single_1, (unsigned long)this->stat_ret_single_2p,
             (unsigned long)this->stat_ret_burst_1, (unsigned long)this->stat_ret_burst_2p);
+        fprintf(f, "  %s burst_subs:", this->get_path().c_str());
+        for (int k = 1; k <= 8; k++) fprintf(f, " %d:%lu", k, (unsigned long)this->stat_ret_burst_subs[k]);
+        fprintf(f, " | single_subs:");
+        for (int k = 1; k <= 8; k++) fprintf(f, " %d:%lu", k, (unsigned long)this->stat_ret_single_subs[k]);
+        fprintf(f, "\n");
         fclose(f);
     }
 }
@@ -996,13 +1003,18 @@ void GroupMshr::retire_if_done(Entry *e)
         return;
     }
     // Subscriber histogram at retire (merge-efficiency measure).
-    if (e->burst_len > 1)
     {
-        if (e->subs.size() > 1) this->stat_ret_burst_2p++; else this->stat_ret_burst_1++;
-    }
-    else
-    {
-        if (e->subs.size() > 1) this->stat_ret_single_2p++; else this->stat_ret_single_1++;
+        int sc = (int)e->subs.size(); if (sc > 8) sc = 8;
+        if (e->burst_len > 1)
+        {
+            this->stat_ret_burst_subs[sc]++;
+            if (sc > 1) this->stat_ret_burst_2p++; else this->stat_ret_burst_1++;
+        }
+        else
+        {
+            this->stat_ret_single_subs[sc]++;
+            if (sc > 1) this->stat_ret_single_2p++; else this->stat_ret_single_1++;
+        }
     }
     // Every beat delivered to every subscriber. Free only MSHR-owned flits
     // (merged subscribers); the owner's flit was forwarded as the fetch and
