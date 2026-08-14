@@ -29,17 +29,17 @@ from pulp.stdout.stdout_v3_v2 import StdoutV2
 from utils.loader.loader_v2 import ElfLoader
 import gvsoc.systree as st
 from gvrun.parameter import TargetParameter
-from pulp.teranoc_v2.dma.teranoc_dma import TeranocDma
+from pulp.teranoc_spatz.dma.teranoc_dma import TeranocDma
 from elftools.elf.elffile import *
 from utils.io_v2_single_req_width_adapter import IoV2SingleReqWidthAdapter
 from utils.io_v2_beat_to_single_req_adapter import IoV2BeatToSingleReqAdapter
-from pulp.teranoc_v2.teranoc_cluster import TeranocCluster
-from pulp.teranoc_v2.ctrl_registers import CtrlRegisters
-from pulp.teranoc_v2.l2_subsystem import L2_subsystem
-from pulp.teranoc_v2.dpi_checker import TeranocDpiChecker
-from pulp.teranoc_v2.l2_interconnect.l2_address_scrambler import L2AddressScrambler
-from pulp.teranoc_v2.l2_interconnect.l2_noc import L2_noc
-from pulp.teranoc_v2.arch import CONFIGS, DEFAULT_CONFIG
+from pulp.teranoc_spatz.teranoc_cluster import TeranocCluster
+from pulp.teranoc_spatz.ctrl_registers import CtrlRegisters
+from pulp.teranoc_spatz.l2_subsystem import L2_subsystem
+from pulp.teranoc_spatz.dpi_checker import TeranocDpiChecker
+from pulp.teranoc_spatz.l2_interconnect.l2_address_scrambler import L2AddressScrambler
+from pulp.teranoc_spatz.l2_interconnect.l2_noc import L2_noc
+from pulp.teranoc_spatz.arch import CONFIGS, DEFAULT_CONFIG
 
 
 def _add_config_arg(parser):
@@ -309,7 +309,7 @@ class TeranocSystem(st.Component):
             hbm5_soc_beat_adapter.o_OUTPUT(soc_ico.i_INPUT())
 
         else:
-            raise ValueError('teranoc_v2 preserves the v1 L2 endpoint topology, which '
+            raise ValueError('teranoc_spatz preserves the v1 L2 endpoint topology, which '
                 'defines only 2x2 and 4x4 group meshes; '
                 f'got {arch.nb_x_groups}x{arch.nb_y_groups}')
 

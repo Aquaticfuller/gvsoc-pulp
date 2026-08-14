@@ -27,7 +27,7 @@ class CtrlRegisters(gvsoc.systree.Component):
             nb_cores: int = 1, cores_per_group: int = 0):
         super().__init__(parent, name)
 
-        self.add_sources(['pulp/teranoc_v2/ctrl_registers.cpp'])
+        self.add_sources(['pulp/teranoc_spatz/ctrl_registers.cpp'])
 
         self.add_properties({
             'wakeup_latency': wakeup_latency,

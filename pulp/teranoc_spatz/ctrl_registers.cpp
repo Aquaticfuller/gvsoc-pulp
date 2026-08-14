@@ -42,7 +42,6 @@ class CtrlRegisters : public vp::Component
 {
 public:
     CtrlRegisters(vp::ComponentConf &config);
-
 private:
     static vp::IoReqStatus req(vp::Block *__this, vp::IoReq *req);
     static void wakeup_event_handler(vp::Block *__this, vp::ClockEvent *event);

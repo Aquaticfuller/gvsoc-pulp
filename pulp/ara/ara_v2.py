@@ -130,7 +130,10 @@ def extend_isa(isa_instance: Isa):
 def attach(component: Component, vlen: int, nb_lanes: int, use_spatz: bool=False,
         spatz_nb_ports: int|None=None, lane_width=8, vlsu_v2: bool=False,
         nb_outstanding_reqs: int=8, reduction_is_serial: bool=False,
-        reduction_step_latency: int=1):
+        reduction_step_latency: int=1, vlsu_burst_enable: int=0,
+        vlsu_burst_max_words: int=16, vlsu_burst_rob_depth: int=64,
+        vlsu_burst_block_alloc: int=1, vlsu_burst_dual_load: int=2,
+        vlsu_burst_recv_ports: int=2, vlsu_burst_issue_latency: int=0):
     component.add_sources([
         "cpu/iss_v2/src/vector_unit/vector_unit.cpp",
         "cpu/iss_v2/src/vector_unit/vector_unit_compute.cpp",
@@ -180,3 +183,12 @@ def attach(component: Component, vlen: int, nb_lanes: int, use_spatz: bool=False
     if use_spatz:
         component.add_property('vu/nb_ports', nb_lanes if spatz_nb_ports is None else spatz_nb_ports)
         component.add_property('vu/nb_outstanding_reqs', nb_outstanding_reqs)
+        # Spatz port-0 burst loads (RTL spatz_vlsu.sv). burst_enable defaults 0
+        # (legacy behavior); issue_latency 0 derives 3/18 from block_alloc.
+        component.add_property('vu/burst_enable', int(vlsu_burst_enable))
+        component.add_property('vu/burst_max_words', int(vlsu_burst_max_words))
+        component.add_property('vu/burst_rob_depth', int(vlsu_burst_rob_depth))
+        component.add_property('vu/burst_block_alloc', int(vlsu_burst_block_alloc))
+        component.add_property('vu/burst_dual_load', int(vlsu_burst_dual_load))
+        component.add_property('vu/burst_recv_ports', int(vlsu_burst_recv_ports))
+        component.add_property('vu/burst_issue_latency', int(vlsu_burst_issue_latency))

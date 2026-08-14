@@ -23,7 +23,7 @@ from cpu.iss_v2.riscv import (Arch, ExecInOrder, IssModule, Lsu, LsuV2, Offload,
 from cpu.iss_v2.riscv_config import RiscvConfig
 from gvsoc.systree import Component
 from pulp.snitch.snitch_isa import Xdma
-from gvsoc.signature import IoV2SingleReq
+from gvsoc.signature import IoV2SingleReq, IoV2Beat
 
 
 class SnitchMempoolConfig(RiscvConfig):
@@ -41,6 +41,21 @@ class SnitchMempoolConfig(RiscvConfig):
     nb_lanes: int = cfg_field(default=4, dump=True, desc="Number of vector lanes (vector only).")
     lane_width: int = cfg_field(default=8, dump=True,
         desc="Vector lane width in bytes (vector only).")
+    # Spatz port-0 burst loads (RTL spatz_vlsu.sv). All off/zero = legacy behavior.
+    vlsu_burst_enable: int = cfg_field(default=0, dump=True,
+        desc="Enable port-0 64B burst loads (vector only).")
+    vlsu_burst_max_words: int = cfg_field(default=16, dump=True,
+        desc="Words per full burst (RTL MaxBurstWords).")
+    vlsu_burst_rob_depth: int = cfg_field(default=64, dump=True,
+        desc="Port-0 ROB depth in words (RTL spatz_vlsu_rob_depth).")
+    vlsu_burst_block_alloc: int = cfg_field(default=1, dump=True,
+        desc="BlockAlloc: 3-cycle burst cadence, else 18-cycle id walk.")
+    vlsu_burst_dual_load: int = cfg_field(default=2, dump=True,
+        desc="1 = full load serialization, 2 = H1 burst-safe runahead.")
+    vlsu_burst_recv_ports: int = cfg_field(default=2, dump=True,
+        desc="Burst ROB fill/commit words per cycle (TwinROB0).")
+    vlsu_burst_issue_latency: int = cfg_field(default=0, dump=True,
+        desc="Cycles between burst sends; 0 = derive from block_alloc (3/18).")
 
 
 class ArchSnitchMempool(Arch):
@@ -188,13 +203,27 @@ class SnitchMempool(RiscvCommon):
 
         if config.vector:
             self._lsu_v2 = config.lsu_v2
+            self._vlsu_burst_enable = config.vlsu_burst_enable
             # MemPool-Spatz reduces one element per FPU round trip (3 cycles for
             # FP32: ADDMUL PipeRegs=1 plus the Reduction_Reduce handshake).
             pulp.ara.ara_v2.attach(self, config.vlen, nb_lanes=config.nb_lanes,
                 use_spatz=True, lane_width=config.lane_width,
                 vlsu_v2=config.lsu_v2, nb_outstanding_reqs=config.vlsu_nb_outstanding,
-                reduction_is_serial=True, reduction_step_latency=3)
+                reduction_is_serial=True, reduction_step_latency=3,
+                vlsu_burst_enable=config.vlsu_burst_enable,
+                vlsu_burst_max_words=config.vlsu_burst_max_words,
+                vlsu_burst_rob_depth=config.vlsu_burst_rob_depth,
+                vlsu_burst_block_alloc=config.vlsu_burst_block_alloc,
+                vlsu_burst_dual_load=config.vlsu_burst_dual_load,
+                vlsu_burst_recv_ports=config.vlsu_burst_recv_ports,
+                vlsu_burst_issue_latency=config.vlsu_burst_issue_latency)
 
     def o_VLSU(self, port: int, itf: gvsoc.systree.SlaveItf):
-        self.itf_bind(f'vlsu_{port}', itf,
-            signature=IoV2SingleReq() if getattr(self, '_lsu_v2', False) else 'io')
+        # Burst mode streams per-beat responses on port 0 (IoV2Beat); a plain
+        # 4B request is a 1-beat burst, so tail-phase traffic is unaffected.
+        if getattr(self, '_vlsu_burst_enable', 0) and port == 0 and \
+                getattr(self, '_lsu_v2', False):
+            self.itf_bind(f'vlsu_{port}', itf, signature=IoV2Beat(4))
+        else:
+            self.itf_bind(f'vlsu_{port}', itf,
+                signature=IoV2SingleReq() if getattr(self, '_lsu_v2', False) else 'io')
