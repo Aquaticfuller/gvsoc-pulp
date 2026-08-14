@@ -20,6 +20,7 @@
 import gvsoc.systree
 import gvsoc.systree as st
 import math
+import os
 from gvsoc.signature import IoV2Beat, IoV2SingleReq
 from pulp.teranoc_spatz.teranoc_tile import TeranocTile
 from pulp.teranoc_spatz.l1_interconnect.interleaver import Interleaver
@@ -118,6 +119,7 @@ class TeranocGroup(st.Component):
                 resp_cache=arch.group_mshr.resp_cache,
                 stall_on_resp=arch.group_mshr.stall_on_resp,
                 bypass_track_ways=arch.group_mshr.bypass_track_ways,
+                spill=int(os.environ.get('TERANOC_MSHR_SPILL', 1)),
                 nb_groups=arch.nb_groups,
                 max_burst_words=arch.vlsu_burst.max_burst_words)
 

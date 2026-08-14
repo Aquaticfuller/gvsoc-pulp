@@ -37,6 +37,7 @@ class GroupMshr(gvsoc.systree.Component):
             bank_shift_single: int = 9, bank_shift_burst: int = 7, bank_burst_bits: int = 1,
             serve_timeout: int = 255, resp_cache: bool = True,
             stall_on_resp: bool = True, bypass_track_ways: int = 4,
+            spill: int = 1,
             nb_groups: int = 16, max_burst_words: int = 16):
         super().__init__(parent, name)
 
@@ -63,6 +64,7 @@ class GroupMshr(gvsoc.systree.Component):
             'resp_cache': int(resp_cache),
             'stall_on_resp': int(stall_on_resp),
             'bypass_track_ways': bypass_track_ways,
+            'spill': spill,
             'nb_groups': nb_groups,
             'max_burst_words': max_burst_words,
         })

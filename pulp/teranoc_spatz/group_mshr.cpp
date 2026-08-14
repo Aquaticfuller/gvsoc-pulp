@@ -105,6 +105,9 @@ private:
         // in bottleneck_analysis/2026-06-16); the drain pace is unchanged.
         uint32_t resp_words[16] = {0};
         uint16_t arrived_mask = 0;
+        uint16_t arrive_pending = 0;  // captured, not yet visible (resp_in spill)
+        int64_t issue_cycle = 0;      // earliest fetch issue (req_out spill)
+        int64_t drain_not_before = 0; // earliest head-beat delivery (resp_out spill)
         int resp_rd = 0;          // read cursor (word index being drained)
         int beats_arrived = 0;    // total beats captured
         uint32_t served_mask = 0; // per-head-beat pending bitmap over subs
@@ -166,6 +169,8 @@ private:
     int nb_groups;
     int max_burst_words;
     int nb_banks;
+    int spill;   // 1: +1-cycle spill register on all four interfaces (RTL
+                 // SpillReqIn/Out, SpillRespIn/Out all default 1). 0: off.
 
     // ---------------- state
     std::vector<Entry> entries;               // num_entries
@@ -177,7 +182,12 @@ private:
     std::vector<bool> resp_out_blocked;
     std::vector<L1NocFlit *> resp_out_held;    // elected beat held per lane
     std::deque<std::pair<L1NocFlit *, int>> bypass_queue; // bypass beats (priority)
+    // req_in spill (one-cycle input register per lane): 0=idle, 1=filling
+    // (presenting next cycle), 2=presenting (resend is processed).
+    std::vector<int> req_spill_state;
+    std::vector<L1NocFlit *> req_spill_flit;
     int alloc_rr = 0;                          // lane RR base for allocation
+    int64_t last_spill_move = -1;              // cycle-gate for the resp_in spill move
     int replay_rr = 0;                         // entry RR base for hold replay
     int drain_rr = 0;                          // entry RR base for drain
     int sub_rr = 0;
@@ -267,6 +277,7 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->nb_groups = cfg->get_int("nb_groups");
     this->max_burst_words = cfg->get_int("max_burst_words");
     this->nb_banks = this->num_entries / this->ways_per_bank;
+    this->spill = cfg->get_int("spill");
 
     this->entries.resize(this->num_entries);
     this->bank_ways.resize(this->nb_banks);
@@ -280,6 +291,8 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->req_out_held.resize(this->nb_lanes, nullptr);
     this->resp_out_blocked.resize(this->nb_lanes, false);
     this->resp_out_held.resize(this->nb_lanes, nullptr);
+    this->req_spill_state.resize(this->nb_lanes, 0);
+    this->req_spill_flit.resize(this->nb_lanes, nullptr);
 
     for (int i = 0; i < this->nb_lanes; i++)
     {
@@ -326,6 +339,38 @@ vp::IoReqStatus GroupMshr::req_in(vp::Block *__this, vp::IoReq *req, int lane)
 {
     auto *_this = static_cast<GroupMshr *>(__this);
     auto *flit = static_cast<L1NocFlit *>(req);
+
+    // req_in spill register (SpillReqIn): a new flit fills the register and is
+    // only processed from the NEXT cycle (when the producer resends it after
+    // our retry). A flit already in the register re-presents immediately on
+    // retry, so stall-denies do NOT pay the delay again.
+    if (_this->spill)
+    {
+        int st = _this->req_spill_state[lane];
+        if (st == 0)
+        {
+            // Register empty: fill it, present next cycle.
+            _this->req_spill_state[lane] = 1;
+            _this->req_spill_flit[lane] = flit;
+            _this->fsm_event.enqueue(1);
+            return vp::IO_REQ_DENIED;
+        }
+        if (st == 1 || flit != _this->req_spill_flit[lane])
+        {
+            // Still filling (retry comes from door_handler) or a different
+            // flit queued behind: keep the producer waiting.
+            return vp::IO_REQ_DENIED;
+        }
+        // st == 2 and this is the presenting flit: process it now.
+        vp::IoReqStatus rst = _this->handle_request(flit, lane);
+        if (rst != vp::IO_REQ_DENIED)
+        {
+            // Accepted: register frees for the next flit.
+            _this->req_spill_state[lane] = 0;
+            _this->req_spill_flit[lane] = nullptr;
+        }
+        return rst;
+    }
     return _this->handle_request(flit, lane);
 }
 
@@ -401,6 +446,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             {
                 hit->state = ST_DRAIN_RESP;
                 hit->served_mask = (1u << hit->subs.size()) - 1;
+                hit->drain_not_before = this->clock.get_cycles() + this->spill;
             }
             // CACHED hit: re-arm for service (single-word entries only). The
             // mask was consumed by the previous service, so re-arm it for the
@@ -409,6 +455,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             {
                 hit->state = ST_DRAIN_RESP;
                 hit->served_mask = (1u << hit->subs.size()) - 1;
+                hit->drain_not_before = this->clock.get_cycles() + this->spill;
                 this->stat_cache_hits++;
             }
             // Burst hold window early release.
@@ -480,6 +527,9 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             e->subs.push_back(Sub{tile, port, flit, false, flit->burst, flit->src_x, flit->src_y, flit->initiator_addr});
             e->resp_rd = 0;
             e->arrived_mask = 0;
+            e->arrive_pending = 0;
+            e->issue_cycle = this->clock.get_cycles() + this->spill;  // req_out spill
+            e->drain_not_before = 0;
             e->beats_arrived = 0;
             e->served_mask = 0;
             e->beats_drained = 0;
@@ -631,6 +681,11 @@ void GroupMshr::forward_fetch(Entry *e)
         // (fetch_blocked is only for flits already parked in req_out_held).
         return;
     }
+    // req_out spill: the fetch presents to the remapper one cycle after issue.
+    if (this->spill && this->clock.get_cycles() < e->issue_cycle)
+    {
+        return;
+    }
     vp::IoReqStatus st = this->req_out_v[lane]->req(owner.flit);
     if (st == vp::IO_REQ_DENIED)
     {
@@ -747,7 +802,16 @@ vp::IoReqStatus GroupMshr::capture_response(L1NocFlit *flit, int lane)
         return vp::IO_REQ_DONE;
     }
     e.resp_words[idx] = flit->beat_data;
-    e.arrived_mask |= (uint16_t)(1u << idx);
+    // resp_in spill: with spill on, the beat becomes drain-visible NEXT cycle
+    // (arrive_pending moves into arrived_mask on the next clock edge).
+    if (this->spill)
+    {
+        e.arrive_pending |= (uint16_t)(1u << idx);
+    }
+    else
+    {
+        e.arrived_mask |= (uint16_t)(1u << idx);
+    }
     e.beats_arrived++;
     this->stat_resp_mshr++;
     delete flit;
@@ -767,6 +831,7 @@ vp::IoReqStatus GroupMshr::capture_response(L1NocFlit *flit, int lane)
         else
         {
             e.state = ST_DRAIN_RESP;
+            e.drain_not_before = this->clock.get_cycles() + this->spill;
         }
     }
     // Arm the head beat's subscriber bitmap when it becomes head.
@@ -774,7 +839,9 @@ vp::IoReqStatus GroupMshr::capture_response(L1NocFlit *flit, int lane)
     {
         e.served_mask = (1u << e.subs.size()) - 1;
     }
-    this->fsm_event.enqueue(0);
+    // With the resp_in spill, the move to arrived_mask (and the drain of the
+    // just-visible beats) happens on the next clock edge.
+    this->fsm_event.enqueue(this->spill ? 1 : 0);
     return vp::IO_REQ_DONE;
 }
 
@@ -827,6 +894,36 @@ void GroupMshr::hb_handler(vp::Block *__this, vp::ClockEvent *)
 void GroupMshr::door_handler(vp::Block *__this, vp::ClockEvent *)
 {
     auto *_this = static_cast<GroupMshr *>(__this);
+
+    if (_this->spill)
+    {
+        // req_in spill: registers that filled last cycle present now — wake the
+        // producer to resend so the door can process them.
+        for (int lane = 0; lane < _this->nb_lanes; lane++)
+        {
+            if (_this->req_spill_state[lane] == 1)
+            {
+                _this->req_spill_state[lane] = 2;
+                _this->req_in_v[lane]->retry(vp::IO_RETRY_ANY);
+            }
+        }
+        // resp_in spill: beats captured in a PREVIOUS cycle become visible to
+        // the drain (cycle-gated so a same-cycle fsm(0) can't leak them early).
+        int64_t now = _this->clock.get_cycles();
+        if (now != _this->last_spill_move)
+        {
+            _this->last_spill_move = now;
+            for (Entry &e : _this->entries)
+            {
+                if (e.valid && e.arrive_pending)
+                {
+                    e.arrived_mask |= e.arrive_pending;
+                    e.arrive_pending = 0;
+                }
+            }
+        }
+    }
+
     _this->drain_cycle();
     _this->replay_holds();
     _this->serve_timeouts(_this->clock.get_cycles());
@@ -853,7 +950,8 @@ void GroupMshr::door_handler(vp::Block *__this, vp::ClockEvent *)
             {
                 continue;
             }
-            if ((e.state == ST_DRAIN_RESP && (e.arrived_mask >> e.resp_rd) & 1) ||
+            if ((e.state == ST_DRAIN_RESP &&
+                 ((e.arrived_mask | e.arrive_pending) >> e.resp_rd) & 1) ||
                 (!e.issued) ||   // any un-issued entry needs the replay walker
                 (e.state == ST_RESP_HOLD) ||
                 (e.state == ST_CACHED && e.release_cycle >= 0))
@@ -902,6 +1000,12 @@ void GroupMshr::drain_cycle()
         int i = (this->drain_rr + k) % this->num_entries;
         Entry &e = this->entries[i];
         if (!e.valid || e.state != ST_DRAIN_RESP)
+        {
+            continue;
+        }
+        // resp_out spill: the first delivery leaves one cycle after the entry
+        // became drainable.
+        if (this->spill && this->clock.get_cycles() < e.drain_not_before)
         {
             continue;
         }
@@ -1034,6 +1138,7 @@ void GroupMshr::retire_if_done(Entry *e)
         e->cache_word = e->resp_words[0];
         e->resp_rd = 0;
         e->arrived_mask = 1;   // the cached word sits at index 0
+        e->arrive_pending = 0;
         e->beats_drained = 0;
         e->beats_arrived = 1;
         e->served_mask = 0;
@@ -1096,6 +1201,7 @@ void GroupMshr::serve_timeouts(int64_t cycles)
             // FULL current set (armed for the first subscriber at capture).
             e.state = ST_DRAIN_RESP;
             e.served_mask = (1u << e.subs.size()) - 1;
+            e.drain_not_before = this->clock.get_cycles() + this->spill;
             this->fsm_event.enqueue(0);
             e.release_cycle = -1;
         }
