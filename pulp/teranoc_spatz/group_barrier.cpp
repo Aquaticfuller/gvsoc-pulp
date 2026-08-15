@@ -26,7 +26,8 @@
  * Address decode (kernel gbar_base, sp-fmatmul.c): byte address =
  * word*2^14 | group*2^10 | tile*2^6 | bank*2^2 | byte. Window: word in
  * [base_word, base_word+num_barriers); struct = word - base_word; op = bank
- * field (addr>>2)&3: 0=ARRIVE (load), 1=WR_TARGET (store), 2=WR_MASK (store).
+ * field (addr>>2)&3: 0=ARRIVE (load), 1=WR_TARGET (store), 2=WR_MASK (store),
+ * 3=MSHR CSR (store = config write, load = status read).
  *
  * Semantics (mempool_group_barrier.sv): per struct {target, mask, count,
  * arrived}. ARRIVE increments count and marks the tile arrived, holding the
@@ -34,9 +35,20 @@
  * tile's held load gets its response in the same cycle (EnableBcast), then
  * count/arrived reset; target/mask persist (Mode B auto-reuse). WR_TARGET /
  * WR_MASK are config stores acked immediately.
+ *
+ * MSHR CSR op (mempool_group.sv, 2026-08-15): a bank-3 access reuses the
+ * struct field as the CSR index. Faithful to the RTL decode, a bank-3 STORE
+ * also lands on the barrier FSM as a WR_MASK on struct N (bar_op collapses
+ * bank 0/2/3 to op 2) — the model applies that mask side effect here — and
+ * is additionally forwarded to the group MSHR's CSR file, whose response
+ * acks the store. A bank-3 LOAD is the CSR status read: the RTL has no data
+ * source for it (it decodes as a barrier ARRIVE and only the watchdog would
+ * release it — disabled in terapool); the model returns the MSHR's status
+ * register, the documented intent of mshr_cfg_status().
  */
 
 #include <deque>
+#include <map>
 #include <vector>
 
 #include <vp/vp.hpp>
@@ -55,15 +67,30 @@ private:
     static void out_retry(vp::Block *__this, int tile, vp::IoRetryChannel);
     static vp::IoRespAck out_resp(vp::Block *__this, vp::IoReq *req, int tile);
     static void rel_handler(vp::Block *__this, vp::ClockEvent *event);
+    static vp::IoRespAck cfg_resp(vp::Block *__this, vp::IoReq *req, int itf);
+    static void cfg_retry(vp::Block *__this, int itf, vp::IoRetryChannel);
 
     vp::IoReqStatus passthrough(L1NocFlit *flit, int tile);
     vp::IoReqStatus handle_barrier(L1NocFlit *flit, int tile);
+    vp::IoReqStatus cfg_forward(L1NocFlit *flit, int tile, int csr,
+                                bool is_write, uint32_t data);
     void release(int s);
 
     // ---------------- config
     int nb_tiles;
     int num_barriers;
     int base_word;
+    bool mshr_present;   // group MSHR instantiated (CSR forward target)
+
+    // MSHR CSR forward (bank-3 accesses): copy flit -> originator awaiting
+    // the MSHR's response (tile + the original flit, completed from
+    // rel_handler). Responses arrive in order on the single cfg link.
+    struct CfgPend
+    {
+        int tile;
+        L1NocFlit *orig;
+    };
+    std::map<L1NocFlit *, CfgPend> cfg_pending;
 
     // ---------------- per-struct barrier state
     std::vector<uint32_t> target;   // configured subscriber count (persists)
@@ -99,6 +126,7 @@ private:
     vp::Trace trace;
     std::vector<std::unique_ptr<vp::IoSlave>> in_v;
     std::vector<std::unique_ptr<vp::IoMaster>> out_v;
+    std::unique_ptr<vp::IoMaster> cfg_out;
     vp::ClockEvent rel_event{this, &GroupBarrier::rel_handler};
 };
 
@@ -109,6 +137,7 @@ GroupBarrier::GroupBarrier(vp::ComponentConf &config) : vp::Component(config)
     this->nb_tiles = cfg->get_int("nb_tiles_per_group");
     this->num_barriers = cfg->get_int("num_barriers");
     this->base_word = cfg->get_int("base_word");
+    this->mshr_present = cfg->get_int("mshr_present") != 0;
 
     this->target.assign(this->num_barriers, 0);
     this->mask.assign(this->num_barriers, 0);
@@ -128,6 +157,14 @@ GroupBarrier::GroupBarrier(vp::ComponentConf &config) : vp::Component(config)
         this->out_v.push_back(std::make_unique<vp::IoMaster>(i,
             &GroupBarrier::out_retry, &GroupBarrier::out_resp));
         this->new_master_port("out_" + std::to_string(i), this->out_v.back().get());
+    }
+
+    // MSHR CSR forward link (bound only when the group MSHR is instantiated).
+    if (this->mshr_present)
+    {
+        this->cfg_out = std::make_unique<vp::IoMaster>(0,
+            &GroupBarrier::cfg_retry, &GroupBarrier::cfg_resp);
+        this->new_master_port("mshr_cfg_out", this->cfg_out.get());
     }
 }
 
@@ -185,12 +222,46 @@ vp::IoReqStatus GroupBarrier::handle_barrier(L1NocFlit *flit, int tile)
         {
             this->target[s] = data;
         }
-        else if (op == 2)
+        else if (op == 2 || op == 3)
         {
+            // The RTL's bar_op collapses bank 0/2/3 stores to WR_MASK, so a
+            // bank-3 MSHR CSR write also writes struct N's mask — apply that
+            // side effect here (harmless: gbar_setup re-arms mask/target).
             this->mask[s] = data;
         }
-        this->trace.msg(vp::Trace::LEVEL_TRACE,
-            "GBAR_CFG tile=%d struct=%d op=%d data=0x%x\n", tile, s, op, data);
+        if (op == 3)
+        {
+            // MSHR CSR store: forward to the group MSHR's runtime config file;
+            // its response acks the store. Without an MSHR, ack directly (the
+            // CSR write lands nowhere, as in the RTL's no-MSHR arm).
+            if (this->mshr_present)
+            {
+                return this->cfg_forward(flit, tile, s, true, data);
+            }
+        }
+        else
+        {
+            this->trace.msg(vp::Trace::LEVEL_TRACE,
+                "GBAR_CFG tile=%d struct=%d op=%d data=0x%x\n", tile, s, op, data);
+        }
+        this->ack_queue.push_back({tile, flit});
+        this->rel_event.enqueue(1);
+        return vp::IO_REQ_GRANTED;
+    }
+
+    if (op == 3)
+    {
+        // MSHR CSR status read (see the header comment: the model returns the
+        // CSR file's value; the RTL has no read data path). Without an MSHR
+        // the read returns 0.
+        if (this->mshr_present)
+        {
+            return this->cfg_forward(flit, tile, s, false, 0);
+        }
+        if (flit->get_data() != nullptr && flit->get_size() >= 4)
+        {
+            *(uint32_t *)flit->get_data() = 0;
+        }
         this->ack_queue.push_back({tile, flit});
         this->rel_event.enqueue(1);
         return vp::IO_REQ_GRANTED;
@@ -301,6 +372,75 @@ vp::IoRespAck GroupBarrier::out_resp(vp::Block *__this, vp::IoReq *req, int tile
     auto *_this = static_cast<GroupBarrier *>(__this);
     // LIC response for a passthrough request: forward to the tile.
     return _this->in_v[tile]->resp(req);
+}
+
+// ---------------------------------------------------------------------------
+// MSHR CSR forward (bank-3 window accesses). The original flit stays parked
+// here; a 4-byte copy carrying {csr index, value} goes to the group MSHR's
+// cfg_in port, whose response completes the original (store ack / load data)
+// from the release event. The MSHR's cfg port is always-ready by
+// construction; a deny here would mean that changed, so fail loudly.
+// ---------------------------------------------------------------------------
+vp::IoReqStatus GroupBarrier::cfg_forward(L1NocFlit *flit, int tile, int csr,
+                                          bool is_write, uint32_t data)
+{
+    L1NocFlit *copy = new L1NocFlit();
+    copy->set_addr((uint64_t)csr << 2);
+    copy->set_size(4);
+    copy->set_is_write(is_write);
+    copy->set_opcode(is_write ? vp::WRITE : vp::READ);
+    uint8_t *buf = new uint8_t[4];
+    *(uint32_t *)buf = data;
+    copy->set_data(buf);
+
+    vp::IoReqStatus st = this->cfg_out->req(copy);
+    if (st == vp::IO_REQ_DENIED)
+    {
+        this->trace.fatal("MSHR CSR port denied a config access — the cfg_in "
+                          "handler is always-ready by construction; a deny "
+                          "means that changed and needs retry handling here\n");
+    }
+    this->cfg_pending[copy] = CfgPend{tile, flit};
+    this->trace.msg(vp::Trace::LEVEL_TRACE,
+        "GBAR_MSHR_CSR tile=%d csr=%d wen=%d data=0x%x\n",
+        tile, csr, (int)is_write, data);
+    return vp::IO_REQ_GRANTED;
+}
+
+vp::IoRespAck GroupBarrier::cfg_resp(vp::Block *__this, vp::IoReq *req, int)
+{
+    auto *_this = static_cast<GroupBarrier *>(__this);
+    auto *copy = static_cast<L1NocFlit *>(req);
+
+    auto it = _this->cfg_pending.find(copy);
+    if (it == _this->cfg_pending.end())
+    {
+        _this->trace.fatal("MSHR CSR response without a pending access\n");
+        return vp::IO_RESP_ACCEPTED;
+    }
+    CfgPend pend = it->second;
+    _this->cfg_pending.erase(it);
+
+    if (!copy->get_is_write())
+    {
+        // Status read: deposit the CSR value into the original load's data.
+        if (pend.orig->get_data() != nullptr && pend.orig->get_size() >= 4 &&
+            copy->get_data() != nullptr)
+        {
+            *(uint32_t *)pend.orig->get_data() = *(uint32_t *)copy->get_data();
+        }
+    }
+    delete[] copy->get_data();
+    delete copy;
+
+    _this->ack_queue.push_back({pend.tile, pend.orig});
+    _this->rel_event.enqueue(1);
+    return vp::IO_RESP_ACCEPTED;
+}
+
+void GroupBarrier::cfg_retry(vp::Block *, int, vp::IoRetryChannel)
+{
+    // Never expected: the MSHR cfg port is always-ready (see cfg_forward).
 }
 
 extern "C" vp::Component *gv_new(vp::ComponentConf &config)

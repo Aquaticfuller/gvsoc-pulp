@@ -29,7 +29,8 @@ class GroupBarrier(gvsoc.systree.Component):
     arrival count reaches its target, then broadcast-released in one cycle."""
 
     def __init__(self, parent: gvsoc.systree.Component, name: str,
-            nb_tiles_per_group: int, num_barriers: int = 16, base_word: int = 240):
+            nb_tiles_per_group: int, num_barriers: int = 16, base_word: int = 240,
+            mshr_present: bool = False):
         super().__init__(parent, name)
 
         self.add_sources(['pulp/teranoc_spatz/group_barrier.cpp'])
@@ -37,6 +38,7 @@ class GroupBarrier(gvsoc.systree.Component):
             'nb_tiles_per_group': nb_tiles_per_group,
             'num_barriers': num_barriers,
             'base_word': base_word,
+            'mshr_present': int(mshr_present),
         })
 
     def i_IN(self, tile: int) -> gvsoc.systree.SlaveItf:
@@ -44,3 +46,7 @@ class GroupBarrier(gvsoc.systree.Component):
 
     def o_OUT(self, tile: int, itf: gvsoc.systree.SlaveItf):
         self.itf_bind(f'out_{tile}', itf, signature=IoV2SingleReq())
+
+    def o_MSHR_CFG(self, itf: gvsoc.systree.SlaveItf):
+        """Forward link for bank-3 MSHR CSR accesses (mempool_group_mshr_cfg)."""
+        self.itf_bind('mshr_cfg_out', itf, signature=IoV2SingleReq())

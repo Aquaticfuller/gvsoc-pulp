@@ -37,7 +37,7 @@ class GroupMshr(gvsoc.systree.Component):
             bank_shift_single: int = 9, bank_shift_burst: int = 7, bank_burst_bits: int = 1,
             serve_timeout: int = 255, resp_cache: bool = True,
             stall_on_resp: bool = True, bypass_track_ways: int = 4,
-            spill: int = 1,
+            spill: int = 1, spill_req_in: int = 0, cfg_enable_reset: int = 1,
             nb_groups: int = 16, max_burst_words: int = 16):
         super().__init__(parent, name)
 
@@ -65,6 +65,8 @@ class GroupMshr(gvsoc.systree.Component):
             'stall_on_resp': int(stall_on_resp),
             'bypass_track_ways': bypass_track_ways,
             'spill': spill,
+            'spill_req_in': spill_req_in,
+            'cfg_enable_reset': cfg_enable_reset,
             'nb_groups': nb_groups,
             'max_burst_words': max_burst_words,
         })
@@ -80,3 +82,8 @@ class GroupMshr(gvsoc.systree.Component):
 
     def o_RESP_OUT(self, lane: int, itf: gvsoc.systree.SlaveItf):
         self.itf_bind(f'resp_out_{lane}', itf, signature=IoV2SingleReq())
+
+    def i_CFG(self) -> gvsoc.systree.SlaveItf:
+        """Runtime CSR port (mempool_group_mshr_cfg): the group barrier
+        forwards its bank-3 accesses here."""
+        return gvsoc.systree.SlaveItf(self, 'cfg_in', signature=IoV2SingleReq())

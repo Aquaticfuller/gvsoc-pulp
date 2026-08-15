@@ -25,7 +25,7 @@
 # nb_snitch_per_tile counts only Snitch cores. Heterogeneous tiles may carry
 # additional compute (RedMule, Spatz, …) which are not part of this number.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 
 
@@ -106,15 +106,15 @@ class GroupMshrConfig:
     enable_single:       bool = True # group_mshr_enable_single
     drain_beats:         int  = 2    # group_mshr_drain_beats (ParityDrain)
     hold_window_single:  int  = 0    # group_mshr_hold_window_single
-    hold_window_burst:   int  = 255  # group_mshr_hold_window_burst
-    hold_subs_single:    int  = 4    # group_mshr_hold_subs_single (early release)
+    hold_window_burst:   int  = 2047 # group_mshr_hold_window_burst (2047 since 2026-08-14)
+    hold_subs_single:    int  = 4    # group_mshr_hold_subs_single (early release; 1 = bypass class)
     hold_subs_burst:     int  = 4    # group_mshr_hold_subs_burst
     hold_prescale_w:     int  = 4    # group_mshr_hold_prescale_w (16-cycle ticks)
     resp_wait_subs_single: int = 1   # group_mshr_resp_wait_subs_single
-    bank_shift_single:   int  = 5    # group_mshr_bank_shift (shared default; _single inherits)
+    bank_shift_single:   int  = 9    # group_mshr_bank_shift_single
     bank_shift_burst:    int  = 7    # group_mshr_bank_shift_burst
     bank_burst_bits:     int  = 1    # group_mshr_bank_burst_bits
-    serve_timeout:       int  = 255  # group_mshr_serve_timeout
+    serve_timeout:       int  = 2047 # group_mshr_serve_timeout (singles only)
     resp_cache:          bool = True # EnableRespCache (single-word CACHED state)
     stall_on_resp:       bool = True # group_mshr_stall_on_resp
     bypass_track_ways:   int  = 4    # bypass retag table ways per tile
@@ -610,33 +610,47 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
     nb_axi_masters_per_group = 1,
     l2_size                  = 0x1000000,
     nb_l2_banks              = 16,
-    l1_noc_remap_mode        = 3,
+    # noc_router_remapping=2 (response remapping) — the RTL's shipping default
+    # since 2026-08-14 (c05d54c1); was 3 (req+resp) here before that. Property-
+    # valued only (remapper batch sizes), so env-overridable at run time:
+    # TERANOC_L1_REMAP_MODE=3 reproduces teranoc_v2's profile for fork-parity
+    # checks.
+    l1_noc_remap_mode        = int(os.environ.get('TERANOC_L1_REMAP_MODE', 2)),
     l1_noc_remap_batch_size  = 4,
     l1_noc_remap_shuffle     = True,
     snitch                  = SNITCHMEMPOOL_VECTOR_CORE,
     vector                   = SNITCHMEMPOOL_VECTOR,
     redmule                  = None,
     nb_redmule_tiles_per_group = 0,
-    # RTL values for the teranoc_spatz features. Both stay disabled until the
-    # model components land (Phase 2: VLSU burst, Phase 4: group MSHR).
-    vlsu_burst = VlsuBurstConfig(enable=True, max_burst_words=16, rob_depth=64,
+    # VLSU burst loads (spatz_vlsu.sv port-0 path). TERANOC_VLSU_BURST_ENABLE=0
+    # gives the naive per-word behavior (== teranoc_v2's VLSU).
+    vlsu_burst = VlsuBurstConfig(
+        enable=bool(int(os.environ.get('TERANOC_VLSU_BURST_ENABLE', 1))),
+        max_burst_words=16, rob_depth=64,
         block_alloc=True, dual_load=2, recv_ports=2),
-    # MSHR knobs default to config/terapool_spatz4_fpu.mk's built defaults;
-    # the benchmark suite tunes them per shape (gemm_results.md: merge_reqs =
-    # max(A-share, B-share), hold_subs = share clamped to [2, merge], and a
-    # share of 1 zeroes that class's hold window). Override via
-    # TERANOC_MSHR_* env vars for calibration sweeps, e.g. for 128x128x512
-    # (A 16-way, B 1-way): MERGE_REQS=16 HOLD_SUBS_SINGLE=16 HOLD_SUBS_BURST=2
-    # HOLD_WINDOW_BURST=0.
+    # MSHR knobs default to config/terapool_spatz4_fpu.mk's built defaults
+    # (2026-08-15 state: hold_window_burst and serve_timeout track the uniform
+    # 2047 decision; the request-input spill is bypassed — C2). Newer GEMM
+    # ELFs instead program all runtime knobs per shape through the MSHR CSRs
+    # (mshr_cfg.h) from their own make variables, so these only matter for
+    # ELFs built before the CSR flow. Override via TERANOC_MSHR_* env vars;
+    # scripts_local/run_shape.sh derives them from gemm_autotune.py.
+    # TERANOC_MSHR_ENABLE=0 removes the component entirely (== naive
+    # teranoc_v2 wiring); TERANOC_MSHR_CFG_ENABLE_RESET=0 makes an
+    # instantiated MSHR start bypassed until a CSR write enables it (the
+    # RTL's MshrCfgRuntime=1 reset state).
     group_mshr = GroupMshrConfig(
-        enable=True,
+        enable=bool(int(os.environ.get('TERANOC_MSHR_ENABLE', 1))),
         merge_reqs=int(os.environ.get('TERANOC_MSHR_MERGE_REQS', 4)),
-        hold_subs_single=int(os.environ.get('TERANOC_MSHR_HOLD_SUBS_SINGLE', 2)),
-        hold_subs_burst=int(os.environ.get('TERANOC_MSHR_HOLD_SUBS_BURST', 2)),
-        hold_window_burst=int(os.environ.get('TERANOC_MSHR_HOLD_WINDOW_BURST', 255)),
+        hold_subs_single=int(os.environ.get('TERANOC_MSHR_HOLD_SUBS_SINGLE', 4)),
+        hold_subs_burst=int(os.environ.get('TERANOC_MSHR_HOLD_SUBS_BURST', 4)),
+        hold_window_single=int(os.environ.get('TERANOC_MSHR_HOLD_WINDOW_SINGLE', 0)),
+        hold_window_burst=int(os.environ.get('TERANOC_MSHR_HOLD_WINDOW_BURST', 2047)),
+        serve_timeout=int(os.environ.get('TERANOC_MSHR_SERVE_TIMEOUT', 2047)),
         resp_wait_subs_single=int(os.environ.get('TERANOC_MSHR_RESP_WAIT_SUBS_SINGLE', 1)),
-        bank_shift_single=int(os.environ.get('TERANOC_MSHR_BANK_SHIFT_SINGLE', 5)),
+        bank_shift_single=int(os.environ.get('TERANOC_MSHR_BANK_SHIFT_SINGLE', 9)),
         bank_shift_burst=int(os.environ.get('TERANOC_MSHR_BANK_SHIFT_BURST', 7)),
+        bank_burst_bits=int(os.environ.get('TERANOC_MSHR_BANK_BURST_BITS', 1)),
     ),
     # HW group barrier (mempool_group_barrier.sv). EnableGroupBarrier defaults
     # ON in the RTL; the burst-merge kernel's GBAR_PLOOP syncs through it.
@@ -658,6 +672,19 @@ CONFIGS = {
     'minpool_spatz4_fpu':   MINPOOL_SPATZ4_FPU,
     'mempool_spatz4_fpu':   MEMPOOL_SPATZ4_FPU,
     'terapool_spatz4_fpu':  TERAPOOL_SPATZ4_FPU,
+    # Feature-off variants for one-knob-apart comparison (each is its own
+    # compiled platform tree — component presence is structural, so runtime
+    # env switches can't do this; see runner_gvrun2's tree SHA check).
+    #   _nomshr: VLSU burst transport + group barrier on, group MSHR off
+    #            (the burst-merge kernel still syncs; loads never merge).
+    #   _naive:  everything off — expected to match teranoc_v2's
+    #            terapool_spatz4_fpu cycle-for-cycle.
+    'terapool_spatz4_fpu_nomshr': replace(TERAPOOL_SPATZ4_FPU,
+        group_mshr=replace(TERAPOOL_SPATZ4_FPU.group_mshr, enable=False)),
+    'terapool_spatz4_fpu_naive': replace(TERAPOOL_SPATZ4_FPU,
+        vlsu_burst=VlsuBurstConfig(enable=False, fabric_enable=False),
+        group_mshr=replace(TERAPOOL_SPATZ4_FPU.group_mshr, enable=False),
+        group_barrier=replace(TERAPOOL_SPATZ4_FPU.group_barrier, enable=False)),
 }
 
 DEFAULT_CONFIG = 'terapool'

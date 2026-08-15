@@ -43,8 +43,17 @@
  * hits until served_cnt reaches hold_subs_single (self-invalidate);
  * serve_timeout forces drains and cache expiry for liveness.
  *
- * Latency: +1 cycle spill register semantics on all four interfaces is folded
- * into the one-cycle door decision + one-cycle port handoffs.
+ * Latency: +1 cycle spill register semantics on req_out/resp_in/resp_out
+ * (RTL defaults). The req_in input spill is bypassed in the shipping RTL
+ * (C2, 2026-08-14: group_mshr_spill_req_in=0 — the tile already registers
+ * its request output); model knob spill_req_in defaults to 0 accordingly.
+ *
+ * Runtime configuration (mempool_group_mshr_cfg.sv, 2026-08-15): SW writes
+ * the CSRs through the group barrier port's bank-3 op encoding; the barrier
+ * forwards them on the cfg_in port. enable gates merge/alloc only;
+ * hold_subs_*==1 bypasses that class; bank-hash writes are refused while
+ * entries are resident; refusals set sticky status bits read back via a
+ * bank-3 load.
  */
 
 #include <deque>
@@ -126,6 +135,14 @@ private:
     static vp::IoRespAck resp_out_resp(vp::Block *__this, vp::IoReq *req, int lane);
     static void door_handler(vp::Block *__this, vp::ClockEvent *event);
     static void hb_handler(vp::Block *__this, vp::ClockEvent *event);
+    // Runtime CSR port (mempool_group_mshr_cfg.sv): single slave fed by the
+    // group barrier's bank-3 decode. Always GRANTED; the response (ack for
+    // writes, status word for reads) leaves one cycle later via cfg_resp_event
+    // (never synchronously — same NI re-entrancy discipline as everywhere).
+    static vp::IoReqStatus cfg_req(vp::Block *__this, vp::IoReq *req, int itf);
+    static void cfg_resp_handler(vp::Block *__this, vp::ClockEvent *event);
+    void cfg_apply(int idx, bool is_write, uint32_t data, uint32_t *rdata);
+    bool mshr_busy() const;
     void reset(bool active) override { if (active) this->hb_event.enqueue(65536); }
 
     // ---------------- door (request path)
@@ -169,8 +186,22 @@ private:
     int nb_groups;
     int max_burst_words;
     int nb_banks;
-    int spill;   // 1: +1-cycle spill register on all four interfaces (RTL
-                 // SpillReqIn/Out, SpillRespIn/Out all default 1). 0: off.
+    int spill;   // 1: +1-cycle spill register on req_out/resp_in/resp_out
+                 // (RTL SpillReqOut/SpillRespIn/SpillRespOut default 1). 0: off.
+    int spill_req_in; // req_in input register (RTL group_mshr_spill_req_in).
+                 // Default 0 since the 2026-08-14 C2 commit: the tile already
+                 // registers its request output, so the MSHR's own input spill
+                 // was bypassed (5,312 flops/group).
+
+    // ---------------- runtime CSR file (mempool_group_mshr_cfg.sv)
+    // Written by SW through the group barrier's bank-3 op encoding. The live
+    // knob members above ARE the CSR storage: writes update them in place and
+    // subsequent door/alloc/timeout decisions observe the new values, exactly
+    // like the RTL's cfg_i wires. cfg_enable gates merge/alloc only (the RTL's
+    // req_can_merge eligibility gate); resident entries keep draining.
+    bool cfg_enable;          // reset value = cfg_enable_reset property
+    uint32_t cfg_status = 0;  // sticky: bit0 BANK_BUSY, bit1 RANGE,
+                              // bit2 TIMEOUT_ZERO, bit3 BAD_INDEX
 
     // ---------------- state
     std::vector<Entry> entries;               // num_entries
@@ -211,10 +242,13 @@ private:
     vp::IoMaster *resp_out_itfs = nullptr;
     vp::ClockEvent fsm_event{this, &GroupMshr::door_handler};
     vp::ClockEvent hb_event{this, &GroupMshr::hb_handler};
+    vp::ClockEvent cfg_resp_event{this, &GroupMshr::cfg_resp_handler};
+    std::deque<L1NocFlit *> cfg_resp_queue;
     std::vector<std::unique_ptr<vp::IoSlave>> req_in_v;
     std::vector<std::unique_ptr<vp::IoMaster>> req_out_v;
     std::vector<std::unique_ptr<vp::IoSlave>> resp_in_v;
     std::vector<std::unique_ptr<vp::IoMaster>> resp_out_v;
+    std::unique_ptr<vp::IoSlave> cfg_in;
 };
 
 // ---------------------------------------------------------------------------
@@ -245,6 +279,12 @@ GroupMshr::~GroupMshr()
         fprintf(f, " | single_subs:");
         for (int k = 1; k <= 8; k++) fprintf(f, " %d:%lu", k, (unsigned long)this->stat_ret_single_subs[k]);
         fprintf(f, "\n");
+        fprintf(f, "  %s cfg: enable=%d merge_reqs=%d hss=%d hsb=%d hws=%d hwb=%d st=%d bss=%d bsb=%d bbb=%d status=0x%x\n",
+            this->get_path().c_str(), (int)this->cfg_enable, this->merge_reqs,
+            this->hold_subs_single, this->hold_subs_burst,
+            this->hold_window_single, this->hold_window_burst, this->serve_timeout,
+            this->bank_shift_single, this->bank_shift_burst, this->bank_burst_bits,
+            this->cfg_status);
         fclose(f);
     }
 }
@@ -278,6 +318,8 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->max_burst_words = cfg->get_int("max_burst_words");
     this->nb_banks = this->num_entries / this->ways_per_bank;
     this->spill = cfg->get_int("spill");
+    this->spill_req_in = cfg->get_int("spill_req_in");
+    this->cfg_enable = cfg->get_int("cfg_enable_reset") != 0;
 
     this->entries.resize(this->num_entries);
     this->bank_ways.resize(this->nb_banks);
@@ -312,6 +354,166 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
             &GroupMshr::resp_out_retry, &GroupMshr::resp_out_resp));
         this->new_master_port("resp_out_" + std::to_string(i), this->resp_out_v.back().get());
     }
+
+    // Runtime CSR port (fed by the group barrier's bank-3 decode).
+    this->cfg_in = std::make_unique<vp::IoSlave>(0, &GroupMshr::cfg_req, nullptr);
+    this->new_slave_port("cfg_in", this->cfg_in.get());
+}
+
+// ---------------------------------------------------------------------------
+// Runtime CSR file (mempool_group_mshr_cfg.sv). CSR indices mirror
+// mempool_pkg.sv MSHR_CSR_* / software/runtime/mshr_cfg.h:
+//   0 ENABLE, 1 HOLD_SUBS_SINGLE, 2 HOLD_SUBS_BURST, 3 HOLD_WINDOW_SINGLE,
+//   4 HOLD_WINDOW_BURST, 5 BANK_SHIFT_SINGLE, 6 BANK_SHIFT_BURST,
+//   7 BANK_BURST_BITS, 8 SERVE_TIMEOUT, 15 STATUS (write: clear sticky).
+// ---------------------------------------------------------------------------
+#define MSHR_CSR_ENABLE             0
+#define MSHR_CSR_HOLD_SUBS_SINGLE   1
+#define MSHR_CSR_HOLD_SUBS_BURST    2
+#define MSHR_CSR_HOLD_WINDOW_SINGLE 3
+#define MSHR_CSR_HOLD_WINDOW_BURST  4
+#define MSHR_CSR_BANK_SHIFT_SINGLE  5
+#define MSHR_CSR_BANK_SHIFT_BURST   6
+#define MSHR_CSR_BANK_BURST_BITS    7
+#define MSHR_CSR_SERVE_TIMEOUT      8
+#define MSHR_CSR_STATUS             15
+
+#define MSHR_STATUS_BANK_BUSY    (1u << 0)
+#define MSHR_STATUS_RANGE        (1u << 1)
+#define MSHR_STATUS_TIMEOUT_ZERO (1u << 2)
+#define MSHR_STATUS_BAD_INDEX    (1u << 3)
+// HoldCntHwMax (mempool_pkg::MshrCfgHoldCntMax) and the bank-shift range.
+#define MSHR_CFG_HOLD_CNT_MAX 2047
+#define MSHR_CFG_SHIFT_MIN 5
+#define MSHR_CFG_SHIFT_MAX 10
+
+bool GroupMshr::mshr_busy() const
+{
+    // The bank-hash CSRs are refused with entries resident: the bank index
+    // both places and looks up an entry, so re-hashing mid-flight would
+    // shadow a live line.
+    for (const Entry &e : this->entries)
+    {
+        if (e.valid)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void GroupMshr::cfg_apply(int idx, bool is_write, uint32_t data, uint32_t *rdata)
+{
+    *rdata = 0;
+    if (!is_write)
+    {
+        // The RTL's group decode routes only WRITES to the CSR file; a bank-3
+        // load there decodes as a barrier arrive. The model instead returns
+        // the CSR file's read value — the documented intent of
+        // mshr_cfg_status() (the RTL's read path has no data source and only
+        // completes via the barrier watchdog, which terapool disables).
+        *rdata = (idx == MSHR_CSR_STATUS) ? this->cfg_status : 0;
+        return;
+    }
+
+    switch (idx)
+    {
+    case MSHR_CSR_ENABLE:
+        this->cfg_enable = (data & 1) != 0;
+        break;
+    case MSHR_CSR_HOLD_SUBS_SINGLE:
+        if (data >= 1 && data <= (uint32_t)this->merge_reqs) this->hold_subs_single = (int)data;
+        else this->cfg_status |= MSHR_STATUS_RANGE;
+        break;
+    case MSHR_CSR_HOLD_SUBS_BURST:
+        if (data >= 1 && data <= (uint32_t)this->merge_reqs) this->hold_subs_burst = (int)data;
+        else this->cfg_status |= MSHR_STATUS_RANGE;
+        break;
+    case MSHR_CSR_HOLD_WINDOW_SINGLE:
+        if (data <= MSHR_CFG_HOLD_CNT_MAX) this->hold_window_single = (int)data;
+        else this->cfg_status |= MSHR_STATUS_RANGE;
+        break;
+    case MSHR_CSR_HOLD_WINDOW_BURST:
+        if (data <= MSHR_CFG_HOLD_CNT_MAX) this->hold_window_burst = (int)data;
+        else this->cfg_status |= MSHR_STATUS_RANGE;
+        break;
+    case MSHR_CSR_BANK_SHIFT_SINGLE:
+        if (this->mshr_busy()) this->cfg_status |= MSHR_STATUS_BANK_BUSY;
+        else if (data < MSHR_CFG_SHIFT_MIN || data > MSHR_CFG_SHIFT_MAX) this->cfg_status |= MSHR_STATUS_RANGE;
+        else this->bank_shift_single = (int)data;
+        break;
+    case MSHR_CSR_BANK_SHIFT_BURST:
+        if (this->mshr_busy()) this->cfg_status |= MSHR_STATUS_BANK_BUSY;
+        else if (data < MSHR_CFG_SHIFT_MIN || data > MSHR_CFG_SHIFT_MAX) this->cfg_status |= MSHR_STATUS_RANGE;
+        else this->bank_shift_burst = (int)data;
+        break;
+    case MSHR_CSR_BANK_BURST_BITS:
+        if (this->mshr_busy()) this->cfg_status |= MSHR_STATUS_BANK_BUSY;
+        else this->bank_burst_bits = (int)(data & 1);
+        break;
+    case MSHR_CSR_SERVE_TIMEOUT:
+        if (data > MSHR_CFG_HOLD_CNT_MAX)
+        {
+            this->cfg_status |= MSHR_STATUS_RANGE;
+        }
+        // serve_timeout=0 pins a CACHED/RESP_HOLD way forever: the model's
+        // response cache is never reclaimable (CacheReclaimable=0), so
+        // ServeTimeoutMustBeNonZero is always set and 0 is always refused
+        // (mirrors the RTL's elaboration guard at mempool_group_mshr.sv).
+        else if (data == 0)
+        {
+            this->cfg_status |= MSHR_STATUS_TIMEOUT_ZERO;
+        }
+        else
+        {
+            this->serve_timeout = (int)data;
+        }
+        break;
+    case MSHR_CSR_STATUS:
+        this->cfg_status = 0;
+        break;
+    default:
+        this->cfg_status |= MSHR_STATUS_BAD_INDEX;
+        break;
+    }
+
+    this->trace.msg(vp::Trace::LEVEL_TRACE,
+        "MSHR_CSR idx=%d wen=%d data=0x%x status=0x%x\n",
+        idx, (int)is_write, data, this->cfg_status);
+}
+
+vp::IoReqStatus GroupMshr::cfg_req(vp::Block *__this, vp::IoReq *req, int)
+{
+    auto *_this = static_cast<GroupMshr *>(__this);
+    auto *flit = static_cast<L1NocFlit *>(req);
+
+    int idx = (int)(flit->get_addr() >> 2) & 0xF;
+    bool is_write = flit->get_is_write();
+    uint32_t data = 0;
+    if (is_write && flit->get_data() != nullptr && flit->get_size() >= 4)
+    {
+        data = *(uint32_t *)flit->get_data();
+    }
+    uint32_t rdata = 0;
+    _this->cfg_apply(idx, is_write, data, &rdata);
+    if (!is_write && flit->get_data() != nullptr && flit->get_size() >= 4)
+    {
+        *(uint32_t *)flit->get_data() = rdata;
+    }
+    _this->cfg_resp_queue.push_back(flit);
+    _this->cfg_resp_event.enqueue(1);
+    return vp::IO_REQ_GRANTED;
+}
+
+void GroupMshr::cfg_resp_handler(vp::Block *__this, vp::ClockEvent *)
+{
+    auto *_this = static_cast<GroupMshr *>(__this);
+    while (!_this->cfg_resp_queue.empty())
+    {
+        L1NocFlit *flit = _this->cfg_resp_queue.front();
+        _this->cfg_resp_queue.pop_front();
+        _this->cfg_in->resp(flit);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -340,11 +542,12 @@ vp::IoReqStatus GroupMshr::req_in(vp::Block *__this, vp::IoReq *req, int lane)
     auto *_this = static_cast<GroupMshr *>(__this);
     auto *flit = static_cast<L1NocFlit *>(req);
 
-    // req_in spill register (SpillReqIn): a new flit fills the register and is
-    // only processed from the NEXT cycle (when the producer resends it after
-    // our retry). A flit already in the register re-presents immediately on
-    // retry, so stall-denies do NOT pay the delay again.
-    if (_this->spill)
+    // req_in spill register (SpillReqIn, bypassed in the shipping RTL since
+    // the C2 commit — group_mshr_spill_req_in=0): a new flit fills the
+    // register and is only processed from the NEXT cycle (when the producer
+    // resends it after our retry). A flit already in the register re-presents
+    // immediately on retry, so stall-denies do NOT pay the delay again.
+    if (_this->spill_req_in)
     {
         int st = _this->req_spill_state[lane];
         if (st == 0)
@@ -414,6 +617,22 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
     if (is_load && !is_burst && !this->enable_single)
     {
         mergeable = false;
+    }
+    // Runtime bypass (mempool_group_mshr_cfg, wired into req_can_merge in the
+    // RTL — the single eligibility gate for both merging and allocation):
+    //  * cfg_enable = 0       -> the whole MSHR is bypassed; resident entries
+    //                            keep capturing/draining (quiesce-drain flow).
+    //  * hold_subs_* == 1     -> that class does not merge (a 1-way-shared
+    //                            operand has nothing to merge with; holding it
+    //                            only guarantees a full-window stall).
+    if (is_load)
+    {
+        bool class_bypass = is_burst ? (this->hold_subs_burst <= 1)
+                                     : (this->hold_subs_single <= 1);
+        if (!this->cfg_enable || class_bypass)
+        {
+            mergeable = false;
+        }
     }
 
     int tgt_group = (int)((addr >> 10) & (uint32_t)(this->nb_groups - 1));
@@ -895,7 +1114,7 @@ void GroupMshr::door_handler(vp::Block *__this, vp::ClockEvent *)
 {
     auto *_this = static_cast<GroupMshr *>(__this);
 
-    if (_this->spill)
+    if (_this->spill_req_in)
     {
         // req_in spill: registers that filled last cycle present now — wake the
         // producer to resend so the door can process them.
@@ -907,6 +1126,9 @@ void GroupMshr::door_handler(vp::Block *__this, vp::ClockEvent *)
                 _this->req_in_v[lane]->retry(vp::IO_RETRY_ANY);
             }
         }
+    }
+    if (_this->spill)
+    {
         // resp_in spill: beats captured in a PREVIOUS cycle become visible to
         // the drain (cycle-gated so a same-cycle fsm(0) can't leak them early).
         int64_t now = _this->clock.get_cycles();

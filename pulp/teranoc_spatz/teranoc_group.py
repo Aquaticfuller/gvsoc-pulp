@@ -120,19 +120,26 @@ class TeranocGroup(st.Component):
                 stall_on_resp=arch.group_mshr.stall_on_resp,
                 bypass_track_ways=arch.group_mshr.bypass_track_ways,
                 spill=int(os.environ.get('TERANOC_MSHR_SPILL', 1)),
+                spill_req_in=int(os.environ.get('TERANOC_MSHR_SPILL_REQ_IN', 0)),
+                cfg_enable_reset=int(os.environ.get('TERANOC_MSHR_CFG_ENABLE_RESET', 1)),
                 nb_groups=arch.nb_groups,
                 max_burst_words=arch.vlsu_burst.max_burst_words)
 
         # Group fine-grained barrier (teranoc_spatz): a held-response slave on
         # the intra-group LIC, diverting barrier-window addresses (within-tile
         # word in [base_word, +num_barriers)). Required by the burst-merge
-        # GEMM's per-p-iteration group sync (GBAR_PLOOP).
+        # GEMM's per-p-iteration group sync (GBAR_PLOOP). Also decodes the
+        # bank-3 MSHR CSR accesses (mempool_group_mshr_cfg) and forwards them
+        # to the group MSHR when present.
         group_barrier = None
         if arch.group_barrier.enable:
             group_barrier = GroupBarrier(self, 'group_barrier',
                 nb_tiles_per_group=arch.nb_tiles_per_group,
                 num_barriers=arch.group_barrier.num_barriers,
-                base_word=arch.group_barrier.base_word)
+                base_word=arch.group_barrier.base_word,
+                mshr_present=(group_mshr is not None))
+            if group_mshr is not None:
+                group_barrier.o_MSHR_CFG(group_mshr.i_CFG())
 
         # L1 NoC Request Router Remapper
         l1_noc_req_remapper = L1NocRouterRemapper(self, 'l1_noc_req_remapper',
