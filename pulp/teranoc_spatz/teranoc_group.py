@@ -120,6 +120,8 @@ class TeranocGroup(st.Component):
                 stall_on_resp=arch.group_mshr.stall_on_resp,
                 bypass_track_ways=arch.group_mshr.bypass_track_ways,
                 spill=int(os.environ.get('TERANOC_MSHR_SPILL', 1)),
+                # 0 = shipping RTL (C2). Timing-sensitivity at the margins —
+                # see group_mshr.py; the testset pins per-test values.
                 spill_req_in=int(os.environ.get('TERANOC_MSHR_SPILL_REQ_IN', 0)),
                 cfg_enable_reset=int(os.environ.get('TERANOC_MSHR_CFG_ENABLE_RESET', 1)),
                 nb_groups=arch.nb_groups,

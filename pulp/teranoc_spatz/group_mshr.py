@@ -37,6 +37,11 @@ class GroupMshr(gvsoc.systree.Component):
             bank_shift_single: int = 9, bank_shift_burst: int = 7, bank_burst_bits: int = 1,
             serve_timeout: int = 255, resp_cache: bool = True,
             stall_on_resp: bool = True, bypass_track_ways: int = 4,
+            # spill_req_in: 0 = shipping RTL (C2 bypasses the input register).
+            # Model timing-sensitivity at the margins: lone-load latency
+            # traffic crawls at 0, 512x512x128-CSR crawls at 1 (both
+            # >10x, correctness unaffected). Default 0 (RTL); the regression
+            # testset pins per-test values into their validated regimes.
             spill: int = 1, spill_req_in: int = 0, cfg_enable_reset: int = 1,
             nb_groups: int = 16, max_burst_words: int = 16):
         super().__init__(parent, name)
