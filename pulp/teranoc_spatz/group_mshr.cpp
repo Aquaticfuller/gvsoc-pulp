@@ -143,6 +143,27 @@ private:
     static void cfg_resp_handler(vp::Block *__this, vp::ClockEvent *event);
     void cfg_apply(int idx, bool is_write, uint32_t data, uint32_t *rdata);
     bool mshr_busy() const;
+    // Auto-bypass: record a stall-miss for class cls (0=single, 1=burst).
+    void auto_stall_miss(int cls)
+    {
+        if (!this->auto_bypass)
+        {
+            return;
+        }
+        this->stat_auto_stall[cls]++;
+        if (this->miss_streak[cls] < 255)
+        {
+            this->miss_streak[cls]++;
+        }
+        if (!this->dyn_bypass[cls] && this->miss_streak[cls] >= this->auto_bypass_threshold)
+        {
+            this->dyn_bypass[cls] = true;
+            this->stat_auto_engaged[cls]++;
+            this->trace.msg(vp::Trace::LEVEL_TRACE,
+                "MSHR_AUTO_BYPASS class=%d engaged (streak %d)\n",
+                cls, this->miss_streak[cls]);
+        }
+    }
     void reset(bool active) override { if (active) this->hb_event.enqueue(65536); }
 
     // ---------------- door (request path)
@@ -202,6 +223,28 @@ private:
     bool cfg_enable;          // reset value = cfg_enable_reset property
     uint32_t cfg_status = 0;  // sticky: bit0 BANK_BUSY, bit1 RANGE,
                               // bit2 TIMEOUT_ZERO, bit3 BAD_INDEX
+
+    // ---------------- adaptive auto-bypass (EXPERIMENTAL, off by default)
+    // Per-class (0=single, 1=burst) stall detector: a held entry whose
+    // window expires below its early-release target, or a RESP_HOLD whose
+    // serve_timeout expires below it, increments the class's miss streak;
+    // threshold consecutive misses bypass the class at the door (straight
+    // to the NoC, like cfg_enable=0 but per class). Any merge success
+    // clears the streak and the bypass instantly; while bypassed, every
+    // auto_bypass_probe-th request of the class probes (allocates) so a
+    // traffic change re-engages merging. Motivation: the win2047 collapse
+    // (B-share-1 shapes: hold_subs_burst unreachable, every burst rides
+    // the full window, +1,900% on the RTL) — the hwb=0 pin is the static
+    // version of this; the auto rule removes the per-shape pin.
+    int auto_bypass = 0;          // master switch (property)
+    int auto_bypass_threshold = 4;
+    int auto_bypass_probe = 16;
+    int auto_probe_window = 255;  // probe hold window (ticks; 255 -> 240 cyc)
+    int miss_streak[2] = {0, 0};
+    bool dyn_bypass[2] = {false, false};
+    int probe_cnt[2] = {0, 0};
+    uint64_t stat_auto_engaged[2] = {0, 0};   // bypass engagements per class
+    uint64_t stat_auto_stall[2] = {0, 0};     // stall-misses counted
 
     // ---------------- state
     std::vector<Entry> entries;               // num_entries
@@ -285,6 +328,14 @@ GroupMshr::~GroupMshr()
             this->hold_window_single, this->hold_window_burst, this->serve_timeout,
             this->bank_shift_single, this->bank_shift_burst, this->bank_burst_bits,
             this->cfg_status);
+        if (this->auto_bypass)
+        {
+            fprintf(f, "  %s auto_bypass: engaged_s=%lu engaged_b=%lu stalls_s=%lu stalls_b=%lu final_bypass=%d/%d\n",
+                this->get_path().c_str(),
+                (unsigned long)this->stat_auto_engaged[0], (unsigned long)this->stat_auto_engaged[1],
+                (unsigned long)this->stat_auto_stall[0], (unsigned long)this->stat_auto_stall[1],
+                (int)this->dyn_bypass[0], (int)this->dyn_bypass[1]);
+        }
         fclose(f);
     }
 }
@@ -320,6 +371,10 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->spill = cfg->get_int("spill");
     this->spill_req_in = cfg->get_int("spill_req_in");
     this->cfg_enable = cfg->get_int("cfg_enable_reset") != 0;
+    this->auto_bypass = cfg->get_int("auto_bypass");
+    this->auto_bypass_threshold = cfg->get_int("auto_bypass_threshold");
+    this->auto_bypass_probe = cfg->get_int("auto_bypass_probe");
+    this->auto_probe_window = cfg->get_int("auto_probe_window");
 
     this->entries.resize(this->num_entries);
     this->bank_ways.resize(this->nb_banks);
@@ -625,6 +680,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
     //  * hold_subs_* == 1     -> that class does not merge (a 1-way-shared
     //                            operand has nothing to merge with; holding it
     //                            only guarantees a full-window stall).
+    bool is_probe = false;   // auto-bypass probe request (short hold window)
     if (is_load)
     {
         bool class_bypass = is_burst ? (this->hold_subs_burst <= 1)
@@ -632,6 +688,24 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
         if (!this->cfg_enable || class_bypass)
         {
             mergeable = false;
+        }
+        // Adaptive auto-bypass: a class with a proven stall streak goes
+        // straight to the NoC, with every Nth request probing to re-engage.
+        if (mergeable && this->auto_bypass)
+        {
+            int cls = is_burst ? 1 : 0;
+            if (this->dyn_bypass[cls])
+            {
+                if (++this->probe_cnt[cls] >= this->auto_bypass_probe)
+                {
+                    this->probe_cnt[cls] = 0;   // probe: keep mergeable
+                    is_probe = true;
+                }
+                else
+                {
+                    mergeable = false;
+                }
+            }
         }
     }
 
@@ -657,6 +731,13 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             hit->subs.push_back(Sub{tile, port, flit, true, flit->burst, flit->src_x, flit->src_y, flit->initiator_addr});
             this->stat_merged++;
             if (is_burst) this->stat_merged_burst++; else this->stat_merged_single++;
+            // Merge success: clear the class's stall streak and bypass.
+            if (this->auto_bypass)
+            {
+                int cls = is_burst ? 1 : 0;
+                this->miss_streak[cls] = 0;
+                this->dyn_bypass[cls] = false;
+            }
             // RESP_HOLD reaching its subscriber target re-activates the drain.
             // Re-arm the mask for the full subscriber set (it was armed for
             // the first subscriber only at capture time).
@@ -761,10 +842,17 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
                 lane, (unsigned long)addr, (int)(e - this->entries.data()), burst_len);
 
             // Hold window: bursts are held to catch late merges (singles
-            // issue immediately).
-            if (is_burst && this->hold_window_burst > 0)
+            // issue immediately). Auto-bypass probes arm a short window:
+            // a probe only needs to catch barrier-aligned same-phase merges
+            // (tens of cycles), and a hopeless probe must be cheap.
+            int window = this->hold_window_burst;
+            if (is_probe && this->auto_probe_window < window)
             {
-                int ticks = this->hold_window_burst >> this->hold_prescale_w;
+                window = this->auto_probe_window;
+            }
+            if (is_burst && window > 0)
+            {
+                int ticks = window >> this->hold_prescale_w;
                 if (ticks <= 0) ticks = 1;
                 e->release_cycle = this->clock.get_cycles() + (int64_t)ticks *
                     (1 << this->hold_prescale_w);
@@ -936,6 +1024,18 @@ void GroupMshr::replay_holds()
         if (e.release_cycle >= 0 && now < e.release_cycle)
         {
             continue;
+        }
+        // Window expiry below the early-release target = a stall-miss for the
+        // auto-bypass (entries released AT the target have subs >= target and
+        // don't count; release_cycle < 0 means no window was armed).
+        if (e.release_cycle >= 0)
+        {
+            int cls = e.burst_len > 1 ? 1 : 0;
+            int target = cls ? this->hold_subs_burst : this->hold_subs_single;
+            if ((int)e.subs.size() < target)
+            {
+                this->auto_stall_miss(cls);
+            }
         }
         this->forward_fetch(&e);
         this->replay_rr = (i + 1) % n;
@@ -1421,6 +1521,11 @@ void GroupMshr::serve_timeouts(int64_t cycles)
         {
             // Serve whatever subscribers exist now — re-arm the mask for the
             // FULL current set (armed for the first subscriber at capture).
+            if ((int)e.subs.size() < this->hold_subs_single)
+            {
+                // serve_timeout expiry below the release target = stall-miss.
+                this->auto_stall_miss(0);
+            }
             e.state = ST_DRAIN_RESP;
             e.served_mask = (1u << e.subs.size()) - 1;
             e.drain_not_before = this->clock.get_cycles() + this->spill;

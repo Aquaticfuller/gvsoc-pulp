@@ -43,6 +43,8 @@ class GroupMshr(gvsoc.systree.Component):
             # >10x, correctness unaffected). Default 0 (RTL); the regression
             # testset pins per-test values into their validated regimes.
             spill: int = 1, spill_req_in: int = 0, cfg_enable_reset: int = 1,
+            auto_bypass: int = 0, auto_bypass_threshold: int = 4,
+            auto_bypass_probe: int = 16, auto_probe_window: int = 255,
             nb_groups: int = 16, max_burst_words: int = 16):
         super().__init__(parent, name)
 
@@ -72,6 +74,10 @@ class GroupMshr(gvsoc.systree.Component):
             'spill': spill,
             'spill_req_in': spill_req_in,
             'cfg_enable_reset': cfg_enable_reset,
+            'auto_bypass': auto_bypass,
+            'auto_bypass_threshold': auto_bypass_threshold,
+            'auto_bypass_probe': auto_bypass_probe,
+            'auto_probe_window': auto_probe_window,
             'nb_groups': nb_groups,
             'max_burst_words': max_burst_words,
         })

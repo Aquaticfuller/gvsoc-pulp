@@ -124,6 +124,12 @@ class TeranocGroup(st.Component):
                 # see group_mshr.py; the testset pins per-test values.
                 spill_req_in=int(os.environ.get('TERANOC_MSHR_SPILL_REQ_IN', 0)),
                 cfg_enable_reset=int(os.environ.get('TERANOC_MSHR_CFG_ENABLE_RESET', 1)),
+                # Adaptive per-class bypass (experimental): stall-streak
+                # counter engages a dynamic bypass; any merge clears it.
+                auto_bypass=int(os.environ.get('TERANOC_MSHR_AUTO_BYPASS', 0)),
+                auto_bypass_threshold=int(os.environ.get('TERANOC_MSHR_AUTO_BYPASS_THRESHOLD', 4)),
+                auto_bypass_probe=int(os.environ.get('TERANOC_MSHR_AUTO_BYPASS_PROBE', 16)),
+                auto_probe_window=int(os.environ.get('TERANOC_MSHR_AUTO_PROBE_WINDOW', 255)),
                 nb_groups=arch.nb_groups,
                 max_burst_words=arch.vlsu_burst.max_burst_words)
 
