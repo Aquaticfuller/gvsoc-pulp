@@ -145,6 +145,12 @@ class TeranocGroup(st.Component):
                 nb_tiles_per_group=arch.nb_tiles_per_group,
                 num_barriers=arch.group_barrier.num_barriers,
                 base_word=arch.group_barrier.base_word,
+                # window word field sits above the group field in the L1
+                # word-interleave (14 at 4x4, 16 at 8x8)
+                word_shift=(int(math.log2(arch.l1_bank_width))
+                    + int(math.log2(arch.nb_banks_per_tile))
+                    + int(math.log2(arch.nb_tiles_per_group))
+                    + int(math.log2(arch.nb_groups))),
                 mshr_present=(group_mshr is not None))
             if group_mshr is not None:
                 group_barrier.o_MSHR_CFG(group_mshr.i_CFG())

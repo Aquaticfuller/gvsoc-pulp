@@ -40,6 +40,7 @@ from pulp.teranoc_v2.dpi_checker import TeranocDpiChecker
 from pulp.teranoc_v2.l2_interconnect.l2_address_scrambler import L2AddressScrambler
 from pulp.teranoc_v2.l2_interconnect.l2_noc import L2_noc
 from pulp.teranoc_v2.arch import CONFIGS, DEFAULT_CONFIG
+from pulp.floonoc_v2 import perimeter_map
 
 
 def _add_config_arg(parser):
@@ -189,129 +190,74 @@ class TeranocSystem(st.Component):
             for j in range(0, arch.nb_y_groups):
                 teranoc_cluster.o_AXI(i, j, 0, l2_noc.i_CLUSTER_WIDE_INPUT(i, j))
 
-        # L2 NoC -> HBM and peripherals
-        if arch.nb_x_groups == 2 and arch.nb_y_groups == 2:
+        # L2 NoC -> HBM and peripherals. The endpoint placement is DERIVED per
+        # mesh, not hand-tabled: pulp.floonoc_v2.perimeter_map ports the RTL's
+        # gen_perimeter_map.py (edge rule + interior minimum-distance pass +
+        # 2-opt), which reproduces the committed 4x4 numbering exactly (gated
+        # at import) and generalises to any legal power-of-two mesh
+        # (docs/scaleup/mesh_plan.md §3.6/§12-14). One L2 channel may share the
+        # periph router point (NI (1,0)) with the host/peripherals — channel 5
+        # at 4x4, 13 at 8x8 — falling out of the placement, never hardcoded.
+        placement, _served = perimeter_map.assign(arch.nb_x_groups, arch.nb_y_groups,
+                                                  arch.nb_l2_banks)
+        ni_xy = perimeter_map.placement_as_ni(placement, arch.nb_x_groups,
+                                              arch.nb_y_groups)
+        periph_ch = perimeter_map.periph_channel(placement)
+
+        if periph_ch is None:
+            # Degenerate case (2x2): no L2 channel shares the periph point; the
+            # soc demux is a pure latency/shaping stage.
             soc_demux = Router(self, 'soc_demux', config=RouterConfig(kind=KIND_BANDWIDTH,
                     bandwidth=axi_data_width, latency=4))
             soc_beat_adapter = IoV2BeatToSingleReqAdapter(self, 'soc_beat_adapter',
                 beat_width=axi_data_width, max_read_bursts=32)
-
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(0), x=0, y=1)  # HBM bank 0
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(1), x=0, y=2)  # HBM bank 1
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(2), x=3, y=1)  # HBM bank 2
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(3), x=3, y=2)  # HBM bank 3
-            l2_noc.o_WIDE_BIND(
-                soc_beat_adapter.i_INPUT(), x=1, y=0)  # soc
+            for ch in sorted(ni_xy):
+                x, y = ni_xy[ch]
+                l2_noc.o_WIDE_BIND(l2_mem.i_BANK_INPUT(ch), x=x, y=y)
+                l2_noc.o_MAP(base=0x80000000+l2_bank_size*ch, size=l2_bank_size,
+                    x=x, y=y, name=f'hbm{ch}', rm_base=True)
+            l2_noc.o_WIDE_BIND(soc_beat_adapter.i_INPUT(), x=1, y=0)  # soc
             soc_beat_adapter.o_OUTPUT(soc_demux.i_INPUT(0))
-
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*0, size=l2_bank_size,
-                x=0, y=1, name='hbm0', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*1, size=l2_bank_size,
-                x=0, y=2, name='hbm1', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*2, size=l2_bank_size,
-                x=3, y=1, name='hbm2', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*3, size=l2_bank_size,
-                x=3, y=2, name='hbm3', rm_base=True)
             l2_noc.o_MAP(base=0x00000000, size=0x80000000, x=1, y=0, name='soc1', rm_base=False)
             l2_noc.o_MAP(base=0xA0000000, size=0x30000000, x=1, y=0, name='soc2', rm_base=False)
-
             soc_demux.o_MAP_DEFAULT(soc_ico.i_INPUT(), name='soc')
-
-        elif arch.nb_x_groups == 4 and arch.nb_y_groups == 4:
-            # HBM bank 5 shares this node with the host and the peripherals, so
-            # it is the only L2 bank behind an extra hop -- and the distributed
-            # DMA middle end is a stream_fork, so whatever paces group 5 paces
-            # all sixteen groups. The hardware split is combinational and allows
-            # four outstanding transactions per port. The router's stage floors
-            # at one cycle, so the input budget is two beats: the minimum that
-            # keeps that mandatory stage transparent.
-            hbm5_soc_demux = Router(self, 'hbm5_soc_demux', config=RouterConfig(kind=KIND_BEAT,
-                    width=axi_data_width, latency=0, max_pending_bursts_per_input=4,
+        else:
+            # The periph-shared L2 channel sits one hop behind the demux — and
+            # the distributed DMA middle end is a stream_fork, so whatever paces
+            # that channel paces every group. The hardware split is
+            # combinational and allows four outstanding transactions per port.
+            # The router's stage floors at one cycle, so the input budget is
+            # two beats: the minimum that keeps that mandatory stage
+            # transparent.
+            periph_soc_demux = Router(self, 'periph_soc_demux', config=RouterConfig(
+                    kind=KIND_BEAT, width=axi_data_width, latency=0,
+                    max_pending_bursts_per_input=4,
                     max_input_pending_size=2 * axi_data_width))
-            hbm5_soc_beat_adapter = IoV2BeatToSingleReqAdapter(self, 'hbm5_soc_beat_adapter',
-                beat_width=axi_data_width, max_read_bursts=32)
+            periph_soc_beat_adapter = IoV2BeatToSingleReqAdapter(self,
+                'periph_soc_beat_adapter', beat_width=axi_data_width, max_read_bursts=32)
 
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(0), x=0, y=1)  # HBM bank 0
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(1), x=0, y=2)  # HBM bank 1
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(2), x=0, y=3)  # HBM bank 2
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(3), x=0, y=4)  # HBM bank 3
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(4), x=2, y=0)  # HBM bank 4
-            l2_noc.o_WIDE_BIND(hbm5_soc_demux.i_INPUT(0),
-                x=1, y=0)  # HBM bank 5 + soc
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(6), x=1, y=5)  # HBM bank 6
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(7), x=2, y=5)  # HBM bank 7
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(8), x=3, y=0)  # HBM bank 8
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(9), x=4, y=0)  # HBM bank 9
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(10), x=4, y=5)  # HBM bank 10
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(11), x=3, y=5)  # HBM bank 11
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(12), x=5, y=1)  # HBM bank 12
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(13), x=5, y=2)  # HBM bank 13
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(14), x=5, y=3)  # HBM bank 14
-            l2_noc.o_WIDE_BIND(
-                l2_mem.i_BANK_INPUT(15), x=5, y=4)  # HBM bank 15
+            for ch in sorted(ni_xy):
+                if ch == periph_ch:
+                    continue
+                x, y = ni_xy[ch]
+                l2_noc.o_WIDE_BIND(l2_mem.i_BANK_INPUT(ch), x=x, y=y)
+                l2_noc.o_MAP(base=0x80000000+l2_bank_size*ch, size=l2_bank_size,
+                    x=x, y=y, name=f'hbm{ch}', rm_base=True)
 
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*0, size=l2_bank_size,
-                x=0, y=1, name='hbm0', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*1, size=l2_bank_size,
-                x=0, y=2, name='hbm1', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*2, size=l2_bank_size,
-                x=0, y=3, name='hbm2', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*3, size=l2_bank_size,
-                x=0, y=4, name='hbm3', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*4, size=l2_bank_size,
-                x=2, y=0, name='hbm4', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*5, size=l2_bank_size,
-                x=1, y=0, name='hbm5', rm_base=False)
+            # The shared channel: the NoC delivers ABSOLUTE addresses (the
+            # demux re-decodes hbm vs soc windows), and the demux strips the
+            # base for the bank.
+            l2_noc.o_WIDE_BIND(periph_soc_demux.i_INPUT(0), x=1, y=0)
+            l2_noc.o_MAP(base=0x80000000+l2_bank_size*periph_ch, size=l2_bank_size,
+                x=1, y=0, name=f'hbm{periph_ch}', rm_base=False)
             l2_noc.o_MAP(base=0x00000000, size=0x80000000, x=1, y=0, name='soc1', rm_base=False)
             l2_noc.o_MAP(base=0xA0000000, size=0x30000000, x=1, y=0, name='soc2', rm_base=False)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*6, size=l2_bank_size,
-                x=1, y=5, name='hbm6', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*7, size=l2_bank_size,
-                x=2, y=5, name='hbm7', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*8, size=l2_bank_size,
-                x=3, y=0, name='hbm8', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*9, size=l2_bank_size,
-                x=4, y=0, name='hbm9', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*10, size=l2_bank_size,
-                x=4, y=5, name='hbm10', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*11, size=l2_bank_size,
-                x=3, y=5, name='hbm11', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*12, size=l2_bank_size,
-                x=5, y=1, name='hbm12', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*13, size=l2_bank_size,
-                x=5, y=2, name='hbm13', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*14, size=l2_bank_size,
-                x=5, y=3, name='hbm14', rm_base=True)
-            l2_noc.o_MAP(base=0x80000000+l2_bank_size*15, size=l2_bank_size,
-                x=5, y=4, name='hbm15', rm_base=True)
 
-            hbm5_soc_demux.o_MAP(l2_mem.i_BANK_INPUT(5), mapping=RouterMapping(name='hbm5',
-                    base=0x80000000+l2_bank_size*5, size=l2_bank_size, remove_base=True))
-            hbm5_soc_demux.o_MAP_DEFAULT(hbm5_soc_beat_adapter.i_INPUT(), name='soc')
-            hbm5_soc_beat_adapter.o_OUTPUT(soc_ico.i_INPUT())
-
-        else:
-            raise ValueError('teranoc_v2 preserves the v1 L2 endpoint topology, which '
-                'defines only 2x2 and 4x4 group meshes; '
-                f'got {arch.nb_x_groups}x{arch.nb_y_groups}')
+            periph_soc_demux.o_MAP(l2_mem.i_BANK_INPUT(periph_ch), mapping=RouterMapping(
+                name='hbm_periph', base=0x80000000+l2_bank_size*periph_ch, size=l2_bank_size,
+                remove_base=True))
+            periph_soc_demux.o_MAP_DEFAULT(periph_soc_beat_adapter.i_INPUT(), name='soc')
+            periph_soc_beat_adapter.o_OUTPUT(soc_ico.i_INPUT())
 
         # Peripheral interconnect
         soc_ico.o_MAP(periph_ico.i_INPUT(), mapping=RouterMapping(

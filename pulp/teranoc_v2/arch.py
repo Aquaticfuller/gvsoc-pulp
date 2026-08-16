@@ -25,7 +25,7 @@
 # nb_snitch_per_tile counts only Snitch cores. Heterogeneous tiles may carry
 # additional compute (RedMule, Spatz, …) which are not part of this number.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True)
@@ -141,12 +141,33 @@ class TeranocConfig:
         assert self.l1_bank_width & (self.l1_bank_width - 1) == 0, \
             "l1_bank_width must be a power of two"
 
+        # Legal-mesh guards (RTL docs/scaleup/mesh_plan.md §1.1/§12/§14):
+        # mesh coordinates ARE address bits (gid = x*NumY + y is a bit-field
+        # extract), so every mesh dim is a power of two. The L2 channel count
+        # selects a bit field (ScrambleBits = clog2(nb_l2_banks)), is bounded
+        # by the perimeter capacity 2*(nx+ny), and must divide the group count
+        # with a power-of-two share (bank = group >> log2(share)).
+        def _pow2(v):
+            return v > 0 and (v & (v - 1)) == 0
+        assert _pow2(self.nb_x_groups) and _pow2(self.nb_y_groups),             f"mesh dims must be powers of two, got {self.nb_x_groups}x{self.nb_y_groups}"
+        assert _pow2(self.nb_l2_banks),             f"nb_l2_banks must be a power of two, got {self.nb_l2_banks}"
+        perim = 2 * (self.nb_x_groups + self.nb_y_groups)
+        assert self.nb_l2_banks <= perim,             f"nb_l2_banks {self.nb_l2_banks} exceeds the {perim} perimeter attach points"
+        assert self.nb_groups % self.nb_l2_banks == 0,             f"{self.nb_groups} groups do not divide into {self.nb_l2_banks} L2 banks"
+        share = self.nb_groups // self.nb_l2_banks
+        assert _pow2(share), f"group/L2-bank sharing factor {share} must be a power of two"
+
         if self.l2_axi_interleave is None:
+            # RTL interleave law: granule = DmaRegionWidth * share, i.e.
+            # axi_width_interleaved = 16 * num_groups / l2_banks — at 4x4 the
+            # group field maps 1:1 onto banks; above, y-adjacent groups share
+            # a channel (mesh_plan §13).
             group_width = self.l1_bank_width * self.nb_banks_per_group
-            assert group_width % self.axi_data_width == 0, (
-                f"per-group L1 width {group_width} is not a multiple of "
+            granule = group_width * share
+            assert granule % self.axi_data_width == 0, (
+                f"L2 interleave granule {granule} is not a multiple of "
                 f"axi_data_width {self.axi_data_width}; set l2_axi_interleave explicitly")
-            object.__setattr__(self, 'l2_axi_interleave', group_width // self.axi_data_width)
+            object.__setattr__(self, 'l2_axi_interleave', granule // self.axi_data_width)
 
         assert self.l1_noc_router_input_fifo_depth > 0
         assert self.l1_noc_router_output_fifo_depth > 0
@@ -558,6 +579,13 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
 )
 
 
+TERAPOOL_SPATZ4_FPU_8X8 = replace(
+    TERAPOOL_SPATZ4_FPU,
+    nb_x_groups=8, nb_y_groups=8,
+    nb_l2_banks=32, l2_size=0x2000000, l2_axi_interleave=None,
+)
+
+
 CONFIGS = {
     'terapool':             TERAPOOL,
     'mempool':              MEMPOOL,
@@ -568,6 +596,9 @@ CONFIGS = {
     'minpool_spatz4_fpu':   MINPOOL_SPATZ4_FPU,
     'mempool_spatz4_fpu':   MEMPOOL_SPATZ4_FPU,
     'terapool_spatz4_fpu':  TERAPOOL_SPATZ4_FPU,
+    # 8x8 / 64-group / 1024-core mesh (RTL config/terapool_spatz4_fpu_8x8.mk):
+    # 32 L2 channels of 1 MB; y-adjacent group pairs share a channel.
+    'terapool_spatz4_fpu_8x8': TERAPOOL_SPATZ4_FPU_8X8,
 }
 
 DEFAULT_CONFIG = 'terapool'

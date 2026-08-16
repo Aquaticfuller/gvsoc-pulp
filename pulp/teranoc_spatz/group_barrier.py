@@ -30,7 +30,7 @@ class GroupBarrier(gvsoc.systree.Component):
 
     def __init__(self, parent: gvsoc.systree.Component, name: str,
             nb_tiles_per_group: int, num_barriers: int = 16, base_word: int = 240,
-            mshr_present: bool = False):
+            word_shift: int = 14, mshr_present: bool = False):
         super().__init__(parent, name)
 
         self.add_sources(['pulp/teranoc_spatz/group_barrier.cpp'])
@@ -38,6 +38,7 @@ class GroupBarrier(gvsoc.systree.Component):
             'nb_tiles_per_group': nb_tiles_per_group,
             'num_barriers': num_barriers,
             'base_word': base_word,
+            'word_shift': word_shift,
             'mshr_present': int(mshr_present),
         })
 

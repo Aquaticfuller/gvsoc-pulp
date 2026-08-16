@@ -24,7 +24,9 @@
  * LIC input: it diverts window requests and forwards everything else.
  *
  * Address decode (kernel gbar_base, sp-fmatmul.c): byte address =
- * word*2^14 | group*2^10 | tile*2^6 | bank*2^2 | byte. Window: word in
+ * word*2^word_shift | group*2^10 | tile*2^6 | bank*2^2 | byte, where
+ * word_shift = 10 + log2(nb_groups) (14 at 4x4, 16 at 8x8) is passed in
+ * by the generator. Window: word in
  * [base_word, base_word+num_barriers); struct = word - base_word; op = bank
  * field (addr>>2)&3: 0=ARRIVE (load), 1=WR_TARGET (store), 2=WR_MASK (store),
  * 3=MSHR CSR (store = config write, load = status read).
@@ -80,6 +82,11 @@ private:
     int nb_tiles;
     int num_barriers;
     int base_word;
+    // Barrier-window word field shift: 2 + log2(l1_bank_width) +
+    // log2(nb_banks_per_tile) + log2(nb_tiles_per_group) + log2(nb_groups)
+    // (the window sits above the group field in the L1 word-interleave).
+    // 14 at 4x4, 16 at 8x8 — derived and passed by the generator.
+    int word_shift;
     bool mshr_present;   // group MSHR instantiated (CSR forward target)
 
     // MSHR CSR forward (bank-3 accesses): copy flit -> originator awaiting
@@ -137,6 +144,7 @@ GroupBarrier::GroupBarrier(vp::ComponentConf &config) : vp::Component(config)
     this->nb_tiles = cfg->get_int("nb_tiles_per_group");
     this->num_barriers = cfg->get_int("num_barriers");
     this->base_word = cfg->get_int("base_word");
+    this->word_shift = cfg->get_int("word_shift");
     this->mshr_present = cfg->get_int("mshr_present") != 0;
 
     this->target.assign(this->num_barriers, 0);
@@ -174,7 +182,7 @@ vp::IoReqStatus GroupBarrier::in_req(vp::Block *__this, vp::IoReq *req, int tile
     auto *flit = static_cast<L1NocFlit *>(req);
 
     uint64_t addr = flit->get_addr();
-    uint32_t word = (uint32_t)((addr >> 14) & 0xFF);
+    uint32_t word = (uint32_t)((addr >> _this->word_shift) & 0xFF);
     if (word < (uint32_t)_this->base_word ||
         word >= (uint32_t)(_this->base_word + _this->num_barriers))
     {
@@ -205,7 +213,7 @@ vp::IoReqStatus GroupBarrier::passthrough(L1NocFlit *flit, int tile)
 vp::IoReqStatus GroupBarrier::handle_barrier(L1NocFlit *flit, int tile)
 {
     uint64_t addr = flit->get_addr();
-    int s = (int)((addr >> 14) & 0xFF) - this->base_word;
+    int s = (int)((addr >> this->word_shift) & 0xFF) - this->base_word;
     int op = (int)((addr >> 2) & 0x3);
     bool is_load = !flit->get_is_write() && flit->get_opcode() == vp::READ;
 
