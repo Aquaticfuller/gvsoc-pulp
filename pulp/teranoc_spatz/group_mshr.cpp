@@ -59,6 +59,7 @@
 #include <deque>
 #include <map>
 #include <vector>
+#include <cstdlib>
 
 #include <vp/vp.hpp>
 #include <vp/itf/io_v2.hpp>
@@ -275,6 +276,7 @@ private:
     uint64_t stat_ret_burst_1 = 0, stat_ret_burst_2p = 0;
     uint64_t stat_alloc_single = 0, stat_alloc_burst = 0;
     uint64_t stat_bypass_single = 0, stat_bypass_burst = 0;
+    uint64_t stat_deny_stall = 0, stat_deny_meta = 0, stat_deny_slot = 0;
     uint64_t stat_ret_burst_subs[9] = {0};
     uint64_t stat_ret_single_subs[9] = {0};
 
@@ -322,6 +324,9 @@ GroupMshr::~GroupMshr()
         fprintf(f, " | single_subs:");
         for (int k = 1; k <= 8; k++) fprintf(f, " %d:%lu", k, (unsigned long)this->stat_ret_single_subs[k]);
         fprintf(f, "\n");
+        fprintf(f, "  %s denies: stall=%lu meta=%lu slot=%lu\n",
+            this->get_path().c_str(), (unsigned long)this->stat_deny_stall,
+            (unsigned long)this->stat_deny_meta, (unsigned long)this->stat_deny_slot);
         fprintf(f, "  %s cfg: enable=%d merge_reqs=%d hss=%d hsb=%d hws=%d hwb=%d st=%d bss=%d bsb=%d bbb=%d status=0x%x\n",
             this->get_path().c_str(), (int)this->cfg_enable, this->merge_reqs,
             this->hold_subs_single, this->hold_subs_burst,
@@ -785,6 +790,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
                     o.tgt_group == tgt_group &&
                     (int)o.subs.size() < this->merge_reqs)
                 {
+                    this->stat_deny_stall++;
                     this->lane_retry_owed[lane] = true;
                     this->fsm_event.enqueue(1);
                     return vp::IO_REQ_DENIED;
@@ -805,6 +811,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
                 if (o.valid && o.burst_len > 1 && !o.subs.empty() &&
                     o.subs[0].tile == tile)
                 {
+                    this->stat_deny_meta++;
                     this->lane_retry_owed[lane] = true;
                     this->fsm_event.enqueue(1);
                     return vp::IO_REQ_DENIED;
@@ -891,6 +898,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
 
         // Lost the allocation slot but the bank has a free way: stall the lane
         // a cycle (the winner's entry may merge us next cycle).
+        this->stat_deny_slot++;
         this->lane_retry_owed[lane] = true;
         this->fsm_event.enqueue(1);
         return vp::IO_REQ_DENIED;
@@ -1173,7 +1181,11 @@ void GroupMshr::hb_handler(vp::Block *__this, vp::ClockEvent *)
 {
     auto *_this = static_cast<GroupMshr *>(__this);
     static FILE *hb_f = nullptr;
-    if (!hb_f) hb_f = fopen("/tmp/mshr_hb.log", "a");
+    if (!hb_f)
+    {
+        const char *hb_path = getenv("TERANOC_MSHR_HB_PATH");
+        hb_f = fopen(hb_path ? hb_path : "/tmp/mshr_hb.log", "a");
+    }
     if (!hb_f) { _this->hb_event.enqueue(65536); return; }
 
     int nvalid = 0;
@@ -1190,10 +1202,12 @@ void GroupMshr::hb_handler(vp::Block *__this, vp::ClockEvent *)
     }
     last_sig[_this] = sig;
 
-    fprintf(hb_f, "HB cyc=%ld valid=%d reqs=%lu alloc=%lu merged=%lu bypass=%lu\n",
+    fprintf(hb_f, "HB cyc=%ld valid=%d reqs=%lu alloc=%lu merged=%lu bypass=%lu deny[stall=%lu meta=%lu slot=%lu]\n",
         (long)_this->clock.get_cycles(), nvalid,
         (unsigned long)_this->stat_reqs, (unsigned long)_this->stat_alloc,
-        (unsigned long)_this->stat_merged, (unsigned long)_this->stat_bypass);
+        (unsigned long)_this->stat_merged, (unsigned long)_this->stat_bypass,
+        (unsigned long)_this->stat_deny_stall, (unsigned long)_this->stat_deny_meta,
+        (unsigned long)_this->stat_deny_slot);
     for (int i = 0; i < _this->num_entries; i++)
     {
         Entry &e = _this->entries[i];
