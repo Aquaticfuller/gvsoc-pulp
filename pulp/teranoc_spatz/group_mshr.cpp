@@ -117,6 +117,9 @@ private:
         uint16_t arrived_mask = 0;
         uint16_t arrive_pending = 0;  // captured, not yet visible (resp_in spill)
         int64_t issue_cycle = 0;      // earliest fetch issue (req_out spill)
+        int64_t birth_cycle = 0;      // lifetime instrumentation
+        int64_t issued_cycle = -1;    // fetch actually issued
+        int64_t first_beat_cycle = -1;// first response beat visible
         int64_t drain_not_before = 0; // earliest head-beat delivery (resp_out spill)
         int resp_rd = 0;          // read cursor (word index being drained)
         int beats_arrived = 0;    // total beats captured
@@ -277,6 +280,8 @@ private:
     uint64_t stat_alloc_single = 0, stat_alloc_burst = 0;
     uint64_t stat_bypass_single = 0, stat_bypass_burst = 0;
     uint64_t stat_deny_stall = 0, stat_deny_meta = 0, stat_deny_slot = 0;
+    // Entry lifetime (alloc->issue->first beat->retire), in cycles.
+    uint64_t stat_lt_n = 0, stat_lt_hold = 0, stat_lt_flight = 0, stat_lt_drain = 0, stat_lt_total = 0;
     uint64_t stat_ret_burst_subs[9] = {0};
     uint64_t stat_ret_single_subs[9] = {0};
 
@@ -324,6 +329,15 @@ GroupMshr::~GroupMshr()
         fprintf(f, " | single_subs:");
         for (int k = 1; k <= 8; k++) fprintf(f, " %d:%lu", k, (unsigned long)this->stat_ret_single_subs[k]);
         fprintf(f, "\n");
+        if (this->stat_lt_n)
+        {
+            fprintf(f, "  %s entry_lifetime: n=%lu hold=%.1f flight=%.1f drain=%.1f total=%.1f\n",
+                this->get_path().c_str(), (unsigned long)this->stat_lt_n,
+                (double)this->stat_lt_hold / this->stat_lt_n,
+                (double)this->stat_lt_flight / this->stat_lt_n,
+                (double)this->stat_lt_drain / this->stat_lt_n,
+                (double)this->stat_lt_total / this->stat_lt_n);
+        }
         fprintf(f, "  %s denies: stall=%lu meta=%lu slot=%lu\n",
             this->get_path().c_str(), (unsigned long)this->stat_deny_stall,
             (unsigned long)this->stat_deny_meta, (unsigned long)this->stat_deny_slot);
@@ -825,6 +839,9 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
         {
             e->valid = true;
             e->state = ST_WAIT_RESP;
+            e->birth_cycle = this->clock.get_cycles();
+            e->issued_cycle = -1;
+            e->first_beat_cycle = -1;
             e->base_addr = base_addr;
             e->burst_len = burst_len;
             e->tgt_group = tgt_group;
@@ -1010,6 +1027,7 @@ void GroupMshr::forward_fetch(Entry *e)
         return;
     }
     e->issued = true;
+    e->issued_cycle = this->clock.get_cycles();
 }
 
 void GroupMshr::replay_holds()
@@ -1139,6 +1157,10 @@ vp::IoReqStatus GroupMshr::capture_response(L1NocFlit *flit, int lane)
     {
         e.arrived_mask |= (uint16_t)(1u << idx);
     }
+    if (e.beats_arrived == 0 && e.first_beat_cycle < 0)
+    {
+        e.first_beat_cycle = this->clock.get_cycles();
+    }
     e.beats_arrived++;
     this->stat_resp_mshr++;
     delete flit;
@@ -1202,12 +1224,22 @@ void GroupMshr::hb_handler(vp::Block *__this, vp::ClockEvent *)
     }
     last_sig[_this] = sig;
 
-    fprintf(hb_f, "HB cyc=%ld valid=%d reqs=%lu alloc=%lu merged=%lu bypass=%lu deny[stall=%lu meta=%lu slot=%lu]\n",
+    fprintf(hb_f, "HB cyc=%ld valid=%d reqs=%lu alloc=%lu merged=%lu bypass=%lu deny[stall=%lu meta=%lu slot=%lu]",
         (long)_this->clock.get_cycles(), nvalid,
         (unsigned long)_this->stat_reqs, (unsigned long)_this->stat_alloc,
         (unsigned long)_this->stat_merged, (unsigned long)_this->stat_bypass,
         (unsigned long)_this->stat_deny_stall, (unsigned long)_this->stat_deny_meta,
         (unsigned long)_this->stat_deny_slot);
+    if (_this->stat_lt_n)
+    {
+        fprintf(hb_f, " lt[hold=%.1f flight=%.1f drain=%.1f total=%.1f n=%lu]",
+            (double)_this->stat_lt_hold / _this->stat_lt_n,
+            (double)_this->stat_lt_flight / _this->stat_lt_n,
+            (double)_this->stat_lt_drain / _this->stat_lt_n,
+            (double)_this->stat_lt_total / _this->stat_lt_n,
+            (unsigned long)_this->stat_lt_n);
+    }
+    fprintf(hb_f, "\n");
     for (int i = 0; i < _this->num_entries; i++)
     {
         Entry &e = _this->entries[i];
@@ -1465,6 +1497,15 @@ void GroupMshr::retire_if_done(Entry *e)
         {
             delete sub.flit;
         }
+    }
+    if (e->issued_cycle >= 0)
+    {
+        int64_t fb = e->first_beat_cycle >= 0 ? e->first_beat_cycle : e->issued_cycle;
+        this->stat_lt_n++;
+        this->stat_lt_hold  += (uint64_t)(e->issued_cycle - e->birth_cycle);
+        this->stat_lt_flight += (uint64_t)(fb - e->issued_cycle);
+        this->stat_lt_drain += (uint64_t)(this->clock.get_cycles() - fb);
+        this->stat_lt_total += (uint64_t)(this->clock.get_cycles() - e->birth_cycle);
     }
     e->subs.clear();
     if (e->burst_len == 1 && this->resp_cache)
