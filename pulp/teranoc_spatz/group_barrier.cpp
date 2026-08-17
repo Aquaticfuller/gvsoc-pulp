@@ -62,6 +62,7 @@ class GroupBarrier : public vp::Component
 {
 public:
     GroupBarrier(vp::ComponentConf &config);
+    ~GroupBarrier() override;
 
 private:
     static vp::IoReqStatus in_req(vp::Block *__this, vp::IoReq *req, int tile);
@@ -130,12 +131,34 @@ private:
     // Config-store acks to send from the release event: (tile, flit).
     std::deque<std::pair<int, L1NocFlit *>> ack_queue;
 
+    // Per-iteration cadence measurement: releases on the busiest struct.
+    uint64_t stat_releases = 0;
+    int64_t rel_first_cycle = -1, rel_last_cycle = -1;
+    int64_t rel_last_this = -1;   // interval between consecutive releases
+    uint64_t stat_rel_interval_sum = 0, stat_rel_interval_n = 0;
+
     vp::Trace trace;
     std::vector<std::unique_ptr<vp::IoSlave>> in_v;
     std::vector<std::unique_ptr<vp::IoMaster>> out_v;
     std::unique_ptr<vp::IoMaster> cfg_out;
     vp::ClockEvent rel_event{this, &GroupBarrier::rel_handler};
 };
+
+GroupBarrier::~GroupBarrier()
+{
+    if (this->stat_releases > 1)
+    {
+        FILE *f = fopen("gbar_stats.log", "a");
+        if (f)
+        {
+            fprintf(f, "[GBAR] %s releases=%lu mean_interval=%.1f cyc (span %ld..%ld)\n",
+                this->get_path().c_str(), (unsigned long)this->stat_releases,
+                this->stat_rel_interval_n ? (double)this->stat_rel_interval_sum / this->stat_rel_interval_n : 0.0,
+                (long)this->rel_first_cycle, (long)this->rel_last_cycle);
+            fclose(f);
+        }
+    }
+}
 
 GroupBarrier::GroupBarrier(vp::ComponentConf &config) : vp::Component(config)
 {
@@ -338,6 +361,18 @@ void GroupBarrier::release(int s)
     this->held[s].clear();
     this->count[s] = 0;
     this->arrived[s] = 0;
+    {
+        int64_t now = this->clock.get_cycles();
+        if (this->rel_first_cycle < 0) this->rel_first_cycle = now;
+        if (this->rel_last_this >= 0)
+        {
+            this->stat_rel_interval_sum += now - this->rel_last_this;
+            this->stat_rel_interval_n++;
+        }
+        this->rel_last_this = now;
+        this->rel_last_cycle = now;
+        this->stat_releases++;
+    }
     this->trace.msg(vp::Trace::LEVEL_TRACE, "GBAR_RELEASE struct=%d\n", s);
 }
 
