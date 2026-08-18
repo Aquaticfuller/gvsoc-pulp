@@ -139,6 +139,11 @@ private:
     static vp::IoRespAck resp_out_resp(vp::Block *__this, vp::IoReq *req, int lane);
     static void door_handler(vp::Block *__this, vp::ClockEvent *event);
     static void hb_handler(vp::Block *__this, vp::ClockEvent *event);
+    // Per-window (8192-cycle) activity dump: the per-phase curve. Prints the
+    // counter DELTAS since the last window — merges+allocs+drains pace the
+    // FPU, so the rate profile shows ramp/plateau/tail.
+    static void win_handler(vp::Block *__this, vp::ClockEvent *event);
+    uint64_t win_prev_merged = 0, win_prev_alloc = 0, win_prev_drained = 0;
     // Runtime CSR port (mempool_group_mshr_cfg.sv): single slave fed by the
     // group barrier's bank-3 decode. Always GRANTED; the response (ack for
     // writes, status word for reads) leaves one cycle later via cfg_resp_event
@@ -168,7 +173,7 @@ private:
                 cls, this->miss_streak[cls]);
         }
     }
-    void reset(bool active) override { if (active) this->hb_event.enqueue(65536); }
+    void reset(bool active) override { if (active) { this->hb_event.enqueue(65536); this->win_event.enqueue(8192); } }
 
     // ---------------- door (request path)
     vp::IoReqStatus handle_request(L1NocFlit *flit, int lane);
@@ -292,6 +297,7 @@ private:
     vp::IoMaster *resp_out_itfs = nullptr;
     vp::ClockEvent fsm_event{this, &GroupMshr::door_handler};
     vp::ClockEvent hb_event{this, &GroupMshr::hb_handler};
+    vp::ClockEvent win_event{this, &GroupMshr::win_handler};
     vp::ClockEvent cfg_resp_event{this, &GroupMshr::cfg_resp_handler};
     std::deque<L1NocFlit *> cfg_resp_queue;
     std::vector<std::unique_ptr<vp::IoSlave>> req_in_v;
@@ -1199,6 +1205,31 @@ vp::IoReqStatus GroupMshr::capture_response(L1NocFlit *flit, int lane)
 // Minimal progress heartbeat (debug): one counts line per 65536 cycles per
 // instance — cheap enough to leave enabled during bring-up.
 // ---------------------------------------------------------------------------
+void GroupMshr::win_handler(vp::Block *__this, vp::ClockEvent *)
+{
+    auto *_this = static_cast<GroupMshr *>(__this);
+    static FILE *win_f = nullptr;
+    if (!win_f)
+    {
+        const char *wp = getenv("TERANOC_MSHR_WIN_PATH");
+        win_f = wp ? fopen(wp, "a") : nullptr;
+    }
+    if (win_f)
+    {
+        uint64_t dm = _this->stat_merged - _this->win_prev_merged;
+        uint64_t da = _this->stat_alloc - _this->win_prev_alloc;
+        uint64_t dd = _this->stat_lt_n - _this->win_prev_drained;
+        _this->win_prev_merged = _this->stat_merged;
+        _this->win_prev_alloc = _this->stat_alloc;
+        _this->win_prev_drained = _this->stat_lt_n;
+        fprintf(win_f, "WIN cyc=%ld merged=%lu alloc=%lu retired=%lu\n",
+            (long)_this->clock.get_cycles(), (unsigned long)dm,
+            (unsigned long)da, (unsigned long)dd);
+        fflush(win_f);
+    }
+    _this->win_event.enqueue(8192);
+}
+
 void GroupMshr::hb_handler(vp::Block *__this, vp::ClockEvent *)
 {
     auto *_this = static_cast<GroupMshr *>(__this);
