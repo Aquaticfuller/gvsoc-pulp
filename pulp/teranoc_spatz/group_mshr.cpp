@@ -1375,11 +1375,18 @@ void GroupMshr::win_handler(vp::Block *__this, vp::ClockEvent *)
         _this->win_prev_lt_hold = _this->stat_lt_hold;
         _this->win_prev_lt_flight = _this->stat_lt_flight;
         _this->win_prev_lt_drain = _this->stat_lt_drain;
+        // INSTANTANEOUS level sample, NOT a mean. Sampling a time-varying
+        // level at fixed period boundaries and averaging the samples read 6.0
+        // where the true per-cycle time-average is 2.99 -- a 2x bias, and
+        // boundary phase is the worst case because it correlates with
+        // anything the workload does periodically. Use the time-averaged
+        // occupancy in the exit stats for any mean. The field is named
+        // occ_sample so it cannot be quoted as one by mistake.
         int nvalid = 0;
         for (Entry &e : _this->entries) if (e.valid) nvalid++;
         double dn = dd ? (double)dd : 1.0;
         fprintf(win_f, "WIN cyc=%ld merged=%lu alloc=%lu retired=%lu mshr_to=%lu bankfull=%lu"
-            " dny[s=%lu m=%lu sl=%lu] occ=%d lt[h=%.1f f=%.1f d=%.1f]\n",
+            " dny[s=%lu m=%lu sl=%lu] occ_sample=%d lt[h=%.1f f=%.1f d=%.1f]\n",
             (long)_this->clock.get_cycles(), (unsigned long)dm,
             (unsigned long)da, (unsigned long)dd,
             (unsigned long)dt, (unsigned long)db,
