@@ -304,6 +304,18 @@ private:
     // Also track queue depth on entry: a persistently shallow queue is
     // supply-limited by definition, however the loop happens to exit.
     uint64_t byp_exit_empty = 0, byp_exit_blocked = 0, byp_exit_denied = 0;
+    uint64_t stat_lane_cap = 0;  // a delivery skipped: lane already used this cycle
+    // ONE DELIVERY PER LANE PER CYCLE. Each subscriber is bound to exactly one
+    // lane by its own tile_id/port_id, and the RTL scans PER LANE, each lane
+    // picking at most one (entry, subscriber) addressed to it
+    // (mempool_group_mshr.sv:3786-3790). Nothing here enforced that cap -- a
+    // lane was marked busy only on a DENIAL, so one lane could carry many
+    // deliveries in a cycle across different entries. The design asserts the
+    // two sources can never collide (:4955 resp_src_exclusive, a $fatal), and
+    // bypass has strict priority: a lane carrying a bypassed beat is marked
+    // port_taken (:3685) and the whole drain scan skips it (:3769).
+    std::vector<bool> lane_used;
+    int64_t lane_used_cycle = -1;
     uint64_t byp_depth_sum = 0, byp_depth_n = 0, byp_depth_max = 0;
     // req_in spill (one-cycle input register per lane): 0=idle, 1=filling
     // (presenting next cycle), 2=presenting (resend is processed).
@@ -492,7 +504,9 @@ GroupMshr::~GroupMshr()
                 this->get_path().c_str(), this->nb_banks, used, (unsigned long)tot,
                 (unsigned long)mx, tot ? (double)mx / ((double)tot/this->nb_banks) : 0.0,
                 (unsigned long)ftot, tot ? 100.0*ftot/tot : 0.0);
-            fprintf(f, "  %s bank_hist:", this->get_path().c_str());
+            fprintf(f, "  %s lane_cap_skips=%lu\n", this->get_path().c_str(),
+            (unsigned long)this->stat_lane_cap);
+        fprintf(f, "  %s bank_hist:", this->get_path().c_str());
             for (uint64_t v : this->bank_alloc) fprintf(f, " %lu", (unsigned long)v);
             fprintf(f, "\n");
         }
@@ -634,6 +648,7 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->req_out_blocked.resize(this->nb_lanes, false);
     this->req_out_held.resize(this->nb_lanes, nullptr);
     this->bypass_q_lane.resize(this->nb_lanes);
+    this->lane_used.resize(this->nb_lanes, false);
     this->resp_out_blocked.resize(this->nb_lanes, false);
     this->resp_out_held.resize(this->nb_lanes, nullptr);
     this->req_spill_state.resize(this->nb_lanes, 0);
@@ -1665,6 +1680,12 @@ void GroupMshr::drain_cycle()
 {
     int64_t cycles = this->clock.get_cycles();
 
+    if (cycles != this->lane_used_cycle)
+    {
+        this->lane_used_cycle = cycles;
+        std::fill(this->lane_used.begin(), this->lane_used.end(), false);
+    }
+
     // Bypass beats first: strict priority, one per bypass lane per cycle.
     // Round-robin ACROSS LANES so no tile starves and no lane's backlog blocks
     // another's -- each lane is an independent path in the hardware.
@@ -1766,10 +1787,12 @@ void GroupMshr::drain_cycle()
             }
             Sub &sub = e.subs[si];
             int lane = sub.tile * this->nb_ports_per_tile + port;
-            if (this->resp_out_blocked[lane])
+            if (this->resp_out_blocked[lane] || this->lane_used[lane])
             {
+                if (this->lane_used[lane]) this->stat_lane_cap++;
                 break;
             }
+            this->lane_used[lane] = true;
 
             L1NocFlit *flit = new L1NocFlit();
             flit->burst = sub.burst;
