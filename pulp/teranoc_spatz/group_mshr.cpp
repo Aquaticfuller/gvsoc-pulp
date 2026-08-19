@@ -310,6 +310,12 @@ private:
     uint64_t rin_beats = 0, rin_cycles = 0;   // beats into the MSHR, distinct cycles
     int64_t rout_last_cycle = -1;
     uint64_t rout_beats = 0, rout_cycles = 0; // beats out to subscribers
+    // Deliveries counted PER CLASS at the point of delivery. Deriving one from
+    // (total - other) needs a premise about which deliveries a downstream
+    // counter can see, and two competing decompositions fit the same totals
+    // equally well -- a decomposition with fewer measurements than unknowns
+    // restates its assumption rather than measuring the system.
+    uint64_t rout_burst = 0, rout_single = 0;
     uint64_t stat_drain_single_n = 0, stat_drain_single_sum = 0;
     uint64_t stat_drain_burst_n = 0, stat_drain_burst_sum = 0, stat_burst_beats_sum = 0;
     // Intra-group request path (tile -> MSHR door), split by class.
@@ -411,6 +417,9 @@ GroupMshr::~GroupMshr()
         }
         if (this->rin_cycles || this->rout_cycles)
         {
+            fprintf(f, "  %s out_by_class: burst=%lu single=%lu\n",
+                this->get_path().c_str(),
+                (unsigned long)this->rout_burst, (unsigned long)this->rout_single);
             fprintf(f, "  %s beat_rate: in=%lu beats/%lu cyc=%.2f   out=%lu beats/%lu cyc=%.2f\n",
                 this->get_path().c_str(),
                 (unsigned long)this->rin_beats, (unsigned long)this->rin_cycles,
@@ -1600,6 +1609,7 @@ void GroupMshr::drain_cycle()
             {
                 int64_t onow = this->clock.get_cycles();
                 this->rout_beats++;
+                if (e.burst_len > 1) this->rout_burst++; else this->rout_single++;
                 if (onow != this->rout_last_cycle) { this->rout_last_cycle = onow; this->rout_cycles++; }
             }
             e.served_mask &= ~(1u << si);
