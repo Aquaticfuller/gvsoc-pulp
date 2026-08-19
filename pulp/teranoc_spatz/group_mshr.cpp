@@ -304,7 +304,6 @@ private:
     // Also track queue depth on entry: a persistently shallow queue is
     // supply-limited by definition, however the loop happens to exit.
     uint64_t byp_exit_empty = 0, byp_exit_blocked = 0, byp_exit_denied = 0;
-    uint64_t stat_sub_hol = 0;   // drain skipped a subscriber on a busy lane
     uint64_t byp_depth_sum = 0, byp_depth_n = 0, byp_depth_max = 0;
     // req_in spill (one-cycle input register per lane): 0=idle, 1=filling
     // (presenting next cycle), 2=presenting (resend is processed).
@@ -493,9 +492,7 @@ GroupMshr::~GroupMshr()
                 this->get_path().c_str(), this->nb_banks, used, (unsigned long)tot,
                 (unsigned long)mx, tot ? (double)mx / ((double)tot/this->nb_banks) : 0.0,
                 (unsigned long)ftot, tot ? 100.0*ftot/tot : 0.0);
-            fprintf(f, "  %s sub_hol=%lu\n", this->get_path().c_str(),
-            (unsigned long)this->stat_sub_hol);
-        fprintf(f, "  %s bank_hist:", this->get_path().c_str());
+            fprintf(f, "  %s bank_hist:", this->get_path().c_str());
             for (uint64_t v : this->bank_alloc) fprintf(f, " %lu", (unsigned long)v);
             fprintf(f, "\n");
         }
@@ -1752,41 +1749,27 @@ void GroupMshr::drain_cycle()
             uint32_t word = e.resp_words[beat];
             int port = beat & 1;   // ParityDrain: beat b on lane (b&1)
 
-            // First pending subscriber (RR) whose LANE IS FREE gets the word
-            // this cycle. Selecting the first pending subscriber and aborting
-            // if its lane happened to be busy is head-of-line blocking ACROSS
-            // SUBSCRIBERS: with hold_subs=4 every entry has four, each on a
-            // different tile's lane, so one busy lane stalled three cores whose
-            // lanes were free. Measured on 512x128x256: 16 of 256 cores ran
-            // 2.9x-4.9x slow with 90% of their time in wait_beats and a 9.1x
-            // longer time-to-first-beat (256 vs 28 cyc), while the MSHR itself
-            // was healthy (entry lifetime 50 cyc, perfect 4-way merging, zero
-            // bank-full). Same defect as the bypass queue's shared FIFO, one
-            // level down -- which is why fixing that one left these outliers.
+            // First pending subscriber (RR) gets the word this cycle.
             int si = -1;
-            int lane = -1;
             for (int s = 0; s < (int)e.subs.size(); s++)
             {
                 int cand = (this->sub_rr + s) % (int)e.subs.size();
-                if (!(e.served_mask & (1u << cand)))
+                if (e.served_mask & (1u << cand))
                 {
-                    continue;
+                    si = cand;
+                    break;
                 }
-                int cand_lane = e.subs[cand].tile * this->nb_ports_per_tile + port;
-                if (this->resp_out_blocked[cand_lane])
-                {
-                    this->stat_sub_hol++;
-                    continue;
-                }
-                si = cand;
-                lane = cand_lane;
-                break;
             }
             if (si < 0)
             {
                 break;
             }
             Sub &sub = e.subs[si];
+            int lane = sub.tile * this->nb_ports_per_tile + port;
+            if (this->resp_out_blocked[lane])
+            {
+                break;
+            }
 
             L1NocFlit *flit = new L1NocFlit();
             flit->burst = sub.burst;
