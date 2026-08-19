@@ -121,6 +121,7 @@ private:
         int64_t birth_cycle = 0;      // lifetime instrumentation
         int64_t issued_cycle = -1;    // fetch actually issued
         int64_t first_beat_cycle = -1;// first response beat visible
+        int64_t last_beat_cycle = -1; // most recent response beat captured
         int64_t drain_not_before = 0; // earliest head-beat delivery (resp_out spill)
         int resp_rd = 0;          // read cursor (word index being drained)
         int beats_arrived = 0;    // total beats captured
@@ -299,6 +300,12 @@ private:
     // the quantity is wrong. burst_beats is summed from each entry's ACTUAL
     // burst_len, not assumed to be max_burst_words, so an entry that allocated
     // as a burst but completed short cannot inflate the per-beat rate.
+    // First-to-LAST beat arrival, deliberately separate from the drain span:
+    // drain is first-beat -> entry-freed and a coalescer outlives its beats
+    // while serving merge partners, so it cannot answer "how fast do one
+    // burst's beats come back". Entries with a single beat span 0 cycles and
+    // are excluded, or they bias the rate toward infinitely fast.
+    uint64_t f2l_entries = 0, f2l_span_sum = 0, f2l_beats_sum = 0;
     int64_t rin_last_cycle = -1;
     uint64_t rin_beats = 0, rin_cycles = 0;   // beats into the MSHR, distinct cycles
     int64_t rout_last_cycle = -1;
@@ -391,6 +398,16 @@ GroupMshr::~GroupMshr()
                 this->stat_reqpath_single_n ?
                     (double)this->stat_reqpath_single / this->stat_reqpath_single_n : 0.0,
                 (unsigned long)this->stat_reqpath_single_n);
+        }
+        if (this->f2l_entries)
+        {
+            fprintf(f, "  %s beats_in_entry: entries=%lu mean_span=%.1f cyc mean_beats=%.1f"
+                " rate=%.2f beats/cyc\n",
+                this->get_path().c_str(), (unsigned long)this->f2l_entries,
+                (double)this->f2l_span_sum / this->f2l_entries,
+                (double)this->f2l_beats_sum / this->f2l_entries,
+                this->f2l_span_sum ?
+                    (double)(this->f2l_beats_sum - this->f2l_entries) / this->f2l_span_sum : 0.0);
         }
         if (this->rin_cycles || this->rout_cycles)
         {
@@ -937,6 +954,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             e->birth_cycle = this->clock.get_cycles();
             e->issued_cycle = -1;
             e->first_beat_cycle = -1;
+            e->last_beat_cycle = -1;
             e->base_addr = base_addr;
             e->burst_len = burst_len;
             e->tgt_group = tgt_group;
@@ -1263,6 +1281,7 @@ vp::IoReqStatus GroupMshr::capture_response(L1NocFlit *flit, int lane)
         int64_t rnow = this->clock.get_cycles();
         this->rin_beats++;
         if (rnow != this->rin_last_cycle) { this->rin_last_cycle = rnow; this->rin_cycles++; }
+        e.last_beat_cycle = rnow;
     }
     delete flit;
 
@@ -1675,6 +1694,12 @@ void GroupMshr::retire_if_done(Entry *e)
         this->stat_lt_drain += (uint64_t)(this->clock.get_cycles() - fb);
         this->stat_lt_total += (uint64_t)(this->clock.get_cycles() - e->birth_cycle);
         {
+            if (e->beats_arrived >= 2 && e->last_beat_cycle > e->first_beat_cycle)
+            {
+                this->f2l_entries++;
+                this->f2l_span_sum += (uint64_t)(e->last_beat_cycle - e->first_beat_cycle);
+                this->f2l_beats_sum += (uint64_t)e->beats_arrived;
+            }
             uint64_t dspan = (uint64_t)(this->clock.get_cycles() - fb);
             if (e->burst_len > 1)
             {
