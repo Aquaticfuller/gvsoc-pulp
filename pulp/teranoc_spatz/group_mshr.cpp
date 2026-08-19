@@ -1752,26 +1752,19 @@ void GroupMshr::drain_cycle()
             uint32_t word = e.resp_words[beat];
             int port = beat & 1;   // ParityDrain: beat b on lane (b&1)
 
-            // MULTICAST FAN-OUT: one beat, N destinations, ONE cycle.
-            // mempool_group_mshr.sv selects drain candidates PER LANE, not per
-            // entry (:3801-3816): an entry is a candidate for lane (tile,port)
-            // only if it has a ready subscriber on that lane, and nothing
-            // arbitrates entries across lanes -- so several lanes independently
-            // win the SAME entry in the same cycle and each serves a DIFFERENT
-            // subscriber, all reading the same head beat from resp_buf (:3940).
-            // Up to 32 lanes (16 tiles x 2 usable response ports).
-            //
-            // This model previously served ONE subscriber per iteration and
-            // counted deliveries against drain_beats, capping an entry at 2
-            // subscriber-deliveries per cycle where the hardware does 2 BEATS x
-            // N subscribers. With hold_subs=4 that understated delivery 4x on
-            // exactly the shapes that were +434%.
-            //
-            // Beat parity constrains WHICH port a burst beat may use, so the
-            // fan-out for a burst entry is over TILES at fixed port parity.
-            // Single-word entries (burst_len==1, including response-cache hits)
-            // take the legacy b=0 identity path and are unconstrained.
-            int fanned = 0;
+            // First pending subscriber (RR) whose LANE IS FREE gets the word
+            // this cycle. Selecting the first pending subscriber and aborting
+            // if its lane happened to be busy is head-of-line blocking ACROSS
+            // SUBSCRIBERS: with hold_subs=4 every entry has four, each on a
+            // different tile's lane, so one busy lane stalled three cores whose
+            // lanes were free. Measured on 512x128x256: 16 of 256 cores ran
+            // 2.9x-4.9x slow with 90% of their time in wait_beats and a 9.1x
+            // longer time-to-first-beat (256 vs 28 cyc), while the MSHR itself
+            // was healthy (entry lifetime 50 cyc, perfect 4-way merging, zero
+            // bank-full). Same defect as the bypass queue's shared FIFO, one
+            // level down -- which is why fixing that one left these outliers.
+            int si = -1;
+            int lane = -1;
             for (int s = 0; s < (int)e.subs.size(); s++)
             {
                 int cand = (this->sub_rr + s) % (int)e.subs.size();
@@ -1779,83 +1772,95 @@ void GroupMshr::drain_cycle()
                 {
                     continue;
                 }
-                Sub &sub = e.subs[cand];
-                int lane = sub.tile * this->nb_ports_per_tile + port;
-                if (this->resp_out_blocked[lane])
+                int cand_lane = e.subs[cand].tile * this->nb_ports_per_tile + port;
+                if (this->resp_out_blocked[cand_lane])
                 {
-                    // Not a candidate for this lane this cycle. The hardware
-                    // simply omits it and the other lanes proceed untouched --
-                    // there is no head-of-line blocking across subscribers.
                     this->stat_sub_hol++;
                     continue;
                 }
-
-                L1NocFlit *flit = new L1NocFlit();
-                flit->burst = sub.burst;
-                flit->src_tile = sub.tile;
-                flit->source_port = sub.port;
-                flit->src_x = sub.src_x;
-                flit->src_y = sub.src_y;
-                flit->dest_x = sub.src_x;
-                flit->dest_y = sub.src_y;
-                flit->initiator_addr = sub.initiator_addr;
-                flit->set_addr(sub.initiator_addr + (uint64_t)beat * 4);
-                flit->set_size(4);
-                flit->beat_idx = beat;
-                flit->mshr_tag = 0;
-                if (sub.burst && sub.burst->get_data() != nullptr)
-                {
-                    *(uint32_t *)(sub.burst->get_data() + (uint64_t)beat * 4) = word;
-                }
-                // The flit carries the word by value; once created, delivery is
-                // guaranteed (on DENY the router elected it and the same object
-                // is re-sent from retry()), so account it now rather than on
-                // acceptance -- otherwise the retry-resend is counted twice.
-                e.served_cnt++;
-                {
-                    int64_t onow = this->clock.get_cycles();
-                    this->rout_beats++;
-                    if (e.burst_len > 1) this->rout_burst++; else this->rout_single++;
-                    if (onow != this->rout_last_cycle) { this->rout_last_cycle = onow; this->rout_cycles++; }
-                }
-                e.served_mask &= ~(1u << cand);
-                fanned++;
-
-                vp::IoReqStatus st = this->resp_out_v[lane]->req(flit);
-                if (st == vp::IO_REQ_DENIED)
-                {
-                    // The router elected this flit: it must be re-sent with the
-                    // SAME object on retry (never freed here). This lane is now
-                    // blocked; the remaining subscribers keep fanning out.
-                    this->resp_out_blocked[lane] = true;
-                    this->resp_out_held[lane] = flit;
-                }
+                si = cand;
+                lane = cand_lane;
+                break;
             }
-            if (fanned == 0)
+            if (si < 0)
             {
-                break;   // every pending subscriber sat on a blocked lane
+                break;
             }
-            this->sub_rr = (this->sub_rr + 1) % (int)e.subs.size();
+            Sub &sub = e.subs[si];
 
-            if (e.served_mask != 0)
+            L1NocFlit *flit = new L1NocFlit();
+            flit->burst = sub.burst;
+            flit->src_tile = sub.tile;
+            flit->source_port = sub.port;
+            flit->src_x = sub.src_x;
+            flit->src_y = sub.src_y;
+            flit->dest_x = sub.src_x;
+            flit->dest_y = sub.src_y;
+            flit->initiator_addr = sub.initiator_addr;
+            flit->set_addr(sub.initiator_addr + (uint64_t)beat * 4);
+            flit->set_size(4);
+            flit->beat_idx = beat;
+            flit->mshr_tag = 0;
+            if (sub.burst && sub.burst->get_data() != nullptr)
             {
-                break;   // head beat only partly served; the rest next cycle
+                *(uint32_t *)(sub.burst->get_data() + (uint64_t)beat * 4) = word;
             }
-            // Head beat fully served: pop it, arm the next beat's mask, and
-            // charge ONE beat (not one delivery) against the drain_beats
-            // budget. The next beat has the opposite parity, so it leaves on
-            // the other response lane and may go in this same cycle.
-            e.resp_rd++;
-            e.beats_drained++;
-            if (e.beats_drained < e.burst_len)
+            // The flit carries the word by value; once created, delivery is
+            // guaranteed (on DENY the router elected it and the same object is
+            // re-sent from retry()), so account the delivery now rather than
+            // on acceptance — otherwise the retry-resend is delivered twice.
+            e.served_cnt++;
             {
-                e.served_mask = (1u << e.subs.size()) - 1;
+                int64_t onow = this->clock.get_cycles();
+                this->rout_beats++;
+                if (e.burst_len > 1) this->rout_burst++; else this->rout_single++;
+                if (onow != this->rout_last_cycle) { this->rout_last_cycle = onow; this->rout_cycles++; }
             }
+            e.served_mask &= ~(1u << si);
+            this->sub_rr = (si + 1) % (int)e.subs.size();
             delivered++;
-            this->retire_if_done(&e);
-            if (!e.valid || e.state != ST_DRAIN_RESP)
+            bool head_done = (e.served_mask == 0);
+            if (head_done)
             {
-                break;   // entry retired or left the drain state
+                // Head beat fully served: pop it, arm the next beat's mask.
+                e.resp_rd++;
+                e.beats_drained++;
+                if (e.beats_drained < e.burst_len)
+                {
+                    e.served_mask = (1u << e.subs.size()) - 1;
+                }
+            }
+
+            vp::IoReqStatus st = this->resp_out_v[lane]->req(flit);
+            if (st == vp::IO_REQ_DENIED)
+            {
+                // The router elected this flit: it must be re-sent with the
+                // SAME object on retry (never freed here).
+                this->resp_out_blocked[lane] = true;
+                this->resp_out_held[lane] = flit;
+                if (head_done)
+                {
+                    this->retire_if_done(&e);
+                }
+                break;
+            }
+            if (head_done)
+            {
+                this->retire_if_done(&e);
+                // ParityDrain: the NEXT beat has the opposite parity, so it
+                // leaves on the other response lane and can go in this SAME
+                // cycle while the drain_beats budget lasts. Breaking here
+                // unconditionally (as this did) capped delivery at one beat
+                // per entry per cycle no matter what drain_beats said, which
+                // is the pre-ParityDrain behaviour: measured 1.00 beats/cycle
+                // arriving at the VLSU against the RTL's 2.00 words per commit
+                // cycle, and it is why our commit paired only 31% of the time
+                // where the RTL pairs 100%.
+                if (!e.valid || e.state != ST_DRAIN_RESP)
+                {
+                    break;   // entry retired or left the drain state
+                }
+                continue;
             }
         }
         this->drain_rr = (i + 1) % this->num_entries;
