@@ -284,6 +284,10 @@ private:
     // stats (mirror RTL [MSHR stats])
     uint64_t stat_reqs = 0, stat_merged = 0, stat_alloc = 0, stat_bypass = 0;
     uint64_t stat_resp_mshr = 0, stat_resp_bypass = 0, stat_cache_hits = 0;
+    // Bypassed response beats split by class: a single total averages over
+    // mechanisms with nothing in common (stores never enter a read coalescer,
+    // pre-enable init traffic bypasses by config, bank-full bursts overflow).
+    uint64_t stat_bypass_wr = 0, stat_bypass_rd_burst = 0, stat_bypass_rd_single = 0;
     uint64_t stat_reqs_single = 0, stat_reqs_burst = 0;
     uint64_t stat_merged_single = 0, stat_merged_burst = 0;
     uint64_t stat_ret_single_1 = 0, stat_ret_single_2p = 0;
@@ -429,6 +433,10 @@ GroupMshr::~GroupMshr()
                 this->get_path().c_str(), (unsigned long)this->occ_sum, (long)total,
                 total > 0 ? (double)this->occ_sum / total : 0.0, this->num_entries);
         }
+        fprintf(f, "  %s bypass_beats_by_class: write=%lu read_burst=%lu read_single=%lu\n",
+            this->get_path().c_str(), (unsigned long)this->stat_bypass_wr,
+            (unsigned long)this->stat_bypass_rd_burst,
+            (unsigned long)this->stat_bypass_rd_single);
         if (this->rin_cycles || this->rout_cycles)
         {
             fprintf(f, "  %s out_by_class: burst=%lu single=%lu\n",
@@ -1260,6 +1268,9 @@ vp::IoReqStatus GroupMshr::capture_response(L1NocFlit *flit, int lane)
     {
         // Bypass response: strict priority forward (no buffering, no deny).
         this->stat_resp_bypass++;
+        if (flit->get_is_write()) this->stat_bypass_wr++;
+        else if (flit->beat_idx >= 0) this->stat_bypass_rd_burst++;
+        else this->stat_bypass_rd_single++;
         this->bypass_queue.push_back({flit, lane});
         this->fsm_event.enqueue(0);
         return vp::IO_REQ_DONE;
