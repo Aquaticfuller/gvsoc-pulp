@@ -586,6 +586,7 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->lane_retry_owed.resize(this->nb_lanes, false);
     this->req_out_blocked.resize(this->nb_lanes, false);
     this->req_out_held.resize(this->nb_lanes, nullptr);
+    this->bypass_q_lane.resize(this->nb_lanes);
     this->resp_out_blocked.resize(this->nb_lanes, false);
     this->resp_out_held.resize(this->nb_lanes, nullptr);
     this->req_spill_state.resize(this->nb_lanes, 0);
