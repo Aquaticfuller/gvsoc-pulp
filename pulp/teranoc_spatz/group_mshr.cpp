@@ -293,6 +293,14 @@ private:
     uint64_t stat_mshr_timeout = 0;   // hold windows expired below the sub target
     // Entry lifetime (alloc->issue->first beat->retire), in cycles.
     uint64_t stat_lt_n = 0, stat_lt_hold = 0, stat_lt_flight = 0, stat_lt_drain = 0, stat_lt_total = 0;
+    // Lifetime split by CLASS. Single-word entries drain in a couple of cycles
+    // and drag a pooled mean down hard, so a pooled drain number cannot be
+    // compared against a per-burst-entry one -- the arithmetic looks fine and
+    // the quantity is wrong. burst_beats is summed from each entry's ACTUAL
+    // burst_len, not assumed to be max_burst_words, so an entry that allocated
+    // as a burst but completed short cannot inflate the per-beat rate.
+    uint64_t stat_drain_single_n = 0, stat_drain_single_sum = 0;
+    uint64_t stat_drain_burst_n = 0, stat_drain_burst_sum = 0, stat_burst_beats_sum = 0;
     // Intra-group request path (tile -> MSHR door), split by class.
     uint64_t stat_reqpath_burst = 0, stat_reqpath_burst_n = 0;
     uint64_t stat_reqpath_single = 0, stat_reqpath_single_n = 0;
@@ -379,6 +387,21 @@ GroupMshr::~GroupMshr()
                 this->stat_reqpath_single_n ?
                     (double)this->stat_reqpath_single / this->stat_reqpath_single_n : 0.0,
                 (unsigned long)this->stat_reqpath_single_n);
+        }
+        if (this->stat_drain_burst_n || this->stat_drain_single_n)
+        {
+            fprintf(f, "  %s drain_by_class: single_n=%lu single_mean=%.1f"
+                " burst_n=%lu burst_mean=%.1f burst_beats=%lu cyc_per_beat=%.2f\n",
+                this->get_path().c_str(),
+                (unsigned long)this->stat_drain_single_n,
+                this->stat_drain_single_n ?
+                    (double)this->stat_drain_single_sum / this->stat_drain_single_n : 0.0,
+                (unsigned long)this->stat_drain_burst_n,
+                this->stat_drain_burst_n ?
+                    (double)this->stat_drain_burst_sum / this->stat_drain_burst_n : 0.0,
+                (unsigned long)this->stat_burst_beats_sum,
+                this->stat_burst_beats_sum ?
+                    (double)this->stat_drain_burst_sum / this->stat_burst_beats_sum : 0.0);
         }
         fprintf(f, "  %s denies: stall=%lu meta=%lu slot=%lu\n",
             this->get_path().c_str(), (unsigned long)this->stat_deny_stall,
@@ -1628,6 +1651,20 @@ void GroupMshr::retire_if_done(Entry *e)
         this->stat_lt_flight += (uint64_t)(fb - e->issued_cycle);
         this->stat_lt_drain += (uint64_t)(this->clock.get_cycles() - fb);
         this->stat_lt_total += (uint64_t)(this->clock.get_cycles() - e->birth_cycle);
+        {
+            uint64_t dspan = (uint64_t)(this->clock.get_cycles() - fb);
+            if (e->burst_len > 1)
+            {
+                this->stat_drain_burst_n++;
+                this->stat_drain_burst_sum += dspan;
+                this->stat_burst_beats_sum += (uint64_t)e->beats_drained;
+            }
+            else
+            {
+                this->stat_drain_single_n++;
+                this->stat_drain_single_sum += dspan;
+            }
+        }
         // Flight vs mesh distance: hops = |dx| + |dy| between the owning
         // group (subs[0].src_x/y) and the target group (gid = x*ny + y).
         if (!e->subs.empty() && e->subs[0].src_x >= 0)
