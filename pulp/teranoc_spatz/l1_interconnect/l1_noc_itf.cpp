@@ -287,6 +287,7 @@ vp::IoReqStatus L1_NocItf::handle_core_req(vp::IoReq *req, int port)
         flit->src_x = this->group_id_x;
         flit->src_y = this->group_id_y;
         flit->source_port = port;
+        flit->t_created = this->clock.get_cycles();
         // Core stamp from the address scrambler (remaining_size carrier):
         // value 0 = unstamped -> -1, else core = value - 1. The carrier is
         // restored IMMEDIATELY: the NoC NI tracks burst byte progress in the

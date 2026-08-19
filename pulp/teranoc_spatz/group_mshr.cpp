@@ -293,6 +293,9 @@ private:
     uint64_t stat_mshr_timeout = 0;   // hold windows expired below the sub target
     // Entry lifetime (alloc->issue->first beat->retire), in cycles.
     uint64_t stat_lt_n = 0, stat_lt_hold = 0, stat_lt_flight = 0, stat_lt_drain = 0, stat_lt_total = 0;
+    // Intra-group request path (tile -> MSHR door), split by class.
+    uint64_t stat_reqpath_burst = 0, stat_reqpath_burst_n = 0;
+    uint64_t stat_reqpath_single = 0, stat_reqpath_single_n = 0;
     // Flight time vs |dx|+|dy| mesh distance (hops from the requesting
     // group to the entry's target group): the transport law check — flight
     // should be ~2*hops*2 cyc + L2 for every hop count (2 cyc/hop/direction).
@@ -365,6 +368,17 @@ GroupMshr::~GroupMshr()
                 }
             }
             fprintf(f, "\n");
+        }
+        if (this->stat_reqpath_burst_n || this->stat_reqpath_single_n)
+        {
+            fprintf(f, "  %s reqpath(tile->door): burst=%.1f (n=%lu) single=%.1f (n=%lu)\n",
+                this->get_path().c_str(),
+                this->stat_reqpath_burst_n ?
+                    (double)this->stat_reqpath_burst / this->stat_reqpath_burst_n : 0.0,
+                (unsigned long)this->stat_reqpath_burst_n,
+                this->stat_reqpath_single_n ?
+                    (double)this->stat_reqpath_single / this->stat_reqpath_single_n : 0.0,
+                (unsigned long)this->stat_reqpath_single_n);
         }
         fprintf(f, "  %s denies: stall=%lu meta=%lu slot=%lu\n",
             this->get_path().c_str(), (unsigned long)this->stat_deny_stall,
@@ -764,6 +778,14 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
 
     this->stat_reqs++;
     if (is_burst) this->stat_reqs_burst++; else if (is_load) this->stat_reqs_single++;
+    // Intra-group request path: tile flit creation -> this door.
+    if (flit->t_created >= 0 && !flit->t_priced && is_load)
+    {
+        flit->t_priced = true;
+        int64_t d = this->clock.get_cycles() - flit->t_created;
+        if (is_burst) { this->stat_reqpath_burst += (uint64_t)d; this->stat_reqpath_burst_n++; }
+        else          { this->stat_reqpath_single += (uint64_t)d; this->stat_reqpath_single_n++; }
+    }
 
     if (mergeable)
     {
@@ -1546,7 +1568,20 @@ void GroupMshr::drain_cycle()
             if (head_done)
             {
                 this->retire_if_done(&e);
-                break;
+                // ParityDrain: the NEXT beat has the opposite parity, so it
+                // leaves on the other response lane and can go in this SAME
+                // cycle while the drain_beats budget lasts. Breaking here
+                // unconditionally (as this did) capped delivery at one beat
+                // per entry per cycle no matter what drain_beats said, which
+                // is the pre-ParityDrain behaviour: measured 1.00 beats/cycle
+                // arriving at the VLSU against the RTL's 2.00 words per commit
+                // cycle, and it is why our commit paired only 31% of the time
+                // where the RTL pairs 100%.
+                if (!e.valid || e.state != ST_DRAIN_RESP)
+                {
+                    break;   // entry retired or left the drain state
+                }
+                continue;
             }
         }
         this->drain_rr = (i + 1) % this->num_entries;

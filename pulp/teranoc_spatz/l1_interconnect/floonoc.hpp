@@ -56,6 +56,17 @@ public:
     // Carries the per-core identity through the NoC so the group MSHR can
     // scope its meta-conflict check per (tile, core) like the RTL.
     int src_core = -1;
+    // Cycle this flit was created at the requesting tile. Lets the group MSHR
+    // price the INTRA-GROUP request path (tile -> its own group's MSHR door),
+    // which the VLSU-observed flight time says is ~85 cyc at 8x8 -- far more
+    // than a same-group hop should cost. -1 on flits the tile did not create
+    // (response beats), so they never enter the average.
+    int64_t t_created = -1;
+    // Set once the flit has been priced at a door. A denied flit is
+    // re-presented until it is accepted, and counting each presentation turns
+    // this into an inflated deny-churn measure rather than a path latency
+    // (it read 672 cyc against a 129 cyc total load latency before this).
+    bool t_priced = false;
 
     // Burst response beats (teranoc_spatz). A burst request (size > 4 B) stays
     // one object on the request mesh; its response is one flit per word.
