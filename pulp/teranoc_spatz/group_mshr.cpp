@@ -299,6 +299,10 @@ private:
     // the quantity is wrong. burst_beats is summed from each entry's ACTUAL
     // burst_len, not assumed to be max_burst_words, so an entry that allocated
     // as a burst but completed short cannot inflate the per-beat rate.
+    int64_t rin_last_cycle = -1;
+    uint64_t rin_beats = 0, rin_cycles = 0;   // beats into the MSHR, distinct cycles
+    int64_t rout_last_cycle = -1;
+    uint64_t rout_beats = 0, rout_cycles = 0; // beats out to subscribers
     uint64_t stat_drain_single_n = 0, stat_drain_single_sum = 0;
     uint64_t stat_drain_burst_n = 0, stat_drain_burst_sum = 0, stat_burst_beats_sum = 0;
     // Intra-group request path (tile -> MSHR door), split by class.
@@ -387,6 +391,15 @@ GroupMshr::~GroupMshr()
                 this->stat_reqpath_single_n ?
                     (double)this->stat_reqpath_single / this->stat_reqpath_single_n : 0.0,
                 (unsigned long)this->stat_reqpath_single_n);
+        }
+        if (this->rin_cycles || this->rout_cycles)
+        {
+            fprintf(f, "  %s beat_rate: in=%lu beats/%lu cyc=%.2f   out=%lu beats/%lu cyc=%.2f\n",
+                this->get_path().c_str(),
+                (unsigned long)this->rin_beats, (unsigned long)this->rin_cycles,
+                this->rin_cycles ? (double)this->rin_beats / this->rin_cycles : 0.0,
+                (unsigned long)this->rout_beats, (unsigned long)this->rout_cycles,
+                this->rout_cycles ? (double)this->rout_beats / this->rout_cycles : 0.0);
         }
         if (this->stat_drain_burst_n || this->stat_drain_single_n)
         {
@@ -1246,6 +1259,11 @@ vp::IoReqStatus GroupMshr::capture_response(L1NocFlit *flit, int lane)
     }
     e.beats_arrived++;
     this->stat_resp_mshr++;
+    {
+        int64_t rnow = this->clock.get_cycles();
+        this->rin_beats++;
+        if (rnow != this->rin_last_cycle) { this->rin_last_cycle = rnow; this->rin_cycles++; }
+    }
     delete flit;
 
     if (e.state == ST_WAIT_RESP)
@@ -1560,6 +1578,11 @@ void GroupMshr::drain_cycle()
             // re-sent from retry()), so account the delivery now rather than
             // on acceptance — otherwise the retry-resend is delivered twice.
             e.served_cnt++;
+            {
+                int64_t onow = this->clock.get_cycles();
+                this->rout_beats++;
+                if (onow != this->rout_last_cycle) { this->rout_last_cycle = onow; this->rout_cycles++; }
+            }
             e.served_mask &= ~(1u << si);
             this->sub_rr = (si + 1) % (int)e.subs.size();
             delivered++;
