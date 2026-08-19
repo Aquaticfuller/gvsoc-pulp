@@ -306,6 +306,14 @@ private:
     // burst's beats come back". Entries with a single beat span 0 cycles and
     // are excluded, or they bias the rate toward infinitely fast.
     uint64_t f2l_entries = 0, f2l_span_sum = 0, f2l_beats_sum = 0;
+    // TIME-AVERAGED occupancy: valid-entry count accumulated once per cycle,
+    // divided by the total simulated cycles at exit. The occ= field in the
+    // window dump is an INSTANTANEOUS sample at 8192-cycle boundaries, which
+    // is an estimator, not a mean -- and it was quoted as one.
+    // Cycles in which the fsm does not run contribute zero, which is correct:
+    // a valid entry always keeps the fsm armed, so no-tick implies no entries.
+    int64_t occ_last_cycle = -1;
+    uint64_t occ_sum = 0;
     int64_t rin_last_cycle = -1;
     uint64_t rin_beats = 0, rin_cycles = 0;   // beats into the MSHR, distinct cycles
     int64_t rout_last_cycle = -1;
@@ -414,6 +422,12 @@ GroupMshr::~GroupMshr()
                 (double)this->f2l_beats_sum / this->f2l_entries,
                 this->f2l_span_sum ?
                     (double)(this->f2l_beats_sum - this->f2l_entries) / this->f2l_span_sum : 0.0);
+        }
+        {
+            int64_t total = this->clock.get_cycles();
+            fprintf(f, "  %s occupancy: sum=%lu over %ld cyc = %.2f valid entries (of %d)\n",
+                this->get_path().c_str(), (unsigned long)this->occ_sum, (long)total,
+                total > 0 ? (double)this->occ_sum / total : 0.0, this->num_entries);
         }
         if (this->rin_cycles || this->rout_cycles)
         {
@@ -1469,6 +1483,16 @@ void GroupMshr::door_handler(vp::Block *__this, vp::ClockEvent *)
         }
     }
 
+    {
+        int64_t onow = _this->clock.get_cycles();
+        if (onow != _this->occ_last_cycle)
+        {
+            _this->occ_last_cycle = onow;
+            int nv = 0;
+            for (Entry &e : _this->entries) if (e.valid) nv++;
+            _this->occ_sum += (uint64_t)nv;
+        }
+    }
     _this->drain_cycle();
     _this->replay_holds();
     _this->serve_timeouts(_this->clock.get_cycles());
