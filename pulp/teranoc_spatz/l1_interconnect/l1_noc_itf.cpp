@@ -451,7 +451,24 @@ vp::IoRespAck L1_NocItf::tcdm_response(vp::Block *__this, vp::IoReq *req, int po
         vp_assert(idx >= 0 && idx < entry->second.beats_expected, &_this->trace,
             "TCDM burst beat index %d out of range (port %d)\n", idx, port);
 
+        // ParityDrain return path (RTL: beat b leaves on resp port 1+(b&1)).
+        // Every beat of a burst used to take request_to_response_port[], one
+        // fixed channel, and only ONE beat is accepted per channel per cycle
+        // (response_accept_cycle below) -- so a burst returned at exactly one
+        // beat/cycle no matter that the MSHR drains 2 and the VLSU receives 2.
+        // Alternating by beat index puts consecutive beats on different
+        // channels so both can be accepted in the same cycle.
+        //
+        // Safe here without the RTL's core_id retag: our requester routes a
+        // beat by flit->source_port, which travels IN the flit, so the
+        // delivery identity is independent of which channel carried it. In
+        // the RTL the identity IS the route ((tile_id, core_id, meta_id)),
+        // which is why it needs the retag to make the same change legal.
         int response_port = _this->request_to_response_port[request_port];
+        if (_this->nb_resp_ports > 1)
+        {
+            response_port = idx & (_this->nb_resp_ports - 1);
+        }
         int64_t cycle = _this->clock.get_cycles();
         if (_this->response_occupancy(response_port) >= _this->response_spill_depth ||
             _this->response_accept_cycle[response_port] == cycle)
