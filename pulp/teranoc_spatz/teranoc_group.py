@@ -131,6 +131,7 @@ class TeranocGroup(st.Component):
                 auto_bypass_probe=int(os.environ.get('TERANOC_MSHR_AUTO_BYPASS_PROBE', 16)),
                 auto_probe_window=int(os.environ.get('TERANOC_MSHR_AUTO_PROBE_WINDOW', 255)),
                 nb_groups=arch.nb_groups,
+                nb_x_groups=arch.nb_x_groups,
                 max_burst_words=arch.vlsu_burst.max_burst_words)
 
         # Group fine-grained barrier (teranoc_spatz): a held-response slave on

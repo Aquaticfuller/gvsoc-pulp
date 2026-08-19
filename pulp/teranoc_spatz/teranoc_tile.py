@@ -114,7 +114,8 @@ class TeranocTile(st.Component):
             snitch_address_scrambler_list.append(L1AddressScrambler(
                 self, f'snitch_address_scrambler{i}', bypass=False, num_tiles=arch.nb_tiles_total,
                 seq_mem_size_per_tile=512 * arch.nb_snitch_per_tile,
-                byte_offset=arch.l1_bank_byte_offset, num_banks_per_tile=arch.nb_banks_per_tile))
+                byte_offset=arch.l1_bank_byte_offset, num_banks_per_tile=arch.nb_banks_per_tile,
+                src_core=i))
 
         # Spatz VLSU address scramblers. The VLSU ports then go through
         # their own routers, like Snitch LSUs, so they can reach AXI/Soc.
@@ -125,7 +126,8 @@ class TeranocTile(st.Component):
                     self, f'spatz_address_scrambler{i}',
                     bypass=False, num_tiles=arch.nb_tiles_total, seq_mem_size_per_tile=(
                         512 * arch.nb_snitch_per_tile), byte_offset=arch.l1_bank_byte_offset,
-                    num_banks_per_tile=arch.nb_banks_per_tile))
+                    num_banks_per_tile=arch.nb_banks_per_tile,
+                    src_core=i // arch.vlsu_ports_per_core))
 
         # The TCDM/SoC split is the L1 shim (RTL tcdm_shim), so a requester
         # goes scrambler -> L1 subsystem and its non-TCDM traffic comes back

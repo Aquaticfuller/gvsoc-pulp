@@ -33,6 +33,11 @@ private:
     unsigned int low_field_bits;
     unsigned int high_field_bits;
     unsigned int msb_constant_bits;
+    // Owning core of this requester port (-1 = not a core port, e.g.
+    // DMA/RedMulE). Stamped into req->remaining_size (dead on the TCDM path)
+    // so the group MSHR can scope its meta-conflict check per core like the
+    // RTL's (tile, core) match instead of tile-wide.
+    int src_core;
 };
 
 L1AddressScrambler::L1AddressScrambler(vp::ComponentConf &config)
@@ -50,6 +55,7 @@ L1AddressScrambler::L1AddressScrambler(vp::ComponentConf &config)
     this->high_field_bits = this->get_js_config()->get_uint("high_field_bits");
     this->msb_constant_bits =
         this->get_js_config()->get_uint("msb_constant_bits");
+    this->src_core = (int)this->get_js_config()->get_int("src_core");
 }
 
 void L1AddressScrambler::reset(bool active)
@@ -98,13 +104,18 @@ vp::IoReqStatus L1AddressScrambler::input_req(vp::Block *__this, vp::IoReq *req)
 {
     auto *_this = static_cast<L1AddressScrambler *>(__this);
     uint64_t original = req->get_addr();
+    uint64_t saved_remaining = req->remaining_size;
     req->set_addr(_this->scramble(original));
+    // Core stamp (see the src_core member): remaining_size is otherwise dead
+    // on the TCDM path, so it rides along to the L1 NoC interface's flit.
+    req->remaining_size = (uint64_t)(_this->src_core + 1);
     vp::IoReqStatus status = _this->output.req(req);
     if (status == vp::IO_REQ_DENIED)
     {
         // A DENIED IOv2 request remains upstream-owned and must be observable
         // in exactly its pre-call state when the source re-submits it.
         req->set_addr(original);
+        req->remaining_size = saved_remaining;
         _this->request_denied = true;
     }
     else

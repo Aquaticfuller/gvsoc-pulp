@@ -52,6 +52,10 @@ public:
 
     int src_tile = 0;
     int source_port = 0;
+    // Owning core of the requesting requester port (-1 = unknown/non-core).
+    // Carries the per-core identity through the NoC so the group MSHR can
+    // scope its meta-conflict check per (tile, core) like the RTL.
+    int src_core = -1;
 
     // Burst response beats (teranoc_spatz). A burst request (size > 4 B) stays
     // one object on the request mesh; its response is one flit per word.

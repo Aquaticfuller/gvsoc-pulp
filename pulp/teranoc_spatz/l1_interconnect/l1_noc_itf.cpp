@@ -287,6 +287,18 @@ vp::IoReqStatus L1_NocItf::handle_core_req(vp::IoReq *req, int port)
         flit->src_x = this->group_id_x;
         flit->src_y = this->group_id_y;
         flit->source_port = port;
+        // Core stamp from the address scrambler (remaining_size carrier):
+        // value 0 = unstamped -> -1, else core = value - 1. The carrier is
+        // restored IMMEDIATELY: the NoC NI tracks burst byte progress in the
+        // original request's remaining_size (floonoc_network_interface_v2.cpp
+        // sets it to the transfer size and decrements per beat), so leaving
+        // the stamp in place corrupts the beat accounting and deadlocks the
+        // burst assembly. Only the small stamp range (1..16) is trusted.
+        if (req->remaining_size >= 1 && req->remaining_size <= 16)
+        {
+            flit->src_core = (int)req->remaining_size - 1;
+        }
+        req->remaining_size = 0;
         flit->set_addr(req->get_addr());
         flit->initiator_addr = req->get_addr();
         flit->set_size(req->get_size());

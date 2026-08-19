@@ -78,6 +78,7 @@ private:
     {
         int tile;
         int port;
+        int core;          // owning core (-1 = unknown; RTL (tile,core) scope)
         L1NocFlit *flit;   // the requester's own flit (response envelope)
         bool flit_mine;    // false for the owner: its flit is forwarded as the
                            // fetch and deleted by the destination NI; merged
@@ -144,6 +145,9 @@ private:
     // FPU, so the rate profile shows ramp/plateau/tail.
     static void win_handler(vp::Block *__this, vp::ClockEvent *event);
     uint64_t win_prev_merged = 0, win_prev_alloc = 0, win_prev_drained = 0;
+    uint64_t win_prev_timeout = 0, win_prev_bypass = 0;
+    uint64_t win_prev_deny_stall = 0, win_prev_deny_meta = 0, win_prev_deny_slot = 0;
+    uint64_t win_prev_lt_hold = 0, win_prev_lt_flight = 0, win_prev_lt_drain = 0;
     // Runtime CSR port (mempool_group_mshr_cfg.sv): single slave fed by the
     // group barrier's bank-3 decode. Always GRANTED; the response (ack for
     // writes, status word for reads) leaves one cycle later via cfg_resp_event
@@ -214,6 +218,7 @@ private:
     bool stall_on_resp;
     int bypass_track_ways;
     int nb_groups;
+    int nb_x_groups;
     int max_burst_words;
     int nb_banks;
     int spill;   // 1: +1-cycle spill register on req_out/resp_in/resp_out
@@ -285,8 +290,14 @@ private:
     uint64_t stat_alloc_single = 0, stat_alloc_burst = 0;
     uint64_t stat_bypass_single = 0, stat_bypass_burst = 0;
     uint64_t stat_deny_stall = 0, stat_deny_meta = 0, stat_deny_slot = 0;
+    uint64_t stat_mshr_timeout = 0;   // hold windows expired below the sub target
     // Entry lifetime (alloc->issue->first beat->retire), in cycles.
     uint64_t stat_lt_n = 0, stat_lt_hold = 0, stat_lt_flight = 0, stat_lt_drain = 0, stat_lt_total = 0;
+    // Flight time vs |dx|+|dy| mesh distance (hops from the requesting
+    // group to the entry's target group): the transport law check — flight
+    // should be ~2*hops*2 cyc + L2 for every hop count (2 cyc/hop/direction).
+    uint64_t stat_lt_flight_hops[16] = {0};
+    uint64_t stat_lt_n_hops[16] = {0};
     uint64_t stat_ret_burst_subs[9] = {0};
     uint64_t stat_ret_single_subs[9] = {0};
 
@@ -343,6 +354,17 @@ GroupMshr::~GroupMshr()
                 (double)this->stat_lt_flight / this->stat_lt_n,
                 (double)this->stat_lt_drain / this->stat_lt_n,
                 (double)this->stat_lt_total / this->stat_lt_n);
+            fprintf(f, "  %s flight_by_hops:", this->get_path().c_str());
+            for (int k = 0; k < 16; k++)
+            {
+                if (this->stat_lt_n_hops[k])
+                {
+                    fprintf(f, " %d:%.1f/%lu", k,
+                        (double)this->stat_lt_flight_hops[k] / this->stat_lt_n_hops[k],
+                        (unsigned long)this->stat_lt_n_hops[k]);
+                }
+            }
+            fprintf(f, "\n");
         }
         fprintf(f, "  %s denies: stall=%lu meta=%lu slot=%lu\n",
             this->get_path().c_str(), (unsigned long)this->stat_deny_stall,
@@ -391,6 +413,7 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->stall_on_resp = cfg->get_int("stall_on_resp");
     this->bypass_track_ways = cfg->get_int("bypass_track_ways");
     this->nb_groups = cfg->get_int("nb_groups");
+    this->nb_x_groups = cfg->get_int("nb_x_groups");
     this->max_burst_words = cfg->get_int("max_burst_words");
     this->nb_banks = this->num_entries / this->ways_per_bank;
     this->spill = cfg->get_int("spill");
@@ -753,7 +776,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
                 "MSHR_MERGE lane=%d addr=0x%lx entry=%d subs=%d\n",
                 lane, (unsigned long)addr, (int)(hit - this->entries.data()),
                 (int)hit->subs.size());
-            hit->subs.push_back(Sub{tile, port, flit, true, flit->burst, flit->src_x, flit->src_y, flit->initiator_addr});
+            hit->subs.push_back(Sub{tile, port, flit->src_core, flit, true, flit->burst, flit->src_x, flit->src_y, flit->initiator_addr});
             this->stat_merged++;
             if (is_burst) this->stat_merged_burst++; else this->stat_merged_single++;
             // Merge success: clear the class's stall streak and bypass.
@@ -824,12 +847,20 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
         //    are left unconstrained: the single-vs-burst cross-conflict
         //    serialized the A/B interleave and measured WORSE — 17,305 vs
         //    13,807 on 128x128x512.)
+        //    Scope: per (tile, core) like the RTL's (tile_id, core_id) match.
+        //    The first per-core attempt (build62) regressed on both meshes —
+        //    but that build carried the remaining_size stamp leak that
+        //    corrupted the NI's burst accounting and deadlocked the tail, so
+        //    those verdicts are VOID. Re-measured on the leak-fixed control
+        //    (build65: gemm512 4x4 = 44,532, bit-identical to the anchor).
         if (is_burst)
         {
             for (Entry &o : this->entries)
             {
                 if (o.valid && o.burst_len > 1 && !o.subs.empty() &&
-                    o.subs[0].tile == tile)
+                    o.subs[0].tile == tile &&
+                    (flit->src_core < 0 || o.subs[0].core < 0 ||
+                     o.subs[0].core == flit->src_core))
                 {
                     this->stat_deny_meta++;
                     this->lane_retry_owed[lane] = true;
@@ -854,7 +885,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             e->issued = false;
             e->fetch_blocked = false;
             e->subs.clear();
-            e->subs.push_back(Sub{tile, port, flit, false, flit->burst, flit->src_x, flit->src_y, flit->initiator_addr});
+            e->subs.push_back(Sub{tile, port, flit->src_core, flit, false, flit->burst, flit->src_x, flit->src_y, flit->initiator_addr});
             e->resp_rd = 0;
             e->arrived_mask = 0;
             e->arrive_pending = 0;
@@ -1066,6 +1097,7 @@ void GroupMshr::replay_holds()
             int target = cls ? this->hold_subs_burst : this->hold_subs_single;
             if ((int)e.subs.size() < target)
             {
+                this->stat_mshr_timeout++;   // RTL's mshr_timeout counter
                 this->auto_stall_miss(cls);
             }
         }
@@ -1219,12 +1251,35 @@ void GroupMshr::win_handler(vp::Block *__this, vp::ClockEvent *)
         uint64_t dm = _this->stat_merged - _this->win_prev_merged;
         uint64_t da = _this->stat_alloc - _this->win_prev_alloc;
         uint64_t dd = _this->stat_lt_n - _this->win_prev_drained;
+        uint64_t dt = _this->stat_mshr_timeout - _this->win_prev_timeout;
+        uint64_t db = _this->stat_bypass - _this->win_prev_bypass;
+        uint64_t ds = _this->stat_deny_stall - _this->win_prev_deny_stall;
+        uint64_t dmt = _this->stat_deny_meta - _this->win_prev_deny_meta;
+        uint64_t dsl = _this->stat_deny_slot - _this->win_prev_deny_slot;
+        uint64_t lh = _this->stat_lt_hold - _this->win_prev_lt_hold;
+        uint64_t lf = _this->stat_lt_flight - _this->win_prev_lt_flight;
+        uint64_t ld = _this->stat_lt_drain - _this->win_prev_lt_drain;
         _this->win_prev_merged = _this->stat_merged;
         _this->win_prev_alloc = _this->stat_alloc;
         _this->win_prev_drained = _this->stat_lt_n;
-        fprintf(win_f, "WIN cyc=%ld merged=%lu alloc=%lu retired=%lu\n",
+        _this->win_prev_timeout = _this->stat_mshr_timeout;
+        _this->win_prev_bypass = _this->stat_bypass;
+        _this->win_prev_deny_stall = _this->stat_deny_stall;
+        _this->win_prev_deny_meta = _this->stat_deny_meta;
+        _this->win_prev_deny_slot = _this->stat_deny_slot;
+        _this->win_prev_lt_hold = _this->stat_lt_hold;
+        _this->win_prev_lt_flight = _this->stat_lt_flight;
+        _this->win_prev_lt_drain = _this->stat_lt_drain;
+        int nvalid = 0;
+        for (Entry &e : _this->entries) if (e.valid) nvalid++;
+        double dn = dd ? (double)dd : 1.0;
+        fprintf(win_f, "WIN cyc=%ld merged=%lu alloc=%lu retired=%lu mshr_to=%lu bankfull=%lu"
+            " dny[s=%lu m=%lu sl=%lu] occ=%d lt[h=%.1f f=%.1f d=%.1f]\n",
             (long)_this->clock.get_cycles(), (unsigned long)dm,
-            (unsigned long)da, (unsigned long)dd);
+            (unsigned long)da, (unsigned long)dd,
+            (unsigned long)dt, (unsigned long)db,
+            (unsigned long)ds, (unsigned long)dmt, (unsigned long)dsl,
+            nvalid, (double)lh / dn, (double)lf / dn, (double)ld / dn);
         fflush(win_f);
     }
     _this->win_event.enqueue(8192);
@@ -1499,6 +1554,7 @@ void GroupMshr::drain_cycle()
     (void)cycles;
 }
 
+
 void GroupMshr::retire_if_done(Entry *e)
 {
     if (e->beats_drained < e->burst_len)
@@ -1537,6 +1593,20 @@ void GroupMshr::retire_if_done(Entry *e)
         this->stat_lt_flight += (uint64_t)(fb - e->issued_cycle);
         this->stat_lt_drain += (uint64_t)(this->clock.get_cycles() - fb);
         this->stat_lt_total += (uint64_t)(this->clock.get_cycles() - e->birth_cycle);
+        // Flight vs mesh distance: hops = |dx| + |dy| between the owning
+        // group (subs[0].src_x/y) and the target group (gid = x*ny + y).
+        if (!e->subs.empty() && e->subs[0].src_x >= 0)
+        {
+            int ny = this->nb_groups / this->nb_x_groups;
+            int tgt_x = e->tgt_group / ny;
+            int tgt_y = e->tgt_group % ny;
+            int hops = abs(e->subs[0].src_x - tgt_x) + abs(e->subs[0].src_y - tgt_y);
+            if (hops < 16)
+            {
+                this->stat_lt_flight_hops[hops] += (uint64_t)(fb - e->issued_cycle);
+                this->stat_lt_n_hops[hops]++;
+            }
+        }
     }
     e->subs.clear();
     if (e->burst_len == 1 && this->resp_cache)
