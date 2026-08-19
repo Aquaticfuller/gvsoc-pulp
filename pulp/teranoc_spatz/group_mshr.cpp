@@ -264,6 +264,13 @@ private:
     // ---------------- state
     std::vector<Entry> entries;               // num_entries
     std::vector<std::vector<int>> bank_ways;  // bank -> entry indices
+    // Per-bank allocation and bank-full histogram. The hash matches the RTL,
+    // but a shift that CONCENTRATES entries into few banks pushes traffic onto
+    // the bypass path, whose timing differs sharply -- the candidate mechanism
+    // behind the knob hypersensitivity (single-step shift changes swing cycles
+    // 11x-30x here, non-monotonically, where the RTL is smooth).
+    std::vector<uint64_t> bank_alloc;
+    std::vector<uint64_t> bank_full_miss;
     std::vector<L1NocFlit *> lane_pending;    // parked flit per lane (door input)
     std::vector<bool> lane_retry_owed;
     std::vector<bool> req_out_blocked;
@@ -476,6 +483,19 @@ GroupMshr::~GroupMshr()
                 this->occ_active ? (double)this->occ_sum / this->occ_active : 0.0,
                 (unsigned long)this->occ_fsm_cycles);
         }
+        {
+            uint64_t tot=0, mx=0; int used=0;
+            for (uint64_t v : this->bank_alloc) { tot+=v; if (v>mx) mx=v; if (v) used++; }
+            uint64_t ftot=0; for (uint64_t v : this->bank_full_miss) ftot+=v;
+            fprintf(f, "  %s bank_spread: banks=%d used=%d alloc=%lu max_bank=%lu "
+                "concentration=%.2f bank_full=%lu (%.1f%% of allocs)\n",
+                this->get_path().c_str(), this->nb_banks, used, (unsigned long)tot,
+                (unsigned long)mx, tot ? (double)mx / ((double)tot/this->nb_banks) : 0.0,
+                (unsigned long)ftot, tot ? 100.0*ftot/tot : 0.0);
+            fprintf(f, "  %s bank_hist:", this->get_path().c_str());
+            for (uint64_t v : this->bank_alloc) fprintf(f, " %lu", (unsigned long)v);
+            fprintf(f, "\n");
+        }
         fprintf(f, "  %s bypass_exit: empty=%lu blocked=%lu denied=%lu"
             " depth_mean=%.2f depth_max=%lu\n",
             this->get_path().c_str(), (unsigned long)this->byp_exit_empty,
@@ -576,8 +596,35 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->auto_bypass_probe = cfg->get_int("auto_bypass_probe");
     this->auto_probe_window = cfg->get_int("auto_probe_window");
 
+    // Knob legality, ported from mempool_group_mshr.sv's elaboration $error
+    // checks. The model had NONE, so an illegal combination ran silently and
+    // produced a plausible cycle count for a machine that cannot be built --
+    // a bank_shift_burst of 4 at bank_burst_bits=1 measured 554,932 cycles
+    // here while the RTL refuses to elaborate it.
+    {
+        int burst_align_bits = 0;
+        while ((1 << burst_align_bits) < this->max_burst_words) burst_align_bits++;
+        int bank_id_w = 0;
+        while ((1 << bank_id_w) < this->nb_banks) bank_id_w++;
+        if (this->bank_shift_burst < burst_align_bits + this->bank_burst_bits)
+        {
+            this->trace.fatal("group_mshr: bank_shift_burst (%d) overlaps the intra-load burst "
+                "bits [%d +: %d]; the RTL requires bank_shift_burst >= %d. An overlapping shift "
+                "double-counts a bit and collapses half the banks.\n",
+                this->bank_shift_burst, burst_align_bits, this->bank_burst_bits,
+                burst_align_bits + this->bank_burst_bits);
+        }
+        if (this->bank_burst_bits >= bank_id_w)
+        {
+            this->trace.fatal("group_mshr: bank_burst_bits (%d) must leave at least one gap bit "
+                "(BankIdW=%d).\n", this->bank_burst_bits, bank_id_w);
+        }
+    }
+
     this->entries.resize(this->num_entries);
     this->bank_ways.resize(this->nb_banks);
+    this->bank_alloc.resize(this->nb_banks, 0);
+    this->bank_full_miss.resize(this->nb_banks, 0);
     for (int b = 0; b < this->nb_banks; b++)
         for (int w = 0; w < this->ways_per_bank; w++)
             this->bank_ways[b].push_back(b * this->ways_per_bank + w);
@@ -1059,6 +1106,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             e->served_cnt = 0;
             flit->mshr_tag = (int)(e - this->entries.data()) + 1;
             this->stat_alloc++;
+            this->bank_alloc[bank]++;
             if (is_burst) this->stat_alloc_burst++; else this->stat_alloc_single++;
             this->trace.msg(vp::Trace::LEVEL_TRACE,
                 "MSHR_ALLOC lane=%d addr=0x%lx entry=%d len=%d\n",
@@ -1103,6 +1151,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
         }
         if (bank_full)
         {
+            this->bank_full_miss[bank]++;
             flit->mshr_tag = 0;
             this->stat_bypass++;
             if (is_burst) this->stat_bypass_burst++; else this->stat_bypass_single++;
