@@ -278,6 +278,16 @@ private:
     // path the hold_subs_burst==1 shapes use EXCLUSIVELY (+228%/+233%).
     uint64_t byp_out_beats = 0, byp_out_cycles = 0, byp_hol = 0;
     int64_t byp_last_cycle = -1;
+    // WHY the drain loop stops, per entry into drain_cycle. Three exits, and
+    // they imply different fixes:
+    //   empty   -> the queue ran dry: SUPPLY-limited upstream (NoC into the
+    //              group), and the drain is not the choke at all
+    //   blocked -> resp_out_blocked[lane]: head-of-line behind a busy lane
+    //   denied  -> the downstream crossbar refused: crossbar is the choke
+    // Also track queue depth on entry: a persistently shallow queue is
+    // supply-limited by definition, however the loop happens to exit.
+    uint64_t byp_exit_empty = 0, byp_exit_blocked = 0, byp_exit_denied = 0;
+    uint64_t byp_depth_sum = 0, byp_depth_n = 0, byp_depth_max = 0;
     // req_in spill (one-cycle input register per lane): 0=idle, 1=filling
     // (presenting next cycle), 2=presenting (resend is processed).
     std::vector<int> req_spill_state;
@@ -456,6 +466,12 @@ GroupMshr::~GroupMshr()
                 this->occ_active ? (double)this->occ_sum / this->occ_active : 0.0,
                 (unsigned long)this->occ_fsm_cycles);
         }
+        fprintf(f, "  %s bypass_exit: empty=%lu blocked=%lu denied=%lu"
+            " depth_mean=%.2f depth_max=%lu\n",
+            this->get_path().c_str(), (unsigned long)this->byp_exit_empty,
+            (unsigned long)this->byp_exit_blocked, (unsigned long)this->byp_exit_denied,
+            this->byp_depth_n ? (double)this->byp_depth_sum / this->byp_depth_n : 0.0,
+            (unsigned long)this->byp_depth_max);
         fprintf(f, "  %s bypass_delivery: beats=%lu cycles=%lu width=%.4f hol_stalls=%lu\n",
             this->get_path().c_str(), (unsigned long)this->byp_out_beats,
             (unsigned long)this->byp_out_cycles,
@@ -1589,6 +1605,13 @@ void GroupMshr::drain_cycle()
     int64_t cycles = this->clock.get_cycles();
 
     // Bypass beats first: strict priority, one per bypass lane per cycle.
+    {
+        size_t d = this->bypass_queue.size();
+        this->byp_depth_sum += (uint64_t)d;
+        this->byp_depth_n++;
+        if ((uint64_t)d > this->byp_depth_max) this->byp_depth_max = (uint64_t)d;
+    }
+    bool byp_stopped = false;
     while (!this->bypass_queue.empty())
     {
         L1NocFlit *flit = this->bypass_queue.front().first;
@@ -1597,6 +1620,7 @@ void GroupMshr::drain_cycle()
         {
             // Head-of-line: the queue may hold beats for OTHER, free lanes.
             if (this->bypass_queue.size() > 1) this->byp_hol++;
+            this->byp_exit_blocked++; byp_stopped = true;
             break;
         }
         {
@@ -1612,10 +1636,12 @@ void GroupMshr::drain_cycle()
             this->bypass_queue.pop_front();
             this->resp_out_blocked[lane] = true;
             this->resp_out_held[lane] = flit;
+            this->byp_exit_denied++; byp_stopped = true;
             break;
         }
         this->bypass_queue.pop_front();
     }
+    if (!byp_stopped) this->byp_exit_empty++;
 
     // MSHR entries, round-robin: per entry up to drain_beats deliveries per
     // cycle (ParityDrain), each beat on its parity lane.
