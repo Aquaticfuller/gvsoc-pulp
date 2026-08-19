@@ -271,6 +271,13 @@ private:
     std::vector<bool> resp_out_blocked;
     std::vector<L1NocFlit *> resp_out_held;    // elected beat held per lane
     std::deque<std::pair<L1NocFlit *, int>> bypass_queue; // bypass beats (priority)
+    // Bypass DELIVERY width. The MSHR drain spreads beats across lanes by
+    // parity (beat & 1); this path uses whatever lane the beat arrived on and
+    // breaks on the first blocked lane even when later queue entries have a
+    // free one. Both would cap bypassed bursts at 1 beat/cycle, which is the
+    // path the hold_subs_burst==1 shapes use EXCLUSIVELY (+228%/+233%).
+    uint64_t byp_out_beats = 0, byp_out_cycles = 0, byp_hol = 0;
+    int64_t byp_last_cycle = -1;
     // req_in spill (one-cycle input register per lane): 0=idle, 1=filling
     // (presenting next cycle), 2=presenting (resend is processed).
     std::vector<int> req_spill_state;
@@ -449,6 +456,11 @@ GroupMshr::~GroupMshr()
                 this->occ_active ? (double)this->occ_sum / this->occ_active : 0.0,
                 (unsigned long)this->occ_fsm_cycles);
         }
+        fprintf(f, "  %s bypass_delivery: beats=%lu cycles=%lu width=%.4f hol_stalls=%lu\n",
+            this->get_path().c_str(), (unsigned long)this->byp_out_beats,
+            (unsigned long)this->byp_out_cycles,
+            this->byp_out_cycles ? (double)this->byp_out_beats / this->byp_out_cycles : 0.0,
+            (unsigned long)this->byp_hol);
         fprintf(f, "  %s bypass_beats_by_class: write=%lu read_burst=%lu read_single=%lu\n",
             this->get_path().c_str(), (unsigned long)this->stat_bypass_wr,
             (unsigned long)this->stat_bypass_rd_burst,
@@ -1583,7 +1595,14 @@ void GroupMshr::drain_cycle()
         int lane = this->bypass_queue.front().second;
         if (this->resp_out_blocked[lane])
         {
+            // Head-of-line: the queue may hold beats for OTHER, free lanes.
+            if (this->bypass_queue.size() > 1) this->byp_hol++;
             break;
+        }
+        {
+            int64_t bc = this->clock.get_cycles();
+            this->byp_out_beats++;
+            if (bc != this->byp_last_cycle) { this->byp_last_cycle = bc; this->byp_out_cycles++; }
         }
         vp::IoReqStatus st = this->resp_out_v[lane]->req(flit);
         if (st == vp::IO_REQ_DENIED)
