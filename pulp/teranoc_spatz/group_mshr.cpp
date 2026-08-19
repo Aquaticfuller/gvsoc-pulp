@@ -270,7 +270,17 @@ private:
     std::vector<L1NocFlit *> req_out_held;    // fetch held per lane (downstream denied)
     std::vector<bool> resp_out_blocked;
     std::vector<L1NocFlit *> resp_out_held;    // elected beat held per lane
-    std::deque<std::pair<L1NocFlit *, int>> bypass_queue; // bypass beats (priority)
+    // Bypass beats, ONE QUEUE PER LANE. A single shared FIFO head-of-line
+    // blocks across tiles: a 16-beat burst response all targets one tile, so
+    // consecutive entries share a lane, and the drain would deliver one beat,
+    // find the lane busy for a cycle, and abort -- leaving beats for the other
+    // 31 lanes stranded behind it. Measured: denied == attempts EXACTLY
+    // (72,240 both), queue 652 deep, 32 lanes each able to take 1 word/cycle.
+    // Per-lane queues match the hardware, where each tile response port is an
+    // independent path, and make the drain O(nb_lanes) with no cross-lane HoL.
+    std::vector<std::deque<L1NocFlit *>> bypass_q_lane;
+    size_t bypass_q_total = 0;
+    int bypass_rr = 0;
     // Bypass DELIVERY width. The MSHR drain spreads beats across lanes by
     // parity (beat & 1); this path uses whatever lane the beat arrived on and
     // breaks on the first blocked lane even when later queue entries have a
@@ -1315,7 +1325,8 @@ vp::IoReqStatus GroupMshr::capture_response(L1NocFlit *flit, int lane)
         if (flit->get_is_write()) this->stat_bypass_wr++;
         else if (flit->beat_idx >= 0) this->stat_bypass_rd_burst++;
         else this->stat_bypass_rd_single++;
-        this->bypass_queue.push_back({flit, lane});
+        this->bypass_q_lane[lane].push_back(flit);
+        this->bypass_q_total++;
         this->fsm_event.enqueue(0);
         return vp::IO_REQ_DONE;
     }
@@ -1574,7 +1585,7 @@ void GroupMshr::door_handler(vp::Block *__this, vp::ClockEvent *)
 
     // Keep ticking while work remains: bypass beats queued, entries draining,
     // fetches held or blocked, or timeouts pending.
-    bool work = !_this->bypass_queue.empty();
+    bool work = _this->bypass_q_total != 0;
     if (!work)
     {
         for (Entry &e : _this->entries)
@@ -1605,43 +1616,64 @@ void GroupMshr::drain_cycle()
     int64_t cycles = this->clock.get_cycles();
 
     // Bypass beats first: strict priority, one per bypass lane per cycle.
+    // Round-robin ACROSS LANES so no tile starves and no lane's backlog blocks
+    // another's -- each lane is an independent path in the hardware.
     {
-        size_t d = this->bypass_queue.size();
-        this->byp_depth_sum += (uint64_t)d;
+        this->byp_depth_sum += (uint64_t)this->bypass_q_total;
         this->byp_depth_n++;
-        if ((uint64_t)d > this->byp_depth_max) this->byp_depth_max = (uint64_t)d;
+        if ((uint64_t)this->bypass_q_total > this->byp_depth_max)
+            this->byp_depth_max = (uint64_t)this->bypass_q_total;
     }
-    bool byp_stopped = false;
-    while (!this->bypass_queue.empty())
+    if (this->bypass_q_total == 0)
     {
-        L1NocFlit *flit = this->bypass_queue.front().first;
-        int lane = this->bypass_queue.front().second;
-        if (this->resp_out_blocked[lane])
-        {
-            // Head-of-line: the queue may hold beats for OTHER, free lanes.
-            if (this->bypass_queue.size() > 1) this->byp_hol++;
-            this->byp_exit_blocked++; byp_stopped = true;
-            break;
-        }
-        {
-            int64_t bc = this->clock.get_cycles();
-            this->byp_out_beats++;
-            if (bc != this->byp_last_cycle) { this->byp_last_cycle = bc; this->byp_out_cycles++; }
-        }
-        vp::IoReqStatus st = this->resp_out_v[lane]->req(flit);
-        if (st == vp::IO_REQ_DENIED)
-        {
-            // Elected by the router: the SAME object must be re-sent from
-            // inside retry(), so move it to the per-lane held slot.
-            this->bypass_queue.pop_front();
-            this->resp_out_blocked[lane] = true;
-            this->resp_out_held[lane] = flit;
-            this->byp_exit_denied++; byp_stopped = true;
-            break;
-        }
-        this->bypass_queue.pop_front();
+        this->byp_exit_empty++;
     }
-    if (!byp_stopped) this->byp_exit_empty++;
+    else
+    {
+        int64_t bc = this->clock.get_cycles();
+        bool any = false;
+        for (int k = 0; k < this->nb_lanes; k++)
+        {
+            int lane = (this->bypass_rr + k) % this->nb_lanes;
+            if (this->bypass_q_lane[lane].empty())
+            {
+                continue;
+            }
+            if (this->resp_out_blocked[lane])
+            {
+                this->byp_exit_blocked++;
+                this->byp_hol++;
+                continue;
+            }
+            L1NocFlit *flit = this->bypass_q_lane[lane].front();
+            vp::IoReqStatus st = this->resp_out_v[lane]->req(flit);
+            this->bypass_q_lane[lane].pop_front();
+            this->bypass_q_total--;
+            if (st == vp::IO_REQ_DENIED)
+            {
+                // Elected by the router: the SAME object must be re-sent from
+                // inside retry(), so it moves to the per-lane held slot. This
+                // lane is now blocked; the OTHER lanes keep draining.
+                this->resp_out_blocked[lane] = true;
+                this->resp_out_held[lane] = flit;
+                this->byp_exit_denied++;
+                continue;
+            }
+            // Delivered. Count OUTCOMES, not attempts -- the previous counter
+            // sat before req() and reported denials as a delivery width.
+            this->byp_out_beats++;
+            any = true;
+            if (bc != this->byp_last_cycle)
+            {
+                this->byp_last_cycle = bc;
+                this->byp_out_cycles++;
+            }
+        }
+        if (any)
+        {
+            this->bypass_rr = (this->bypass_rr + 1) % this->nb_lanes;
+        }
+    }
 
     // MSHR entries, round-robin: per entry up to drain_beats deliveries per
     // cycle (ParityDrain), each beat on its parity lane.
