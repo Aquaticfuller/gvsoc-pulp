@@ -56,6 +56,8 @@ class SnitchMempoolConfig(RiscvConfig):
         desc="Burst ROB fill/commit words per cycle (TwinROB0).")
     vlsu_burst_issue_latency: int = cfg_field(default=0, dump=True,
         desc="Cycles between burst sends; 0 = derive from block_alloc (3/18).")
+    vlsu_burst_sub_word: int = cfg_field(default=0, dump=True,
+        desc="BurstSubWord: allow e16 on the burst path (RTL SPATZ_VLSU_BURST_EW16).")
 
 
 class ArchSnitchMempool(Arch):
@@ -216,7 +218,8 @@ class SnitchMempool(RiscvCommon):
                 vlsu_burst_block_alloc=config.vlsu_burst_block_alloc,
                 vlsu_burst_dual_load=config.vlsu_burst_dual_load,
                 vlsu_burst_recv_ports=config.vlsu_burst_recv_ports,
-                vlsu_burst_issue_latency=config.vlsu_burst_issue_latency)
+                vlsu_burst_issue_latency=config.vlsu_burst_issue_latency,
+                vlsu_burst_sub_word=config.vlsu_burst_sub_word)
 
     def o_VLSU(self, port: int, itf: gvsoc.systree.SlaveItf):
         # Burst mode streams per-beat responses on port 0 (IoV2Beat); a plain

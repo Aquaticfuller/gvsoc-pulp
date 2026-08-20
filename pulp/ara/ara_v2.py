@@ -131,7 +131,7 @@ def attach(component: Component, vlen: int, nb_lanes: int, use_spatz: bool=False
         spatz_nb_ports: int|None=None, lane_width=8, vlsu_v2: bool=False,
         nb_outstanding_reqs: int=8, reduction_is_serial: bool=False,
         reduction_step_latency: int=1, vlsu_burst_enable: int=0,
-        vlsu_burst_max_words: int=16, vlsu_burst_rob_depth: int=64,
+        vlsu_burst_max_words: int=16, vlsu_burst_rob_depth: int=64, vlsu_burst_sub_word: int=0,
         vlsu_burst_block_alloc: int=1, vlsu_burst_dual_load: int=2,
         vlsu_burst_recv_ports: int=2, vlsu_burst_issue_latency: int=0):
     component.add_sources([
@@ -187,6 +187,7 @@ def attach(component: Component, vlen: int, nb_lanes: int, use_spatz: bool=False
         # (legacy behavior); issue_latency 0 derives 3/18 from block_alloc.
         component.add_property('vu/burst_enable', int(vlsu_burst_enable))
         component.add_property('vu/burst_max_words', int(vlsu_burst_max_words))
+        component.add_property('vu/burst_sub_word', int(vlsu_burst_sub_word))
         component.add_property('vu/burst_rob_depth', int(vlsu_burst_rob_depth))
         component.add_property('vu/burst_block_alloc', int(vlsu_burst_block_alloc))
         component.add_property('vu/burst_dual_load', int(vlsu_burst_dual_load))

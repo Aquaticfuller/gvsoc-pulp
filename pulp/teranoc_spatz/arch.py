@@ -90,6 +90,13 @@ class VlsuBurstConfig:
     block_alloc:     bool = True   # spatz_vlsu_block_alloc (3-cyc cadence, else 18)
     dual_load:       int  = 2      # spatz_vlsu_dual_load: 1=legacy serialize, 2=H1
     recv_ports:      int  = 2      # BurstRecvPorts / TwinROB0 (<= group_mshr drain_beats)
+    # SPATZ_VLSU_BURST_EW16 / BurstSubWord (spatz_vlsu.sv:131). OFF reproduces
+    # the legacy gate `vsew == EW_32`; ON relaxes it to `vsew != EW_8`, so e16
+    # loads may take the burst path. Every other burst term is already in BYTES
+    # (>= FullBurstBytes, <= rob_words*4, 64 B alignment) and a 64 B burst is 16
+    # four-byte memory words regardless of element width, so nothing else moves.
+    # Default OFF: matches the RTL default and every calibration run to date.
+    sub_word:        bool = False  # e16 may burst
     burst_issue_latency: int = 3   # BlockAlloc decide->reserve->send cadence
     walk_issue_latency:  int = 18  # non-BlockAlloc per-burst cadence
 
@@ -652,6 +659,7 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
     vlsu_burst = VlsuBurstConfig(
         enable=bool(int(os.environ.get('TERANOC_VLSU_BURST_ENABLE', 1))),
         max_burst_words=16, rob_depth=64,
+        sub_word=bool(int(os.environ.get('TERANOC_VLSU_BURST_EW16', 0))),
         block_alloc=True, dual_load=2, recv_ports=2),
     # MSHR knobs default to config/terapool_spatz4_fpu.mk's built defaults
     # (2026-08-15 state: hold_window_burst and serve_timeout track the uniform

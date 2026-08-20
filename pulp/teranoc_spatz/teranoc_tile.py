@@ -169,6 +169,7 @@ class TeranocTile(st.Component):
                 core_config.vlsu_burst_block_alloc = int(arch.vlsu_burst.block_alloc)
                 core_config.vlsu_burst_dual_load = arch.vlsu_burst.dual_load
                 core_config.vlsu_burst_recv_ports = arch.vlsu_burst.recv_ports
+                core_config.vlsu_burst_sub_word = int(arch.vlsu_burst.sub_word)
                 core_config.vlsu_burst_issue_latency = (arch.vlsu_burst.burst_issue_latency
                     if arch.vlsu_burst.block_alloc else arch.vlsu_burst.walk_issue_latency)
             # SnitchMempool: barrier CSR + wake counter; optional vector unit.
