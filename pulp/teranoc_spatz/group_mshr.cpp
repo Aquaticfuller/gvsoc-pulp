@@ -335,6 +335,16 @@ private:
     uint64_t stat_bypass_single = 0, stat_bypass_burst = 0;
     uint64_t stat_deny_stall = 0, stat_deny_meta = 0, stat_deny_slot = 0;
     uint64_t stat_mshr_timeout = 0;   // hold windows expired below the sub target
+    // RESP_HOLD entries expire via serve_timeouts(), a DIFFERENT path that never
+    // touched stat_mshr_timeout -- so an entry that sat in RESP_HOLD and was
+    // released below target was invisible to the timeout counter. The RTL side
+    // hit the same class of blindness from the other direction: their classifier
+    // gates on hold_window_{single,burst} while a RESP_HOLD countdown arms from
+    // serve_timeout, so at hold_window_single=0 they reported mshr_timeout=0
+    // while carrying 27,505 RESP-HOLD episodes. Counted separately here rather
+    // than folded in, so "held then released short" stays distinguishable from
+    // "window expired short".
+    uint64_t stat_resp_hold_timeout = 0;
     // Entry lifetime (alloc->issue->first beat->retire), in cycles.
     uint64_t stat_lt_n = 0, stat_lt_hold = 0, stat_lt_flight = 0, stat_lt_drain = 0, stat_lt_total = 0;
     // Lifetime split by CLASS. Single-word entries drain in a couple of cycles
@@ -497,7 +507,9 @@ GroupMshr::~GroupMshr()
                 this->get_path().c_str(), this->nb_banks, used, (unsigned long)tot,
                 (unsigned long)mx, tot ? (double)mx / ((double)tot/this->nb_banks) : 0.0,
                 (unsigned long)ftot, tot ? 100.0*ftot/tot : 0.0);
-            fprintf(f, "  %s bank_hist:", this->get_path().c_str());
+            fprintf(f, "  %s resp_hold_timeout=%lu\n", this->get_path().c_str(),
+            (unsigned long)this->stat_resp_hold_timeout);
+        fprintf(f, "  %s bank_hist:", this->get_path().c_str());
             for (uint64_t v : this->bank_alloc) fprintf(f, " %lu", (unsigned long)v);
             fprintf(f, "\n");
         }
@@ -2006,6 +2018,7 @@ void GroupMshr::serve_timeouts(int64_t cycles)
             if ((int)e.subs.size() < this->hold_subs_single)
             {
                 // serve_timeout expiry below the release target = stall-miss.
+                this->stat_resp_hold_timeout++;
                 this->auto_stall_miss(0);
             }
             e.state = ST_DRAIN_RESP;
