@@ -178,7 +178,12 @@ private:
                 cls, this->miss_streak[cls]);
         }
     }
-    void reset(bool active) override { if (active) { this->hb_event.enqueue(65536); this->win_event.enqueue(8192); } }
+    // Window period for the per-phase dump. Default 8192, but a GEMM
+    // benchmark region can be SHORTER than that (256x32x256 is ~5,138 cycles),
+    // in which case every retirement lands in ONE window and time evolution is
+    // invisible. TERANOC_MSHR_WIN_PERIOD makes it resolvable.
+    int win_period = 8192;
+    void reset(bool active) override { if (active) { this->hb_event.enqueue(65536); this->win_event.enqueue(this->win_period); } }
 
     // ---------------- door (request path)
     vp::IoReqStatus handle_request(L1NocFlit *flit, int lane);
@@ -588,6 +593,10 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->nb_x_groups = cfg->get_int("nb_x_groups");
     this->max_burst_words = cfg->get_int("max_burst_words");
     this->nb_banks = this->num_entries / this->ways_per_bank;
+    {
+        const char *wpp = getenv("TERANOC_MSHR_WIN_PERIOD");
+        if (wpp) { int v = atoi(wpp); if (v > 0) this->win_period = v; }
+    }
     this->spill = cfg->get_int("spill");
     this->spill_req_in = cfg->get_int("spill_req_in");
     this->cfg_enable = cfg->get_int("cfg_enable_reset") != 0;
@@ -1510,7 +1519,7 @@ void GroupMshr::win_handler(vp::Block *__this, vp::ClockEvent *)
             nvalid, (double)lh / dn, (double)lf / dn, (double)ld / dn);
         fflush(win_f);
     }
-    _this->win_event.enqueue(8192);
+    _this->win_event.enqueue(_this->win_period);
 }
 
 void GroupMshr::hb_handler(vp::Block *__this, vp::ClockEvent *)
