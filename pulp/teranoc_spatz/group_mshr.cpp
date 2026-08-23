@@ -353,6 +353,7 @@ private:
     uint64_t stat_bypass_single = 0, stat_bypass_burst = 0;
     uint64_t stat_deny_stall = 0, stat_deny_meta = 0, stat_deny_slot = 0;
     uint64_t stat_deny_bankfull = 0;
+    uint64_t slot_block_self = 0, slot_block_other = 0;
     uint64_t stat_mshr_timeout = 0;   // hold windows expired below the sub target
     // RESP_HOLD entries expire via serve_timeouts(), a DIFFERENT path that never
     // touched stat_mshr_timeout -- so an entry that sat in RESP_HOLD and was
@@ -669,6 +670,12 @@ GroupMshr::~GroupMshr()
                 fprintf(f, "\n");
             }
         }
+        fprintf(f, "  %s slot_block: self=%lu other_group=%lu (%.1f%% stolen)\n",
+            this->get_path().c_str(), (unsigned long)this->slot_block_self,
+            (unsigned long)this->slot_block_other,
+            (this->slot_block_self + this->slot_block_other) ?
+                100.0 * this->slot_block_other /
+                (this->slot_block_self + this->slot_block_other) : 0.0);
         fprintf(f, "  %s denies: stall=%lu meta=%lu slot=%lu bankfull=%lu (bp=%d)\n",
             this->get_path().c_str(), (unsigned long)this->stat_deny_stall,
             (unsigned long)this->stat_deny_meta, (unsigned long)this->stat_deny_slot,
@@ -1386,13 +1393,18 @@ GroupMshr::Entry *GroupMshr::alloc_entry(int bank)
     // <=1 allocation per bank per cycle. Losing candidates stall (the door
     // returns DENIED to them), so a single check per call is enough.
     static std::vector<int> alloc_cycle;
+    static std::vector<const void *> alloc_owner;
     if ((int)alloc_cycle.size() < this->nb_banks)
     {
         alloc_cycle.assign(this->nb_banks, -1);
+        alloc_owner.assign(this->nb_banks, nullptr);
     }
     int64_t now = this->clock.get_cycles();
     if (alloc_cycle[bank] == now)
     {
+        // PROOF INSTRUMENT: attribute the block to this group or another one.
+        if (alloc_owner[bank] == (const void *)this) this->slot_block_self++;
+        else                                        this->slot_block_other++;
         return nullptr;   // already allocated here this cycle
     }
     for (int idx : this->bank_ways[bank])
@@ -1400,6 +1412,7 @@ GroupMshr::Entry *GroupMshr::alloc_entry(int bank)
         if (!this->entries[idx].valid)
         {
             alloc_cycle[bank] = now;
+            alloc_owner[bank] = (const void *)this;
             return &this->entries[idx];
         }
     }
