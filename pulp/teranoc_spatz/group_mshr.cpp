@@ -354,6 +354,8 @@ private:
     uint64_t stat_deny_stall = 0, stat_deny_meta = 0, stat_deny_slot = 0;
     uint64_t stat_deny_bankfull = 0;
     uint64_t slot_block_self = 0, slot_block_other = 0;
+    std::vector<int64_t> bank_alloc_cycle;      // last cycle THIS group allocated, per bank
+    std::vector<const void *> bank_alloc_owner; // self-check only; always `this`
     uint64_t stat_mshr_timeout = 0;   // hold windows expired below the sub target
     // RESP_HOLD entries expire via serve_timeouts(), a DIFFERENT path that never
     // touched stat_mshr_timeout -- so an entry that sat in RESP_HOLD and was
@@ -769,6 +771,8 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->bank_ways.resize(this->nb_banks);
     this->bank_alloc.resize(this->nb_banks, 0);
     this->bank_full_miss.resize(this->nb_banks, 0);
+    this->bank_alloc_cycle.resize(this->nb_banks, -1);
+    this->bank_alloc_owner.resize(this->nb_banks, nullptr);
     for (int b = 0; b < this->nb_banks; b++)
         for (int w = 0; w < this->ways_per_bank; w++)
             this->bank_ways[b].push_back(b * this->ways_per_bank + w);
@@ -1392,27 +1396,30 @@ GroupMshr::Entry *GroupMshr::alloc_entry(int bank)
 {
     // <=1 allocation per bank per cycle. Losing candidates stall (the door
     // returns DENIED to them), so a single check per call is enough.
-    static std::vector<int> alloc_cycle;
-    static std::vector<const void *> alloc_owner;
-    if ((int)alloc_cycle.size() < this->nb_banks)
-    {
-        alloc_cycle.assign(this->nb_banks, -1);
-        alloc_owner.assign(this->nb_banks, nullptr);
-    }
+    // PER-INSTANCE state. This was a function-local `static`, so every
+    // GroupMshr in the process shared ONE slot table -- 16 groups at 4x4, 64
+    // at 8x8, all contending for the same nb_banks slots, capping the whole
+    // chip at nb_banks allocations per cycle no matter how many groups it has.
+    // The RTL's bank_alloc_taken is per group MSHR. Measured before the fix:
+    // 86.0% of alloc-slot blocks at 4x4 were caused by a DIFFERENT group
+    // (322,253 of 374,617), and the door retry rate scaled with group count
+    // (1.2 deny/retry per resolved request at 4x4, 46.6 at 8x8).
+    // int64_t, not int: the cycle counter outlives 2^31 on long runs.
     int64_t now = this->clock.get_cycles();
-    if (alloc_cycle[bank] == now)
+    if (this->bank_alloc_cycle[bank] == now)
     {
-        // PROOF INSTRUMENT: attribute the block to this group or another one.
-        if (alloc_owner[bank] == (const void *)this) this->slot_block_self++;
-        else                                        this->slot_block_other++;
-        return nullptr;   // already allocated here this cycle
+        // Self-check: with per-instance state the blocker can only ever be
+        // this group, so slot_block_other must stay 0 in every dump.
+        if (this->bank_alloc_owner[bank] == (const void *)this) this->slot_block_self++;
+        else                                                    this->slot_block_other++;
+        return nullptr;   // this group already allocated into this bank this cycle
     }
     for (int idx : this->bank_ways[bank])
     {
         if (!this->entries[idx].valid)
         {
-            alloc_cycle[bank] = now;
-            alloc_owner[bank] = (const void *)this;
+            this->bank_alloc_cycle[bank] = now;
+            this->bank_alloc_owner[bank] = (const void *)this;
             return &this->entries[idx];
         }
     }
