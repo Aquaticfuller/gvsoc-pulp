@@ -354,6 +354,22 @@ private:
     uint64_t stat_deny_stall = 0, stat_deny_meta = 0, stat_deny_slot = 0;
     uint64_t stat_deny_bankfull = 0;
     uint64_t slot_block_self = 0, slot_block_other = 0;
+    // --- Subscriber arrival structure -------------------------------------
+    // The quantity to compare against the RTL tracer, and deliberately TWO
+    // measurements, because the RTL side's skew is not noise but a fixed
+    // tile-indexed ramp (snitch_axi_to_cache unrolls a merged miss's N-hot
+    // idmask one bit per cycle in ascending tile order, so tile t retires at
+    // base+t; measured +1 cyc/tile, mean (N-1)/2 = 7.5 at N=16):
+    //   arr_hist   -- WIDTH: offset of each late subscriber from the entry's
+    //                 first request. Ours is ~0; theirs gathers over ~46.93.
+    //   arr_by_tile -- CORRELATION: mean offset per tile index. A rotating
+    //                 arbiter averages to a flat line; a fixed ascending
+    //                 unroll gives a ramp. Same width can have either shape,
+    //                 and only the ramp accumulates into real inter-tile
+    //                 drift, so width alone cannot settle it.
+    uint64_t arr_hist[33] = {0};        // index = min(offset, 32)
+    std::vector<uint64_t> arr_tile_sum, arr_tile_n;
+    uint64_t arr_n = 0, arr_sum = 0, arr_max = 0;
     std::vector<int64_t> bank_alloc_cycle;      // last cycle THIS group allocated, per bank
     std::vector<const void *> bank_alloc_owner; // self-check only; always `this`
     uint64_t stat_mshr_timeout = 0;   // hold windows expired below the sub target
@@ -672,6 +688,20 @@ GroupMshr::~GroupMshr()
                 fprintf(f, "\n");
             }
         }
+        if (this->arr_n)
+        {
+            fprintf(f, "  %s sub_arrival: n=%lu mean=%.2f max=%lu |",
+                this->get_path().c_str(), (unsigned long)this->arr_n,
+                (double)this->arr_sum / this->arr_n, (unsigned long)this->arr_max);
+            for (int k = 0; k <= 32; k++)
+                if (this->arr_hist[k]) fprintf(f, " %d:%lu", k, (unsigned long)this->arr_hist[k]);
+            fprintf(f, "\n");
+            fprintf(f, "  %s sub_arrival_by_tile:", this->get_path().c_str());
+            for (int t = 0; t < this->nb_tiles_per_group; t++)
+                fprintf(f, " %d:%.2f", t, this->arr_tile_n[t] ?
+                    (double)this->arr_tile_sum[t] / this->arr_tile_n[t] : 0.0);
+            fprintf(f, "\n");
+        }
         fprintf(f, "  %s slot_block: self=%lu other_group=%lu (%.1f%% stolen)\n",
             this->get_path().c_str(), (unsigned long)this->slot_block_self,
             (unsigned long)this->slot_block_other,
@@ -771,6 +801,8 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->bank_ways.resize(this->nb_banks);
     this->bank_alloc.resize(this->nb_banks, 0);
     this->bank_full_miss.resize(this->nb_banks, 0);
+    this->arr_tile_sum.resize(this->nb_tiles_per_group, 0);
+    this->arr_tile_n.resize(this->nb_tiles_per_group, 0);
     this->bank_alloc_cycle.resize(this->nb_banks, -1);
     this->bank_alloc_owner.resize(this->nb_banks, nullptr);
     for (int b = 0; b < this->nb_banks; b++)
@@ -1145,6 +1177,20 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
                 lane, (unsigned long)addr, (int)(hit - this->entries.data()),
                 (int)hit->subs.size());
             hit->subs.push_back(Sub{tile, port, flit->src_core, flit, true, flit->burst, flit->src_x, flit->src_y, flit->initiator_addr});
+            {
+                // Offset from the entry's FIRST request (birth), which is the
+                // same origin the RTL tracer differences against.
+                int64_t off = this->clock.get_cycles() - hit->birth_cycle;
+                if (off < 0) off = 0;
+                this->arr_hist[off > 32 ? 32 : off]++;
+                this->arr_n++; this->arr_sum += (uint64_t)off;
+                if ((uint64_t)off > this->arr_max) this->arr_max = (uint64_t)off;
+                if (tile >= 0 && tile < this->nb_tiles_per_group)
+                {
+                    this->arr_tile_sum[tile] += (uint64_t)off;
+                    this->arr_tile_n[tile]++;
+                }
+            }
             this->stat_merged++;
             if (is_burst) this->stat_merged_burst++; else this->stat_merged_single++;
             // Merge success: clear the class's stall streak and bypass.
