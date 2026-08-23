@@ -106,6 +106,7 @@ class TeranocGroup(st.Component):
                 merge_reqs=arch.group_mshr.merge_reqs,
                 enable_single=arch.group_mshr.enable_single,
                 drain_beats=arch.group_mshr.drain_beats,
+                bankfull_bp=arch.group_mshr.bankfull_bp,
                 hold_window_single=arch.group_mshr.hold_window_single,
                 hold_window_burst=arch.group_mshr.hold_window_burst,
                 hold_subs_single=arch.group_mshr.hold_subs_single,

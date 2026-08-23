@@ -196,6 +196,10 @@ private:
     // ---------------- response path
     vp::IoReqStatus capture_response(L1NocFlit *flit, int lane);
     void drain_cycle();
+    void ldh_flush();
+    void ldh_count(int lane, int src);   // src: 0=drain, 1=bypass, 2=retry
+    void edh_flush();
+    void edh_count(int idx, int beat);
     void retire_if_done(Entry *e);
     void store_update(uint64_t addr, const uint8_t *data, uint64_t size);
     void amo_invalidate_all();
@@ -210,6 +214,20 @@ private:
     int merge_reqs;
     bool enable_single;
     int drain_beats;
+    // Bank-full policy (group_mshr_bankfull_backpressure, CSR 11). The RTL
+    // SHIPS this at 1: a mergeable miss whose bank has no free way STALLS and
+    // retries, exactly like one that merely lost the per-bank alloc slot.
+    // Legacy 0 bypasses -- and bypassing is what this model did
+    // unconditionally, which is the bank_shift cliff: per the RTL's own note,
+    // "a bypass splits the cohort: part of a round leaves without an MSHR tag,
+    // the bank frees, and a later member allocates a fresh entry whose
+    // subscriber target counts peers already served -- it then waits out
+    // serve_timeout." Measured signature of exactly that, at bsb=6 on
+    // 512x128x128: bank_full 0 -> 55.1% of allocs, merge 75% -> 58%, entry
+    // lifetime 49.6 -> 801.6 cyc, requests x10.3, wall clock x15.8.
+    // Bounded by serve_timeout (a held entry always releases), so a full bank
+    // cannot wedge a port permanently.
+    bool bankfull_bp;
     int hold_window_single;
     int hold_window_burst;
     int hold_subs_single;
@@ -334,6 +352,7 @@ private:
     uint64_t stat_alloc_single = 0, stat_alloc_burst = 0;
     uint64_t stat_bypass_single = 0, stat_bypass_burst = 0;
     uint64_t stat_deny_stall = 0, stat_deny_meta = 0, stat_deny_slot = 0;
+    uint64_t stat_deny_bankfull = 0;
     uint64_t stat_mshr_timeout = 0;   // hold windows expired below the sub target
     // RESP_HOLD entries expire via serve_timeouts(), a DIFFERENT path that never
     // touched stat_mshr_timeout -- so an entry that sat in RESP_HOLD and was
@@ -401,6 +420,48 @@ private:
     uint64_t stat_ret_burst_subs[9] = {0};
     uint64_t stat_ret_single_subs[9] = {0};
 
+    // --- Delivery-shape histograms (the drain stop-rule instrument) ---------
+    // Three drain "fixes" were reverted, two of them because they cancelled
+    // each other's error. The rule since: no fourth drain change until the
+    // model's delivery SHAPE is measured rather than guessed. Two different
+    // questions, so two histograms:
+    //
+    //   per (lane, cycle)  -- does the model ever push more than one word into
+    //       one tile response port in a single cycle? The hardware port takes
+    //       exactly one. Anything in bucket >=2 is over-delivery, and it would
+    //       be invisible in every throughput mean measured so far.
+    //   per (entry, cycle) -- the RTL drains ONE beat to N subscriber lanes;
+    //       this model drains up to drain_beats beats to ONE subscriber each.
+    //       Same total, different shape. The (deliveries, distinct beats) pair
+    //       per entry-cycle separates the two: RTL is (N, 1), model is (k, k).
+    //
+    // SPAN, stated at the point of measurement: the lane buckets accumulate
+    // over cycles in which this MSHR delivered at least one word (ldh_cycles),
+    // NOT over all simulated cycles -- an all-cycles denominator would mostly
+    // report idle time and put every lane in bucket 0. The zero bucket within
+    // a delivering cycle IS counted, so the per-cycle row sums to nb_lanes.
+    std::vector<int> ldh_lane_cnt;      // deliveries so far this cycle, per lane
+    std::vector<int> ldh_touched;       // lanes with a nonzero count this cycle
+    int64_t ldh_cycle = -1;             // cycle the above refer to
+    uint64_t ldh_hist[9] = {0};         // per (lane, cycle), index = min(n, 8)
+    std::vector<uint64_t> ldh_lanes_hist;  // lanes delivering, per cycle
+    uint64_t ldh_cycles = 0;            // cycles with >= 1 delivery (the span)
+    uint64_t ldh_drain = 0, ldh_bypass = 0, ldh_retry = 0;   // by path
+    uint64_t ldh_offer = 0, ldh_offer_denied = 0;   // first offers, and how many bounced
+    // NOTE the two histograms count different events by design: the lane
+    // buckets count ACCEPTED words (what entered a port), the entry buckets
+    // count the drain's COMMITTED deliveries (the model commits at flit
+    // creation, so these are offers). Mixing them would double-count every
+    // word that bounced -- which is exactly the error the first version made.
+    uint64_t edh_hist[9] = {0};         // committed deliveries per (entry, cycle)
+    uint64_t edh_beats_hist[9] = {0};   // distinct beats per (entry, cycle)
+    uint64_t edh_n = 0;                 // entry-cycles with >= 1 delivery
+    std::vector<int> edh_cnt, edh_beats_cnt, edh_lastbeat;
+    std::vector<int> edh_touched;
+    int64_t edh_cycle = -1;
+    uint64_t edh_visits = 0;            // drain visits (>= entry-cycles if the
+                                        // door FSM runs twice in one cycle)
+
     vp::Trace trace;
     vp::IoSlave *req_in_itfs = nullptr;
     vp::IoMaster *req_out_itfs = nullptr;
@@ -422,6 +483,8 @@ private:
 
 GroupMshr::~GroupMshr()
 {
+    this->ldh_flush();   // the final cycle's counts are still in flight
+    this->edh_flush();
     FILE *f = fopen("mshr_stats.log", "a");
     if (f)
     {
@@ -555,9 +618,61 @@ GroupMshr::~GroupMshr()
                 this->stat_burst_beats_sum ?
                     (double)this->stat_drain_burst_sum / this->stat_burst_beats_sum : 0.0);
         }
-        fprintf(f, "  %s denies: stall=%lu meta=%lu slot=%lu\n",
+        {
+            uint64_t lt = 0, lw = 0;
+            for (int k = 0; k <= 8; k++) { lt += this->ldh_hist[k]; lw += (uint64_t)k * this->ldh_hist[k]; }
+            uint64_t over = 0;
+            for (int k = 2; k <= 8; k++) over += this->ldh_hist[k];
+            fprintf(f, "  %s lane_deliv_hist: span_cycles=%lu lane_cycles=%lu words=%lu"
+                " over1=%lu (%.3f%% of busy) |", this->get_path().c_str(),
+                (unsigned long)this->ldh_cycles, (unsigned long)lt, (unsigned long)lw,
+                (unsigned long)over,
+                (lt - this->ldh_hist[0]) ? 100.0 * over / (lt - this->ldh_hist[0]) : 0.0);
+            for (int k = 0; k <= 8; k++) fprintf(f, " %d:%lu", k, (unsigned long)this->ldh_hist[k]);
+            fprintf(f, "\n");
+            fprintf(f, "  %s lane_deliv_by_path: drain=%lu bypass=%lu retry=%lu"
+                " | first_offers=%lu denied=%lu (%.2f%%)\n",
+                this->get_path().c_str(), (unsigned long)this->ldh_drain,
+                (unsigned long)this->ldh_bypass, (unsigned long)this->ldh_retry,
+                (unsigned long)this->ldh_offer, (unsigned long)this->ldh_offer_denied,
+                this->ldh_offer ? 100.0 * this->ldh_offer_denied / this->ldh_offer : 0.0);
+            uint64_t ltot = 0, lsum = 0; int lmax = 0;
+            for (int k = 0; k <= this->nb_lanes; k++)
+            {
+                ltot += this->ldh_lanes_hist[k];
+                lsum += (uint64_t)k * this->ldh_lanes_hist[k];
+                if (this->ldh_lanes_hist[k]) lmax = k;
+            }
+            fprintf(f, "  %s lanes_active: cycles=%lu mean=%.3f max=%d of %d |",
+                this->get_path().c_str(), (unsigned long)ltot,
+                ltot ? (double)lsum / ltot : 0.0, lmax, this->nb_lanes);
+            for (int k = 0; k <= this->nb_lanes; k++)
+                fprintf(f, " %d:%lu", k, (unsigned long)this->ldh_lanes_hist[k]);
+            fprintf(f, "\n");
+            if (this->edh_n)
+            {
+                uint64_t ds = 0, bs = 0;
+                for (int k = 0; k <= 8; k++)
+                {
+                    ds += (uint64_t)k * this->edh_hist[k];
+                    bs += (uint64_t)k * this->edh_beats_hist[k];
+                }
+                fprintf(f, "  %s entry_deliv_hist: entry_cycles=%lu visits=%lu"
+                    " deliv_mean=%.3f beats_mean=%.3f subs_per_beat=%.3f | deliv:",
+                    this->get_path().c_str(), (unsigned long)this->edh_n,
+                    (unsigned long)this->edh_visits,
+                    (double)ds / this->edh_n, (double)bs / this->edh_n,
+                    bs ? (double)ds / bs : 0.0);
+                for (int k = 1; k <= 8; k++) fprintf(f, " %d:%lu", k, (unsigned long)this->edh_hist[k]);
+                fprintf(f, " | beats:");
+                for (int k = 1; k <= 8; k++) fprintf(f, " %d:%lu", k, (unsigned long)this->edh_beats_hist[k]);
+                fprintf(f, "\n");
+            }
+        }
+        fprintf(f, "  %s denies: stall=%lu meta=%lu slot=%lu bankfull=%lu (bp=%d)\n",
             this->get_path().c_str(), (unsigned long)this->stat_deny_stall,
-            (unsigned long)this->stat_deny_meta, (unsigned long)this->stat_deny_slot);
+            (unsigned long)this->stat_deny_meta, (unsigned long)this->stat_deny_slot,
+            (unsigned long)this->stat_deny_bankfull, (int)this->bankfull_bp);
         fprintf(f, "  %s cfg: enable=%d merge_reqs=%d hss=%d hsb=%d hws=%d hwb=%d st=%d bss=%d bsb=%d bbb=%d status=0x%x\n",
             this->get_path().c_str(), (int)this->cfg_enable, this->merge_reqs,
             this->hold_subs_single, this->hold_subs_burst,
@@ -588,6 +703,7 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->merge_reqs = cfg->get_int("merge_reqs");
     this->enable_single = cfg->get_int("enable_single");
     this->drain_beats = cfg->get_int("drain_beats");
+    this->bankfull_bp = cfg->get_int("bankfull_bp") != 0;
     this->hold_window_single = cfg->get_int("hold_window_single");
     this->hold_window_burst = cfg->get_int("hold_window_burst");
     this->hold_subs_single = cfg->get_int("hold_subs_single");
@@ -657,6 +773,11 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->bypass_q_lane.resize(this->nb_lanes);
     this->resp_out_blocked.resize(this->nb_lanes, false);
     this->resp_out_held.resize(this->nb_lanes, nullptr);
+    this->ldh_lane_cnt.resize(this->nb_lanes, 0);
+    this->ldh_lanes_hist.resize(this->nb_lanes + 1, 0);
+    this->edh_cnt.resize(this->num_entries, 0);
+    this->edh_beats_cnt.resize(this->num_entries, 0);
+    this->edh_lastbeat.resize(this->num_entries, -1);
     this->req_spill_state.resize(this->nb_lanes, 0);
     this->req_spill_flit.resize(this->nb_lanes, nullptr);
 
@@ -689,7 +810,10 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
 // mempool_pkg.sv MSHR_CSR_* / software/runtime/mshr_cfg.h:
 //   0 ENABLE, 1 HOLD_SUBS_SINGLE, 2 HOLD_SUBS_BURST, 3 HOLD_WINDOW_SINGLE,
 //   4 HOLD_WINDOW_BURST, 5 BANK_SHIFT_SINGLE, 6 BANK_SHIFT_BURST,
-//   7 BANK_BURST_BITS, 8 SERVE_TIMEOUT, 15 STATUS (write: clear sticky).
+//   7 BANK_BURST_BITS, 8 SERVE_TIMEOUT, 11 BANKFULL_BP,
+//   15 STATUS (write: clear sticky).
+//   9 CACHE_REUSE_TARGET / 10 CACHE_TIMEOUT are NOT modelled: the model has
+//   no reclaimable response cache, so both sit at their legacy meaning.
 // ---------------------------------------------------------------------------
 #define MSHR_CSR_ENABLE             0
 #define MSHR_CSR_HOLD_SUBS_SINGLE   1
@@ -700,6 +824,7 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
 #define MSHR_CSR_BANK_SHIFT_BURST   6
 #define MSHR_CSR_BANK_BURST_BITS    7
 #define MSHR_CSR_SERVE_TIMEOUT      8
+#define MSHR_CSR_BANKFULL_BP        11
 #define MSHR_CSR_STATUS             15
 
 #define MSHR_STATUS_BANK_BUSY    (1u << 0)
@@ -792,6 +917,9 @@ void GroupMshr::cfg_apply(int idx, bool is_write, uint32_t data, uint32_t *rdata
         {
             this->serve_timeout = (int)data;
         }
+        break;
+    case MSHR_CSR_BANKFULL_BP:
+        this->bankfull_bp = (data & 1) != 0;
         break;
     case MSHR_CSR_STATUS:
         this->cfg_status = 0;
@@ -1160,7 +1288,9 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             return vp::IO_REQ_GRANTED;
         }
 
-        // Bank full: bypass (no coalescing/cache/multicast).
+        // Bank full. The RTL's shipping policy (cfg_bankfull_bp=1) STALLS the
+        // mergeable miss instead of bypassing, so the late peer can merge into
+        // the resident entry once a way frees; only the legacy 0 bypasses.
         bool bank_full = true;
         for (int idx : this->bank_ways[bank])
         {
@@ -1169,6 +1299,14 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
                 bank_full = false;
                 break;
             }
+        }
+        if (bank_full && this->bankfull_bp)
+        {
+            this->bank_full_miss[bank]++;
+            this->stat_deny_bankfull++;
+            this->lane_retry_owed[lane] = true;
+            this->fsm_event.enqueue(1);
+            return vp::IO_REQ_DENIED;
         }
         if (bank_full)
         {
@@ -1682,6 +1820,78 @@ void GroupMshr::door_handler(vp::Block *__this, vp::ClockEvent *)
     }
 }
 
+void GroupMshr::ldh_flush()
+{
+    if (this->ldh_touched.empty())
+    {
+        return;
+    }
+    for (int l : this->ldh_touched)
+    {
+        int n = this->ldh_lane_cnt[l];
+        this->ldh_hist[n > 8 ? 8 : n]++;
+        this->ldh_lane_cnt[l] = 0;
+    }
+    // Lanes that delivered nothing in a delivering cycle belong to the same
+    // population: without them the histogram cannot say "the port was idle
+    // while another port took two", which is the whole question.
+    this->ldh_hist[0] += (uint64_t)(this->nb_lanes - (int)this->ldh_touched.size());
+    this->ldh_lanes_hist[this->ldh_touched.size()]++;
+    this->ldh_cycles++;
+    this->ldh_touched.clear();
+}
+
+void GroupMshr::ldh_count(int lane, int src)
+{
+    int64_t c = this->clock.get_cycles();
+    if (c != this->ldh_cycle)
+    {
+        this->ldh_flush();
+        this->ldh_cycle = c;
+    }
+    if (this->ldh_lane_cnt[lane]++ == 0)
+    {
+        this->ldh_touched.push_back(lane);
+    }
+    if (src == 0)      this->ldh_drain++;
+    else if (src == 1) this->ldh_bypass++;
+    else               this->ldh_retry++;
+}
+
+void GroupMshr::edh_flush()
+{
+    for (int i : this->edh_touched)
+    {
+        int d = this->edh_cnt[i], b = this->edh_beats_cnt[i];
+        this->edh_hist[d > 8 ? 8 : d]++;
+        this->edh_beats_hist[b > 8 ? 8 : b]++;
+        this->edh_n++;
+        this->edh_cnt[i] = 0;
+        this->edh_beats_cnt[i] = 0;
+        this->edh_lastbeat[i] = -1;
+    }
+    this->edh_touched.clear();
+}
+
+void GroupMshr::edh_count(int idx, int beat)
+{
+    int64_t c = this->clock.get_cycles();
+    if (c != this->edh_cycle)
+    {
+        this->edh_flush();
+        this->edh_cycle = c;
+    }
+    if (this->edh_cnt[idx]++ == 0)
+    {
+        this->edh_touched.push_back(idx);
+    }
+    if (beat != this->edh_lastbeat[idx])
+    {
+        this->edh_beats_cnt[idx]++;
+        this->edh_lastbeat[idx] = beat;
+    }
+}
+
 void GroupMshr::drain_cycle()
 {
     int64_t cycles = this->clock.get_cycles();
@@ -1718,6 +1928,8 @@ void GroupMshr::drain_cycle()
             }
             L1NocFlit *flit = this->bypass_q_lane[lane].front();
             vp::IoReqStatus st = this->resp_out_v[lane]->req(flit);
+            this->ldh_offer++;
+            if (st == vp::IO_REQ_DENIED) this->ldh_offer_denied++;
             this->bypass_q_lane[lane].pop_front();
             this->bypass_q_total--;
             if (st == vp::IO_REQ_DENIED)
@@ -1733,6 +1945,7 @@ void GroupMshr::drain_cycle()
             // Delivered. Count OUTCOMES, not attempts -- the previous counter
             // sat before req() and reported denials as a delivery width.
             this->byp_out_beats++;
+            this->ldh_count(lane, 1);
             any = true;
             if (bc != this->byp_last_cycle)
             {
@@ -1820,6 +2033,7 @@ void GroupMshr::drain_cycle()
                 if (e.burst_len > 1) this->rout_burst++; else this->rout_single++;
                 if (onow != this->rout_last_cycle) { this->rout_last_cycle = onow; this->rout_cycles++; }
             }
+            this->edh_count(i, beat);
             e.served_mask &= ~(1u << si);
             this->sub_rr = (si + 1) % (int)e.subs.size();
             delivered++;
@@ -1836,6 +2050,15 @@ void GroupMshr::drain_cycle()
             }
 
             vp::IoReqStatus st = this->resp_out_v[lane]->req(flit);
+            this->ldh_offer++;
+            if (st == vp::IO_REQ_DENIED) this->ldh_offer_denied++;
+            if (st != vp::IO_REQ_DENIED)
+            {
+                // Accepted THIS cycle: one word entered this response port.
+                // A denied word is not in the port yet -- it lands later from
+                // resp_out_retry, and is tallied there.
+                this->ldh_count(lane, 0);
+            }
             if (st == vp::IO_REQ_DENIED)
             {
                 // The router elected this flit: it must be re-sent with the
@@ -1866,6 +2089,10 @@ void GroupMshr::drain_cycle()
                 }
                 continue;
             }
+        }
+        if (delivered > 0)
+        {
+            this->edh_visits++;
         }
         this->drain_rr = (i + 1) % this->num_entries;
     }
@@ -2081,6 +2308,10 @@ void GroupMshr::resp_out_retry(vp::Block *__this, int lane, vp::IoRetryChannel)
             return;
         }
         // Accepted: the response mesh owns the flit now (deleted at the sink).
+        // A word denied on its first offer lands here instead, so this is
+        // where it enters the port. Tallied under `retry` so the split
+        // measures how much of the traffic needs a deny/retry round trip.
+        _this->ldh_count(lane, 2);
     }
     _this->fsm_event.enqueue(0);
 }
