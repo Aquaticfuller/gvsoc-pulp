@@ -40,7 +40,7 @@ class CachepoolV3Cluster(st.Component):
                  router_input_queue_size: int = 2,
                  l2_noc: bool = True,
                  l2_noc_width: int = 64,
-                 l2_channel_granule: int = 256,
+                 l2_channel_granule: int = 1024,
                  l2_noc_req_width: int = 8):
         super().__init__(parent, name)
 
@@ -133,30 +133,45 @@ class CachepoolV3Cluster(st.Component):
                             name=f'g{gid}_j{j}_tunnel')
 
         # ---------------- P4: the L2 refill mesh ----------------
-        # Second NoC level. Each group's 17->1 refill mux (P3) injects at that group's node, and the
-        # MEMORY CHANNELS sit on the perimeter: the mesh is (nb_x+2) x (nb_y+2) with the groups on the
-        # interior nodes, so the boundary ring minus its four corners gives 2*(nb_x+nb_y) attach
-        # points — exactly 16 for a 4x4 group grid, one per outbound edge port.
+        # Second NoC level, matched to the RTL (config/floonoc_cachepool_{4,16}g.yml +
+        # cachepool_group_noc_wrapper.sv). Each group owns ONE mesh node — its 17->1 refill mux (P3)
+        # injects at that node's local port, which is the RTL's `Eject` direction on the group's own
+        # floo_router. The mesh is therefore nb_x x nb_y, NOT (nb_x+2) x (nb_y+2): an earlier revision
+        # put the groups on the interior of an oversized grid and hung 2*(nb_x+nb_y) channels around the
+        # whole perimeter, which is not what the RTL builds.
         #
-        # The channel map interleaves across the WHOLE address space: base = c*granule, size = granule,
-        # period = n_channels*granule. Full coverage is not optional — FlooNoc drops a burst with no
-        # matching entry silently and wedges the NI's in-flight slot forever. A granule of 256 B also
-        # guarantees a 64 B line never straddles two channels. Unlike the L1 mesh this map is static and
-        # correct: DRAM channel interleaving is fixed hardware, not the runtime-programmable XBAR_OFFSET.
+        # MEMORY CHANNELS hang off the two VERTICAL edges only, on the mesh direction the edge routers
+        # leave unused: West of column x=0 and East of column x=nb_x-1. That gives exactly 2*nb_y
+        # channels — 8 for the 4x4 group grid (RTL hbm0-3 on West at [0,y], hbm4-7 on East at [3,y]) and
+        # 4 for the 2x2 grid. The North edge of row 0 and the South edge of row nb_y-1 are tied off in
+        # RTL and carry nothing here either.
+        #
+        # A channel is modelled as a network interface with NO router of its own, one column outside the
+        # group grid. floonoc.cpp's get_router_neighbour() returns the NI directly when the neighbouring
+        # node has no router, and the NI-attach scan (x+1 then x-1) binds it to the adjacent group
+        # router — so a channel costs ZERO extra router hops, exactly like the RTL's floo_tcdm_chimney
+        # hanging off the edge router's unused West/East port. Hence the +2 columns in dim_x are pure
+        # addressing space for those chimneys, not a ring of extra routers.
+        #
+        # Channel address map, from cachepool_pkg.sv getDramCTRLInfo():
+        #     dram_ctrl_id = addr[ConstantBits + ScrambleBits - 1 : ConstantBits]
+        #     ConstantBits = clog2(L2BankBeWidth * Interleave) = clog2(64 * 16) = 10
+        # so the channel is picked by address bits [12:10] for 8 channels: a 1024 B granule striped
+        # round-robin. base=c*gran / size=gran / period=n_channels*gran reproduces exactly that, and a
+        # 64 B line can never straddle a 1024 B boundary. (RTL then applies scrambleAddr() so each
+        # channel sees a contiguous DRAM block; that is a per-channel address rewrite with no timing
+        # consequence, so the model keeps the flat address.) Full coverage is not optional — FlooNoc
+        # silently drops a burst with no matching entry and wedges the NI's in-flight slot forever.
         self.l2_noc = None
         self._n_channels = 0
         use_l2_noc = (nb_groups > 1) and l2_noc
         if use_l2_noc:
-            dim_x, dim_y = nb_x_groups + 2, nb_y_groups + 2
+            # +2 columns of chimney-only nodes (west + east); rows are exactly the group rows
+            dim_x, dim_y = nb_x_groups + 2, nb_y_groups
             gran = l2_channel_granule
-            # perimeter ring minus corners, walked side by side
-            chan_nodes = []
-            for x in range(1, dim_x - 1):
-                chan_nodes.append((x, 0))            # bottom edge
-                chan_nodes.append((x, dim_y - 1))    # top edge
-            for y in range(1, dim_y - 1):
-                chan_nodes.append((0, y))            # left edge
-                chan_nodes.append((dim_x - 1, y))    # right edge
+            # RTL channel order: West column first (hbm0..nb_y-1), then East column (hbm nb_y..2*nb_y-1)
+            chan_nodes = [(0, y) for y in range(nb_y_groups)] + \
+                         [(dim_x - 1, y) for y in range(nb_y_groups)]
             self._n_channels = len(chan_nodes)
 
             # BOTH widths must be real. FlooNoc puts only wide WRITE DATA on the wide plane; every
@@ -168,20 +183,20 @@ class CachepoolV3Cluster(st.Component):
                 dim_x=dim_x, dim_y=dim_y,
                 ni_outstanding_reqs=ni_outstanding_reqs,
                 router_input_queue_size=router_input_queue_size)
-            for x in range(dim_x):
-                for y in range(dim_y):
-                    noc.add_router(x, y)
+            # Routers exist ONLY at group nodes — one per group, degree 5 (N/E/S/W/local), matching
+            # RTL's single i_l2_req_router + i_l2_rsp_router pair per group.
             for gx in range(nb_x_groups):
                 for gy in range(nb_y_groups):
-                    noc.add_network_interface(gx + 1, gy + 1)
+                    noc.add_router(gx + 1, gy)
+                    noc.add_network_interface(gx + 1, gy)
             for (x, y) in chan_nodes:
                 noc.add_network_interface(x, y)
 
-            # groups inject at their own interior node
+            # groups inject at their own node's local (Eject) port
             for gx in range(nb_x_groups):
                 for gy in range(nb_y_groups):
                     gid = gx * nb_y_groups + gy
-                    self.group_list[gid].o_REFILL(noc.i_WIDE_INPUT(gx + 1, gy + 1))
+                    self.group_list[gid].o_REFILL(noc.i_WIDE_INPUT(gx + 1, gy))
 
             # each channel egresses to its own SoC-side port (address decode stays there)
             for c, (x, y) in enumerate(chan_nodes):

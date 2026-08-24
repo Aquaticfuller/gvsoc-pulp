@@ -151,7 +151,12 @@ def _make_cache_config():
 class CachepoolV3SoC(st.Component):
 
     def __init__(self, parent, name, parser, binary=None,
-                 l2_size: int = 0x1000000, nb_l2_banks: int = 4,
+                 # RTL config/config.mk: dram_addr = 0x8000_0000, dram_len = 0x2000_0000 (512 MiB),
+                 # which abuts the uncached/PDCP window at 0xA000_0000 exactly. The old 16 MiB default
+                 # was far below that and made the ELF loader reject any binary with data above
+                 # 0x80FF_FFFF -- the RLC (multi_producer_single_consumer_double_linked_list) tests
+                 # place their working set at 0x9900_0000 and failed to load at all.
+                 l2_size: int = 0x2000_0000, nb_l2_banks: int = 4,
                  axi_data_width: int = 64):
         super().__init__(parent, name)
 
