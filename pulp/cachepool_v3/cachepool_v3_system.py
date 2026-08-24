@@ -108,10 +108,27 @@ def _make_cache_config():
     # Async path: spend the RTL's warm read-hit cost as real simulated time, since stamped latency
     # is discarded by the requester. Calibrated at 8 (measured served latency 10.8 vs the RTL's 10
     # isolated; byte-enable within 1% of the calibrated synchronous path). Sweep with INSITU_RESP_LAT.
-    cfg.controller.resp_latency_cycles = 0 if cfg.controller.inline_sync_miss else 8
-    # Miss-side term: measured isolated costs were HIT 10 (exactly the RTL reference) and MISS 62
-    # against the RTL's MemLatency + 17 = 67, so 5 closes the miss side and leaves the hit side alone.
-    # Sweep with INSITU_MISS_EXTRA.
+    # CALIBRATION BOUNDARY CORRECTION (2026-08-25). This was 8, fitted so that the cache core's own
+    # accept->respond latency measured 10 cycles, "exactly the RTL reference". That fit compared the
+    # wrong two things: the RTL's 10-cycle warm read-hit is what the CORE observes end to end, while
+    # the model's 10 was measured at the cache core's internal boundary — on top of which the model
+    # still spends its own real time in the tile crossbar, AMO shim and remote crossbar on the way in
+    # and out. The constant was therefore double-counting the interconnect.
+    #
+    # Evidence (prompt/rtl_multigroup_comparison_2026-08-25.md, against the RTL's own 64-core RLC
+    # baseline, same binary on both engines):
+    #   resp_lat=8 -> 213,587 / 214,306   (+42 % vs RTL 150,175 / 150,215)
+    #   resp_lat=0 -> 149,248 / 149,678   (-0.6 %)
+    # and the alternative "it is double-counted INSIDE the core" hypothesis was tested and rejected:
+    # reformulating the constant as a floor from arrival (hit_latency_floor, still available) barely
+    # moved the kernel — floor=10 gave 215,331 / 215,623, i.e. the core's own queueing occupancy is
+    # small, so the time really is being added on top of the interconnect rather than absorbed.
+    #
+    # Consistency check on the miss side: with resp_lat=0 the in-core miss is about ML+8, plus the
+    # same ~8 cycles of interconnect gives ~ML+16 end to end against the RTL's ML+17 = 67. So
+    # miss_extra stays at 5 — it was fitted on top of a term that has now moved, and it lands right.
+    # Sweep either with INSITU_RESP_LAT / INSITU_MISS_EXTRA.
+    cfg.controller.resp_latency_cycles = 0
     cfg.controller.miss_extra_cycles = 0 if cfg.controller.inline_sync_miss else 5
     # P3: banks leave their tile on separate wide ports so the group can arbitrate all of them.
     # ASYNC ONLY. The 17->1 refill mux always answers IO_REQ_PENDING, but the synchronous-slave cache
