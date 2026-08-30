@@ -140,6 +140,19 @@ private:
     // handshake has to be added; if it fires, we already have the mechanism
     // and only its GATE differs.
     uint64_t stat_rel_offered = 0, stat_rel_denied = 0;
+    // Per-tile release serialisation (RTL bar_rel_ready[t] =
+    // tcdm_master_resp_ready[0][t]). All cores in a tile share ONE TCDM
+    // response port, so the RTL clears at most one of that tile's bits per
+    // cycle and the rest stay in rel_rem_q. This model drove every held
+    // response in a single cycle -- measured: 2,048 offers, 0 refusals, so
+    // the release was genuinely tail-free. `rel_pending[t]` holds the cores
+    // of tile t still waiting, drained one per tile per cycle.
+    // NOT the LIC path: routing release through the LIC releases ONE CORE PER
+    // CYCLE for the whole group (a 16-cycle staircase) and cost ~20 pp of FPU
+    // utilisation, which is why the broadcast bypass exists. Per TILE, not per
+    // group.
+    std::vector<std::deque<L1NocFlit *>> rel_pending;
+    uint64_t stat_rel_tail = 0;   // responses deferred to a later cycle
     int64_t rel_first_cycle = -1, rel_last_cycle = -1;
     int64_t rel_last_this = -1;   // interval between consecutive releases
     uint64_t stat_rel_interval_sum = 0, stat_rel_interval_n = 0;
@@ -158,6 +171,8 @@ GroupBarrier::~GroupBarrier()
         FILE *f = fopen("gbar_stats.log", "a");
         if (f)
         {
+            fprintf(f, "[GBAR] %s rel_tail: deferred=%lu (cores queued behind a tile-mate)\n",
+                this->get_path().c_str(), (unsigned long)this->stat_rel_tail);
             fprintf(f, "[GBAR] %s rel_accept: offered=%lu denied=%lu (%.2f%% needed a retry)\n",
                 this->get_path().c_str(), (unsigned long)this->stat_rel_offered,
                 (unsigned long)this->stat_rel_denied,
@@ -187,6 +202,7 @@ GroupBarrier::GroupBarrier(vp::ComponentConf &config) : vp::Component(config)
     this->count.assign(this->num_barriers, 0);
     this->arrived.assign(this->num_barriers, 0);
     this->held.resize(this->num_barriers);
+    this->rel_pending.resize(this->nb_tiles);
     this->out_blocked.assign(this->nb_tiles, false);
     this->out_held.assign(this->nb_tiles, nullptr);
     this->resp_held.resize(this->nb_tiles);
@@ -345,6 +361,25 @@ void GroupBarrier::rel_handler(vp::Block *__this, vp::ClockEvent *)
         }
         _this->ack_queue.pop_front();
     }
+    // Drain the per-tile release tail: one response per tile per cycle.
+    {
+        bool more = false;
+        for (int t = 0; t < _this->nb_tiles; t++)
+        {
+            if (_this->rel_pending[t].empty()) continue;
+            L1NocFlit *f = _this->rel_pending[t].front();
+            _this->rel_pending[t].pop_front();
+            vp::IoRespAck ack = _this->in_v[t]->resp(f);
+            _this->stat_rel_offered++;
+            if (ack == vp::IO_RESP_DENIED)
+            {
+                _this->stat_rel_denied++;
+                _this->resp_held[t].push_back(f);
+            }
+            if (!_this->rel_pending[t].empty()) more = true;
+        }
+        if (more) _this->rel_event.enqueue(1);
+    }
     while (!_this->release_queue.empty())
     {
         _this->release(_this->release_queue.front());
@@ -356,6 +391,9 @@ void GroupBarrier::rel_handler(vp::Block *__this, vp::ClockEvent *)
 // the same cycle. The release value is unused by SW (the kernel discards it).
 void GroupBarrier::release(int s)
 {
+    // One response per tile per cycle: the first core of each tile goes now,
+    // its tile-mates queue behind it.
+    std::vector<bool> tile_taken(this->nb_tiles, false);
     for (Held &h : this->held[s])
     {
         L1NocFlit *flit = h.flit;
@@ -363,6 +401,13 @@ void GroupBarrier::release(int s)
         {
             *(uint32_t *)flit->get_data() = 0;
         }
+        if (tile_taken[h.tile])
+        {
+            this->rel_pending[h.tile].push_back(flit);
+            this->stat_rel_tail++;
+            continue;
+        }
+        tile_taken[h.tile] = true;
         vp::IoRespAck ack = this->in_v[h.tile]->resp(flit);
         this->stat_rel_offered++;
         if (ack == vp::IO_RESP_DENIED)
@@ -371,6 +416,10 @@ void GroupBarrier::release(int s)
             // Re-driven from in_resp_retry once the tile accepts.
             this->resp_held[h.tile].push_back(flit);
         }
+    }
+    for (int t = 0; t < this->nb_tiles; t++)
+    {
+        if (!this->rel_pending[t].empty()) { this->rel_event.enqueue(1); break; }
     }
     this->held[s].clear();
     this->count[s] = 0;
