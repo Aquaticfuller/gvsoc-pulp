@@ -133,6 +133,13 @@ private:
 
     // Per-iteration cadence measurement: releases on the busiest struct.
     uint64_t stat_releases = 0;
+    // Per-tile release acceptance. RTL: mempool_group_barrier.sv:235 clears a
+    // core's bit only when its tile accepts; mempool_group.sv:334 wires that
+    // ready to the tile's TCDM response port. If stat_rel_denied stays 0 the
+    // model's release really is a single-cycle broadcast with no tail, and the
+    // handshake has to be added; if it fires, we already have the mechanism
+    // and only its GATE differs.
+    uint64_t stat_rel_offered = 0, stat_rel_denied = 0;
     int64_t rel_first_cycle = -1, rel_last_cycle = -1;
     int64_t rel_last_this = -1;   // interval between consecutive releases
     uint64_t stat_rel_interval_sum = 0, stat_rel_interval_n = 0;
@@ -151,6 +158,11 @@ GroupBarrier::~GroupBarrier()
         FILE *f = fopen("gbar_stats.log", "a");
         if (f)
         {
+            fprintf(f, "[GBAR] %s rel_accept: offered=%lu denied=%lu (%.2f%% needed a retry)\n",
+                this->get_path().c_str(), (unsigned long)this->stat_rel_offered,
+                (unsigned long)this->stat_rel_denied,
+                this->stat_rel_offered ?
+                    100.0 * this->stat_rel_denied / this->stat_rel_offered : 0.0);
             fprintf(f, "[GBAR] %s releases=%lu mean_interval=%.1f cyc (span %ld..%ld)\n",
                 this->get_path().c_str(), (unsigned long)this->stat_releases,
                 this->stat_rel_interval_n ? (double)this->stat_rel_interval_sum / this->stat_rel_interval_n : 0.0,
@@ -352,8 +364,10 @@ void GroupBarrier::release(int s)
             *(uint32_t *)flit->get_data() = 0;
         }
         vp::IoRespAck ack = this->in_v[h.tile]->resp(flit);
+        this->stat_rel_offered++;
         if (ack == vp::IO_RESP_DENIED)
         {
+            this->stat_rel_denied++;
             // Re-driven from in_resp_retry once the tile accepts.
             this->resp_held[h.tile].push_back(flit);
         }
