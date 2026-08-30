@@ -112,6 +112,10 @@ class GroupMshrConfig:
     merge_reqs:          int  = 4    # group_mshr_merge_reqs (max subscribers/entry)
     enable_single:       bool = True # group_mshr_enable_single
     drain_beats:         int  = 2    # group_mshr_drain_beats (ParityDrain)
+    cache_reuse_target:  int  = 0    # group_mshr_cache_reuse_target (CSR 9); the
+                                     # SOFTWARE writes 2*hold_subs_single per shape.
+    cache_timeout:       int  = 0    # group_mshr_cache_timeout (CSR 10); 0 = legacy,
+                                     # non-zero (fp16 only) is NOT modelled.
     bankfull_bp:         int  = 1    # group_mshr_bankfull_backpressure (CSR 11).
                                      # RTL ships 1: a mergeable miss into a full
                                      # bank STALLS instead of bypassing. 0 = legacy.
@@ -688,6 +692,8 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
         bank_shift_burst=int(os.environ.get('TERANOC_MSHR_BANK_SHIFT_BURST', 7)),
         bank_burst_bits=int(os.environ.get('TERANOC_MSHR_BANK_BURST_BITS', 1)),
         bankfull_bp=int(os.environ.get('TERANOC_MSHR_BANKFULL_BP', 1)),
+        cache_reuse_target=int(os.environ.get('TERANOC_MSHR_CACHE_REUSE_TARGET', 0)),
+        cache_timeout=int(os.environ.get('TERANOC_MSHR_CACHE_TIMEOUT', 0)),
     ),
     # HW group barrier (mempool_group_barrier.sv). EnableGroupBarrier defaults
     # ON in the RTL; the burst-merge kernel's GBAR_PLOOP syncs through it.

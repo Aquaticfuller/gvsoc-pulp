@@ -191,6 +191,12 @@ private:
     int mshr_bank_of(uint64_t addr, bool is_single) const;
     Entry *find_hit(int bank, uint64_t base_addr, int burst_len, int tgt_group);
     Entry *alloc_entry(int bank);
+    // Serves a CACHED line must reach before it self-invalidates.
+    int cache_target(const Entry &e) const
+    {
+        if (this->cache_reuse_target != 0) return this->cache_reuse_target;
+        return (e.burst_len == 1) ? this->hold_subs_single : this->hold_subs_burst;
+    }
     void forward_fetch(Entry *e);
     void replay_holds();
     // ---------------- response path
@@ -228,6 +234,15 @@ private:
     // Bounded by serve_timeout (a held entry always releases), so a full bank
     // cannot wedge a port permanently.
     bool bankfull_bp;
+    // Response-cache residency policy (CSR 9/10). The RTL frees a CACHED entry
+    // whose subscribers have all drained once served_cnt reaches a target that
+    // is `cache_reuse_target` when non-zero, else the per-type sharing target
+    // (mempool_group_mshr.sv:3487-3499, gated on CacheSelfInval which the
+    // shipping config sets to 1). Software writes 2*hold_subs_single, so the
+    // RTL keeps a line resident TWICE as long as the legacy rule this model
+    // implemented -- 32 serves at M=512, where we freed at 16.
+    int cache_reuse_target;   // 0 = legacy (per-type hold_subs)
+    int cache_timeout;        // 0 = legacy; non-zero not modelled
     int hold_window_single;
     int hold_window_burst;
     int hold_subs_single;
@@ -743,6 +758,8 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->enable_single = cfg->get_int("enable_single");
     this->drain_beats = cfg->get_int("drain_beats");
     this->bankfull_bp = cfg->get_int("bankfull_bp") != 0;
+    this->cache_reuse_target = cfg->get_int("cache_reuse_target");
+    this->cache_timeout = cfg->get_int("cache_timeout");
     this->hold_window_single = cfg->get_int("hold_window_single");
     this->hold_window_burst = cfg->get_int("hold_window_burst");
     this->hold_subs_single = cfg->get_int("hold_subs_single");
@@ -853,10 +870,11 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
 // mempool_pkg.sv MSHR_CSR_* / software/runtime/mshr_cfg.h:
 //   0 ENABLE, 1 HOLD_SUBS_SINGLE, 2 HOLD_SUBS_BURST, 3 HOLD_WINDOW_SINGLE,
 //   4 HOLD_WINDOW_BURST, 5 BANK_SHIFT_SINGLE, 6 BANK_SHIFT_BURST,
-//   7 BANK_BURST_BITS, 8 SERVE_TIMEOUT, 11 BANKFULL_BP,
-//   15 STATUS (write: clear sticky).
-//   9 CACHE_REUSE_TARGET / 10 CACHE_TIMEOUT are NOT modelled: the model has
-//   no reclaimable response cache, so both sit at their legacy meaning.
+//   7 BANK_BURST_BITS, 8 SERVE_TIMEOUT, 9 CACHE_REUSE_TARGET,
+//   10 CACHE_TIMEOUT, 11 BANKFULL_BP, 15 STATUS (write: clear sticky).
+// Rejecting 9/10 as BAD_INDEX (which this did) is not harmless: the sweep
+// software writes all eleven, so every run raised status=0x8 and silently
+// dropped the cache policy.
 // ---------------------------------------------------------------------------
 #define MSHR_CSR_ENABLE             0
 #define MSHR_CSR_HOLD_SUBS_SINGLE   1
@@ -867,6 +885,8 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
 #define MSHR_CSR_BANK_SHIFT_BURST   6
 #define MSHR_CSR_BANK_BURST_BITS    7
 #define MSHR_CSR_SERVE_TIMEOUT      8
+#define MSHR_CSR_CACHE_REUSE_TARGET 9
+#define MSHR_CSR_CACHE_TIMEOUT      10
 #define MSHR_CSR_BANKFULL_BP        11
 #define MSHR_CSR_STATUS             15
 
@@ -960,6 +980,27 @@ void GroupMshr::cfg_apply(int idx, bool is_write, uint32_t data, uint32_t *rdata
         {
             this->serve_timeout = (int)data;
         }
+        break;
+    case MSHR_CSR_CACHE_REUSE_TARGET:
+        // RTL bound: served_cnt is sized to ServedCntMax == 2*MergeReqs, which
+        // is also the CSR's upper bound, so the target is always representable
+        // and a line can never be pinned by an unreachable threshold.
+        if (data > (uint32_t)(2 * this->merge_reqs)) this->cfg_status |= MSHR_STATUS_RANGE;
+        else this->cache_reuse_target = (int)data;
+        break;
+    case MSHR_CSR_CACHE_TIMEOUT:
+        // 0 = legacy (the cache phase re-arms from serve_timeout), which is
+        // what this model implements and what every fp32 arm programs
+        // (mshr_cfg.h sets it only for GEMM_ELEM_BYTES == 2). A non-zero value
+        // is a DIFFERENT cache-phase timer that is not modelled -- refuse it
+        // loudly rather than accept it and silently mis-model fp16.
+        if (data != 0)
+        {
+            this->cfg_status |= MSHR_STATUS_RANGE;
+            this->trace.force_warning(
+                "group_mshr: cache_timeout=%u is not modelled (only the legacy 0)\n", data);
+        }
+        this->cache_timeout = (int)data;
         break;
     case MSHR_CSR_BANKFULL_BP:
         this->bankfull_bp = (data & 1) != 0;
@@ -2323,7 +2364,7 @@ void GroupMshr::serve_timeouts(int64_t cycles)
         else if (e.state == ST_CACHED)
         {
             // Below the sharing target: age out.
-            if (e.served_cnt < this->hold_subs_single)
+            if (e.served_cnt < this->cache_target(e))
             {
                 e.valid = false;
                 e.state = ST_IDLE;
@@ -2340,7 +2381,7 @@ void GroupMshr::serve_timeouts(int64_t cycles)
     // Self-invalidate caches that reached the sharing target.
     for (Entry &e : this->entries)
     {
-        if (e.valid && e.state == ST_CACHED && e.served_cnt >= this->hold_subs_single)
+        if (e.valid && e.state == ST_CACHED && e.served_cnt >= this->cache_target(e))
         {
             e.valid = false;
             e.state = ST_IDLE;
