@@ -898,7 +898,16 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
 #define MSHR_STATUS_TIMEOUT_ZERO (1u << 2)
 #define MSHR_STATUS_BAD_INDEX    (1u << 3)
 // HoldCntHwMax (mempool_pkg::MshrCfgHoldCntMax) and the bank-shift range.
-#define MSHR_CFG_HOLD_CNT_MAX 2047
+// mempool_pkg::MshrCfgHoldCntW == 13, so every hold_cnt-typed CSR
+// (hold_window_single/_burst, serve_timeout, cache_timeout) accepts up to 8191.
+// This was 2047 -- the pre-widening bound. The shipping image programs 8191 for
+// all three (config/terapool_spatz4_fpu.mk:234,246,514, the "hold/serve
+// 2047->8191" change), so the model refused those writes with MSHR_STATUS_RANGE
+// and silently ran the MSHR on its elaboration defaults. On the fp16 decode arms
+// that collapsed throughput by ~70x: sp-decode-4x4-fp16-ks8-16x128x4096 ran past
+// 6.3M cycles without finishing against 19,321 with the MSHR disabled entirely,
+// and 6,031 in RTL.
+#define MSHR_CFG_HOLD_CNT_MAX 8191
 #define MSHR_CFG_SHIFT_MIN 5
 #define MSHR_CFG_SHIFT_MAX 10
 
@@ -919,6 +928,20 @@ bool GroupMshr::mshr_busy() const
 
 void GroupMshr::cfg_apply(int idx, bool is_write, uint32_t data, uint32_t *rdata)
 {
+    // Diagnostic: log every CSR write and the status it leaves behind, flushed,
+    // so a run that never completes still shows what software programmed and
+    // which write (if any) was refused. File-static, keyed by nothing: one
+    // shared log, each line self-identifying. TERANOC_MSHR_CSR_LOG=<path>.
+    static bool csrlog_ck = false;
+    static FILE *csrlog = nullptr;
+    if (!csrlog_ck)
+    {
+        csrlog_ck = true;
+        const char *p = getenv("TERANOC_MSHR_CSR_LOG");
+        if (p) csrlog = fopen(p, "w");
+    }
+    uint32_t status_before = this->cfg_status;
+
     *rdata = 0;
     if (!is_write)
     {
@@ -1019,6 +1042,15 @@ void GroupMshr::cfg_apply(int idx, bool is_write, uint32_t data, uint32_t *rdata
     this->trace.msg(vp::Trace::LEVEL_TRACE,
         "MSHR_CSR idx=%d wen=%d data=0x%x status=0x%x\n",
         idx, (int)is_write, data, this->cfg_status);
+
+    if (csrlog && is_write)
+    {
+        fprintf(csrlog, "[CSR] %s idx=%d data=%u status 0x%x->0x%x%s\n",
+            this->get_path().c_str(), idx, (unsigned)data,
+            (unsigned)status_before, (unsigned)this->cfg_status,
+            (this->cfg_status != status_before) ? "  <== REFUSED" : "");
+        fflush(csrlog);
+    }
 }
 
 vp::IoReqStatus GroupMshr::cfg_req(vp::Block *__this, vp::IoReq *req, int)
