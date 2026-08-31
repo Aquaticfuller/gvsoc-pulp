@@ -78,6 +78,10 @@ private:
     // the requester a retry), respectively when the requester denies a
     // response coming from it (we then owe that output a resp_retry).
     bool denied_request[OUT_NB] = {false, false, false};
+    long n_deny[OUT_NB] = {0,0,0};      // times we returned DENIED upstream
+    long n_retry_in[OUT_NB] = {0,0,0};  // retries received from downstream
+    long n_retry_fwd[OUT_NB] = {0,0,0}; // retries forwarded upstream
+    bool snap_done = false;
     bool denied_response[OUT_NB] = {false, false, false};
 
     uint64_t l1_size;
@@ -175,6 +179,7 @@ vp::IoReqStatus TeranocL1Shim::input_req(vp::Block *__this, vp::IoReq *req, int)
 
     if (_this->denied_request[output])
     {
+        _this->n_deny[output]++;
         return vp::IO_REQ_DENIED;
     }
 
@@ -198,6 +203,7 @@ vp::IoReqStatus TeranocL1Shim::input_req(vp::Block *__this, vp::IoReq *req, int)
     vp::IoReqStatus status = _this->output_itfs[output]->req(req);
     if (status == vp::IO_REQ_DENIED)
     {
+        _this->n_deny[output]++;
         _this->denied_request[output] = true;
         if (probe != nullptr)
         {
@@ -207,6 +213,7 @@ vp::IoReqStatus TeranocL1Shim::input_req(vp::Block *__this, vp::IoReq *req, int)
         }
         return status;
     }
+
 
     // Inline completion produces no resp(), so close the probe here.
     if (status == vp::IO_REQ_DONE && probe != nullptr)
@@ -220,10 +227,34 @@ vp::IoReqStatus TeranocL1Shim::input_req(vp::Block *__this, vp::IoReq *req, int)
 void TeranocL1Shim::output_retry(vp::Block *__this, int output, vp::IoRetryChannel channel)
 {
     auto *_this = static_cast<TeranocL1Shim *>(__this);
+    _this->n_retry_in[output]++;
+    // Snapshot AFTER the known wedge cycle: if a shim owes a retry it never
+    // sent, deny and forward counts diverge permanently.
+    if (!_this->snap_done && _this->clock.get_cycles() > 400000)
+    {
+        _this->snap_done = true;
+        const char *sp = getenv("TERANOC_SHIM_SNAP_PATH");
+        if (sp)
+        {
+            static FILE *sf = nullptr;
+            if (!sf) sf = fopen(sp, "a");
+            if (sf)
+            {
+                fprintf(sf, "[SHIM] %s cyc=%ld", _this->get_path().c_str(),
+                    (long)_this->clock.get_cycles());
+                for (int o = 0; o < OUT_NB; o++)
+                    fprintf(sf, " | o%d deny=%ld rx=%ld fwd=%ld owed=%d", o,
+                        _this->n_deny[o], _this->n_retry_in[o], _this->n_retry_fwd[o],
+                        (int)_this->denied_request[o]);
+                fprintf(sf, "\n"); fflush(sf);
+            }
+        }
+    }
     if (!_this->denied_request[output])
     {
         return;
     }
+    _this->n_retry_fwd[output]++;
     // Clear first: retry() re-enters input_req() synchronously and may install
     // a fresh denial on this very output.
     _this->denied_request[output] = false;

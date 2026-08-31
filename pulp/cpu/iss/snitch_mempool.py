@@ -31,6 +31,8 @@ class SnitchMempoolConfig(RiscvConfig):
         desc="Max outstanding scalar LSU requests.")
     vlsu_nb_outstanding: int = cfg_field(default=8, dump=True,
         desc="Max outstanding VLSU requests per vector memory port.")
+    vlsu_nb_outstanding_n: int = cfg_field(default=0, dump=True,
+        desc="ROB depth for ports 1..N (0 = same as port 0); the RTL calls this ROBN.")
     zfinx: bool = cfg_field(default=True, dump=True,
         desc="Single-precision FP on the integer register file (Zfinx).")
     lsu_v2: bool = cfg_field(default=False, dump=True,
@@ -211,6 +213,7 @@ class SnitchMempool(RiscvCommon):
             pulp.ara.ara_v2.attach(self, config.vlen, nb_lanes=config.nb_lanes,
                 use_spatz=True, lane_width=config.lane_width,
                 vlsu_v2=config.lsu_v2, nb_outstanding_reqs=config.vlsu_nb_outstanding,
+                nb_outstanding_reqs_n=config.vlsu_nb_outstanding_n,
                 reduction_is_serial=True, reduction_step_latency=3,
                 vlsu_burst_enable=config.vlsu_burst_enable,
                 vlsu_burst_max_words=config.vlsu_burst_max_words,

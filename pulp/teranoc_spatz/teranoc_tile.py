@@ -162,6 +162,7 @@ class TeranocTile(st.Component):
                 core_config.nb_lanes = arch.vector.nb_lanes
                 core_config.lane_width = arch.vector.lane_width
                 core_config.vlsu_nb_outstanding = (arch.vector.vlsu_outstanding)
+                core_config.vlsu_nb_outstanding_n = (arch.vector.vlsu_outstanding_n)
                 # Spatz port-0 burst loads (teranoc_spatz)
                 core_config.vlsu_burst_enable = int(arch.vlsu_burst.enable)
                 core_config.vlsu_burst_max_words = arch.vlsu_burst.max_burst_words

@@ -4,6 +4,7 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
 
+#include <set>
 #include <vp/vp.hpp>
 #include <vp/itf/io_v2.hpp>
 
@@ -132,6 +133,31 @@ void L1AddressScrambler::output_retry(vp::Block *__this, vp::IoRetryChannel chan
     {
         _this->request_denied = false;
         _this->input.retry(channel);
+    }
+    else
+    {
+        // DIAGNOSTIC (TERANOC_SCRAMBLER_DROP_PATH). A retry arriving while the
+        // marker is clear is SWALLOWED here: the upstream VLSU parked its burst
+        // on `port_stalled` and only the retry callback clears it, so a dropped
+        // retry wedges that port permanently. Report the first drop per instance.
+        static const char *dp = nullptr; static bool ck = false;
+        if (!ck) { ck = true; dp = getenv("TERANOC_SCRAMBLER_DROP_PATH"); }
+        if (dp)
+        {
+            static std::set<const void *> seen;
+            if (seen.insert((const void *)_this).second)
+            {
+                static FILE *df = nullptr;
+                if (!df) df = fopen(dp, "a");
+                if (df)
+                {
+                    fprintf(df, "[SCRDROP] %s cyc=%ld channel=%d\n",
+                        _this->get_path().c_str(),
+                        (long)_this->clock.get_cycles(), (int)channel);
+                    fflush(df);
+                }
+            }
+        }
     }
 }
 

@@ -46,6 +46,7 @@ class SnitchVectorConfig:
     rvf:              bool  # single-precision FP support
     rvd:              bool  # double-precision FP support
     vlsu_outstanding: int   # max outstanding VLSU requests per port
+    vlsu_outstanding_n: int = 0   # ports 1..N (the RTL's ROBN); 0 = same as port 0
 
     @property
     def nb_lanes(self):
@@ -424,7 +425,14 @@ SNITCHMEMPOOL_VECTOR = SnitchVectorConfig(
     lane_width       = 4,
     rvf              = True,
     rvd              = False,
-    vlsu_outstanding = 8,
+    # Per-port LOAD ROB depth -- the structure the RTL calls NrOutstandingLoads
+    # (ROB0). NOT the same as vlsu_burst.rob_depth, which sizes the BURST rob.
+    # The RTL runs dual-load runahead (MaxInflight=2) with ROB0=128/ROBN=16 and
+    # validated it at 64, sized so both in-flight loads fit at once. We admit two
+    # slots into 8 entries (7 usable), which is the leading suspect for the
+    # low-sharers wedge. Env-settable so the capacity hypothesis is one rebuild.
+    vlsu_outstanding = int(os.environ.get('TERANOC_VLSU_OUTSTANDING', 8)),
+    vlsu_outstanding_n = int(os.environ.get('TERANOC_VLSU_OUTSTANDING_N', 0)),
 )
 
 

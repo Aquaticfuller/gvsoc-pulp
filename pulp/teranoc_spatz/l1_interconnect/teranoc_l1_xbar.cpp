@@ -697,6 +697,47 @@ void TeranocL1Xbar::arbiter_handler(vp::Block *__this, vp::ClockEvent *)
     {
         _this->arbiter_event.enqueue(1);
     }
+    else
+    {
+        // LIVENESS PROBE. has_pending() counts a pending input only while its
+        // target output HAS ROOM, so the arbiter can stop here with work still
+        // parked. That is only safe if every path that frees an output also
+        // re-arms us. Report the first time we stop with a pending item, per
+        // instance: if this fires, the requester is waiting on a retry that
+        // depends on an arbiter that is no longer scheduled.
+        static const char *lp = nullptr; static bool ck = false;
+        if (!ck) { ck = true; lp = getenv("TERANOC_XBAR_LIVE_PATH"); }
+        if (lp)
+        {
+            int stuck = -1;
+            for (int i = 0; i < _this->nb_inputs; i++)
+                if (_this->inputs[i].pending != nullptr) { stuck = i; break; }
+            // Only stops AFTER the known wedge cycle matter: the arbiter
+            // legitimately stops with a full stage all the time and recovers
+            // via drain_stage's was_full re-arm. A stop that persists past the
+            // wedge is the one that never recovered.
+            if (stuck >= 0 && cycles > 350000)
+            {
+                static std::set<const void *> seen;
+                if (seen.insert((const void *)_this).second)
+                {
+                    static FILE *lf = nullptr;
+                    if (!lf) lf = fopen(lp, "a");
+                    if (lf)
+                    {
+                        const Output &o = _this->outputs[_this->inputs[stuck].pending->output];
+                        fprintf(lf, "[XBARSTOP] %s cyc=%ld input=%d out=%d"
+                            " stage=%d/%d stalled=%d elected=%d in_stalled=%d\n",
+                            _this->get_path().c_str(), (long)cycles, stuck,
+                            _this->inputs[stuck].pending->output,
+                            (int)o.stage.size(), _this->stage_depth, (int)o.stalled,
+                            (int)(o.elected != nullptr), (int)_this->inputs[stuck].stalled);
+                        fflush(lf);
+                    }
+                }
+            }
+        }
+    }
 }
 
 void TeranocL1Xbar::fsm_handler(vp::Block *__this, vp::ClockEvent *)

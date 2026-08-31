@@ -129,7 +129,8 @@ def extend_isa(isa_instance: Isa):
 
 def attach(component: Component, vlen: int, nb_lanes: int, use_spatz: bool=False,
         spatz_nb_ports: int|None=None, lane_width=8, vlsu_v2: bool=False,
-        nb_outstanding_reqs: int=8, reduction_is_serial: bool=False,
+        nb_outstanding_reqs: int=8, nb_outstanding_reqs_n: int=0,
+        reduction_is_serial: bool=False,
         reduction_step_latency: int=1, vlsu_burst_enable: int=0,
         vlsu_burst_max_words: int=16, vlsu_burst_rob_depth: int=64, vlsu_burst_sub_word: int=0,
         vlsu_burst_block_alloc: int=1, vlsu_burst_dual_load: int=2,
@@ -183,6 +184,7 @@ def attach(component: Component, vlen: int, nb_lanes: int, use_spatz: bool=False
     if use_spatz:
         component.add_property('vu/nb_ports', nb_lanes if spatz_nb_ports is None else spatz_nb_ports)
         component.add_property('vu/nb_outstanding_reqs', nb_outstanding_reqs)
+        component.add_property('vu/nb_outstanding_reqs_n', nb_outstanding_reqs_n)
         # Spatz port-0 burst loads (RTL spatz_vlsu.sv). burst_enable defaults 0
         # (legacy behavior); issue_latency 0 derives 3/18 from block_alloc.
         component.add_property('vu/burst_enable', int(vlsu_burst_enable))
