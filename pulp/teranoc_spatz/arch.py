@@ -115,6 +115,17 @@ class GroupMshrConfig:
     drain_beats:         int  = 2    # group_mshr_drain_beats (ParityDrain)
     cache_reuse_target:  int  = 0    # group_mshr_cache_reuse_target (CSR 9); the
                                      # SOFTWARE writes 2*hold_subs_single per shape.
+    cache_reclaimable:   int  = 0    # RTL CacheReclaimable pass-2 allocator: a bank with
+                                     # no INVALID way may reclaim an idle CACHED way
+                                     # (mempool_group_mshr.sv:1975-2020). The RTL DEFAULTS
+                                     # THIS TO 1; the model defaults it to 0 because
+                                     # enabling it costs +42.7% on the 16-way-share anchor
+                                     # gemm_128x128x512 (16,333 vs the 11,445 reference,
+                                     # measured 2026-09-01 with the RTL-exact victim
+                                     # predicate). Our CACHED entries evidently live longer
+                                     # / are reclaimed more often than the RTL's, so the
+                                     # calibrated anchors assume no reclaim. Revisit when
+                                     # the CACHED lifetime is matched to the RTL.
     cache_timeout:       int  = 0    # group_mshr_cache_timeout (CSR 10); 0 = legacy,
                                      # non-zero (fp16 only) is NOT modelled.
     bankfull_bp:         int  = 1    # group_mshr_bankfull_backpressure (CSR 11).
@@ -709,6 +720,7 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
         bankfull_bp=int(os.environ.get('TERANOC_MSHR_BANKFULL_BP', 1)),
         cache_reuse_target=int(os.environ.get('TERANOC_MSHR_CACHE_REUSE_TARGET', 0)),
         cache_timeout=int(os.environ.get('TERANOC_MSHR_CACHE_TIMEOUT', 0)),
+        cache_reclaimable=int(os.environ.get('TERANOC_MSHR_CACHE_RECLAIMABLE', 0)),
     ),
     # HW group barrier (mempool_group_barrier.sv). EnableGroupBarrier defaults
     # ON in the RTL; the burst-merge kernel's GBAR_PLOOP syncs through it.

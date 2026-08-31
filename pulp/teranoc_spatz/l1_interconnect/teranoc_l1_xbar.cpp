@@ -727,11 +727,13 @@ void TeranocL1Xbar::arbiter_handler(vp::Block *__this, vp::ClockEvent *)
                     {
                         const Output &o = _this->outputs[_this->inputs[stuck].pending->output];
                         fprintf(lf, "[XBARSTOP] %s cyc=%ld input=%d out=%d"
-                            " stage=%d/%d stalled=%d elected=%d in_stalled=%d\n",
+                            " stage=%d/%d stalled=%d elected=%d in_stalled=%d"
+                            " stage_blocked=%d next_cycle=%ld\n",
                             _this->get_path().c_str(), (long)cycles, stuck,
                             _this->inputs[stuck].pending->output,
                             (int)o.stage.size(), _this->stage_depth, (int)o.stalled,
-                            (int)(o.elected != nullptr), (int)_this->inputs[stuck].stalled);
+                            (int)(o.elected != nullptr), (int)_this->inputs[stuck].stalled,
+                            (int)o.stage_blocked, (long)o.next_cycle);
                         fflush(lf);
                     }
                 }

@@ -109,6 +109,7 @@ class TeranocGroup(st.Component):
                 bankfull_bp=arch.group_mshr.bankfull_bp,
                 cache_reuse_target=arch.group_mshr.cache_reuse_target,
                 cache_timeout=arch.group_mshr.cache_timeout,
+                cache_reclaimable=arch.group_mshr.cache_reclaimable,
                 hold_window_single=arch.group_mshr.hold_window_single,
                 hold_window_burst=arch.group_mshr.hold_window_burst,
                 hold_subs_single=arch.group_mshr.hold_subs_single,

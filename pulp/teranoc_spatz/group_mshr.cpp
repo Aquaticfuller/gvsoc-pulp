@@ -243,6 +243,7 @@ private:
     // implemented -- 32 serves at M=512, where we freed at 16.
     int cache_reuse_target;   // 0 = legacy (per-type hold_subs)
     int cache_timeout;        // 0 = legacy; non-zero not modelled
+    int cache_reclaimable;    // RTL CacheReclaimable: pass-2 CACHED reclaim
     int hold_window_single;
     int hold_window_burst;
     int hold_subs_single;
@@ -309,6 +310,7 @@ private:
     // 11x-30x here, non-monotonically, where the RTL is smooth).
     std::vector<uint64_t> bank_alloc;
     std::vector<uint64_t> bank_full_miss;
+    uint64_t stat_cache_evict = 0;
     std::vector<L1NocFlit *> lane_pending;    // parked flit per lane (door input)
     std::vector<bool> lane_retry_owed;
     std::vector<bool> req_out_blocked;
@@ -760,6 +762,7 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->bankfull_bp = cfg->get_int("bankfull_bp") != 0;
     this->cache_reuse_target = cfg->get_int("cache_reuse_target");
     this->cache_timeout = cfg->get_int("cache_timeout");
+    this->cache_reclaimable = cfg->get_int("cache_reclaimable");
     this->hold_window_single = cfg->get_int("hold_window_single");
     this->hold_window_burst = cfg->get_int("hold_window_burst");
     this->hold_subs_single = cfg->get_int("hold_subs_single");
@@ -1398,6 +1401,35 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
                 break;
             }
         }
+
+        // Pass 2 of the RTL's two-pass allocator (mempool_group_mshr.sv:1975-2020,
+        // `CacheReclaimable`, default 1): when a bank has no INVALID way, it may
+        // reclaim a resident CACHED way. The RTL victim predicate is exact --
+        //   valid && state == MSHR_CACHED && sub_reqs_num == 0 && !mshr_hit_req[e]
+        // -- scanned lowest-index-first (CacheVictimRR defaults to 0). The
+        // sub_reqs_num guard keeps a line that is still serving subscribers, and
+        // mshr_hit_req is the RTL's same-cycle guard against evicting a line a
+        // concurrent port is about to hit-merge; this model retires one request
+        // at a time and the hit lookup above already missed, so no concurrent
+        // hit can exist and that term is vacuously true here.
+        //
+        // Knob-gated because reclaim is not free: on the 16-way-share anchor
+        // gemm_128x128x512 an unguarded LRU reclaim cost +37.5% (15,739 vs the
+        // 11,445 reference) by destroying lines that later sharers still wanted.
+        if (bank_full && this->cache_reclaimable && this->resp_cache)
+        {
+            for (int idx : this->bank_ways[bank])
+            {
+                Entry &c = this->entries[idx];
+                if (!c.valid || c.state != ST_CACHED || !c.subs.empty()) continue;
+                this->stat_cache_evict++;
+                c.valid = false;
+                c.state = ST_IDLE;
+                c.release_cycle = -1;
+                bank_full = false;
+                break;
+            }
+        }
         if (bank_full && this->bankfull_bp)
         {
             this->bank_full_miss[bank]++;
@@ -1696,6 +1728,15 @@ vp::IoReqStatus GroupMshr::capture_response(L1NocFlit *flit, int lane)
             (int)e.subs.size() < this->hold_subs_single)
         {
             // Single word with subscribers below target: hold for more.
+            //
+            // Deliberately NOT gated on hold_window_single. RespWaitSubsSingle
+            // is the RESPONSE-side release policy, and the RTL states it is
+            // "independent of HoldWindowSingle: the request-side hold window is
+            // unchanged" (mempool_group_mshr.sv:188-190). Gating it on a zero
+            // request-side window (software programs hws=0 at share degree < 2)
+            // cost +14.5% on the gemm_128x128x512 anchor -- 13,101 against the
+            // 11,445 reference -- and did not move the low-sharers hang, which
+            // reproduces identically with the gate in or out.
             e.state = ST_RESP_HOLD;
             int ticks = this->serve_timeout >> this->hold_prescale_w;
             if (ticks <= 0) ticks = 1;
@@ -1900,8 +1941,30 @@ void GroupMshr::door_handler(vp::Block *__this, vp::ClockEvent *)
     }
 
     // Keep ticking while work remains: bypass beats queued, entries draining,
-    // fetches held or blocked, or timeouts pending.
+    // fetches held or blocked, timeouts pending, OR a lane retry still owed.
+    //
+    // The retry drain above re-enters req_in() synchronously, and that re-entry
+    // can deny again and re-arm lane_retry_owed for the SAME lane. If that is
+    // the only work left, omitting it here stops the FSM with a retry owed and
+    // never issued -- the requester's door stays denied forever. Measured
+    // consequence: the tile's remote_interco holds a full stage with
+    // stage_blocked=1, its arbiter does not self-re-arm (has_pending() is false
+    // while the stage is full), the L1 shim reports owed=1, and the VLSU's
+    // non-burst ports sit parked with parked=1 for the rest of the run, while
+    // the MSHR itself reports every window counter at zero -- idle, not stuck,
+    // because nothing ever wakes it again.
     bool work = _this->bypass_q_total != 0;
+    if (!work)
+    {
+        for (int lane = 0; lane < _this->nb_lanes; lane++)
+        {
+            if (_this->lane_retry_owed[lane])
+            {
+                work = true;
+                break;
+            }
+        }
+    }
     if (!work)
     {
         for (Entry &e : _this->entries)
@@ -1924,6 +1987,52 @@ void GroupMshr::door_handler(vp::Block *__this, vp::ClockEvent *)
     if (work)
     {
         _this->fsm_event.enqueue(1);
+    }
+
+    {
+        // Is the MSHR the component that owes the wedged ports their retry?
+        static const char *mp = nullptr; static bool ck = false;
+        if (!ck) { ck = true; mp = getenv("TERANOC_MSHR_OWED_PATH"); }
+        if (mp && _this->clock.get_cycles() > 350000)
+        {
+            static std::set<const void *> seen;
+            int owed = 0;
+            for (int l = 0; l < _this->nb_lanes; l++) if (_this->lane_retry_owed[l]) owed++;
+            if (seen.insert((const void *)_this).second)
+            {
+                static FILE *mf = nullptr;
+                if (!mf) mf = fopen(mp, "a");
+                if (mf)
+                {
+                    int st_cnt[5] = {0,0,0,0,0}; int nvalid = 0;
+                    for (Entry &e : _this->entries)
+                        if (e.valid) { nvalid++; if (e.state >= 0 && e.state < 5) st_cnt[e.state]++; }
+                    fprintf(mf, "[MSHROWED] %s cyc=%ld owed_lanes=%d work=%d reqs=%lu"
+                        " deny[stall=%lu meta=%lu slot=%lu bankfull=%lu]"
+                        " valid=%d st[idle=%d wait=%d resphold=%d drain=%d cached=%d]\n",
+                        _this->get_path().c_str(), (long)_this->clock.get_cycles(),
+                        owed, (int)work, (unsigned long)_this->stat_reqs,
+                        (unsigned long)_this->stat_deny_stall,
+                        (unsigned long)_this->stat_deny_meta,
+                        (unsigned long)_this->stat_deny_slot,
+                        (unsigned long)_this->stat_deny_bankfull,
+                        nvalid, st_cnt[0], st_cnt[1], st_cnt[2], st_cnt[3], st_cnt[4]);
+                    for (Entry &e : _this->entries)
+                    {
+                        if (!e.valid || e.state != ST_RESP_HOLD) continue;
+                        fprintf(mf, "   RESPHOLD subs=%d/%d release_cycle=%ld (now=%ld,"
+                            " %s) issued=%d beats_arrived=%d burst_len=%d\n",
+                            (int)e.subs.size(), _this->hold_subs_single,
+                            (long)e.release_cycle, (long)_this->clock.get_cycles(),
+                            e.release_cycle < 0 ? "NEVER ARMED"
+                              : (_this->clock.get_cycles() >= e.release_cycle ? "EXPIRED"
+                                                                              : "pending"),
+                            (int)e.issued, e.beats_arrived, e.burst_len);
+                    }
+                    fflush(mf);
+                }
+            }
+        }
     }
 }
 
