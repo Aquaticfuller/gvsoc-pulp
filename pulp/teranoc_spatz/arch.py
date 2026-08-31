@@ -132,6 +132,8 @@ class GroupMshrConfig:
     resp_cache:          bool = True # EnableRespCache (single-word CACHED state)
     stall_on_resp:       bool = True # group_mshr_stall_on_resp
     bypass_track_ways:   int  = 4    # bypass retag table ways per tile
+                                     # (group_mshr_bypass_ways; the decode campaign's
+                                     #  build_tgt4x4 image pins 16)
     # tcdm_burst_expander at destination tiles
     burst_expander_local_issue:  int = 1  # i_local_burst_expander IssueWidth
     burst_expander_remote_issue: int = 3  # i_remote_burst_expander IssueWidth
@@ -665,7 +667,11 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
     # gives the naive per-word behavior (== teranoc_v2's VLSU).
     vlsu_burst = VlsuBurstConfig(
         enable=bool(int(os.environ.get('TERANOC_VLSU_BURST_ENABLE', 1))),
-        max_burst_words=16, rob_depth=64,
+        max_burst_words=16,
+        # spatz_vlsu_rob_depth. The B x KS decode campaign's image (build_tgt4x4)
+        # pins ROB0=128, so this must be settable to compare against it; the base
+        # config/terapool_spatz4_fpu.mk default is 64.
+        rob_depth=int(os.environ.get('TERANOC_VLSU_ROB_DEPTH', 64)),
         sub_word=bool(int(os.environ.get('TERANOC_VLSU_BURST_EW16', 0))),
         block_alloc=True, dual_load=2, recv_ports=2),
     # MSHR knobs default to config/terapool_spatz4_fpu.mk's built defaults
@@ -691,6 +697,7 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
         bank_shift_single=int(os.environ.get('TERANOC_MSHR_BANK_SHIFT_SINGLE', 9)),
         bank_shift_burst=int(os.environ.get('TERANOC_MSHR_BANK_SHIFT_BURST', 7)),
         bank_burst_bits=int(os.environ.get('TERANOC_MSHR_BANK_BURST_BITS', 1)),
+        bypass_track_ways=int(os.environ.get('TERANOC_MSHR_BYPASS_WAYS', 4)),
         bankfull_bp=int(os.environ.get('TERANOC_MSHR_BANKFULL_BP', 1)),
         cache_reuse_target=int(os.environ.get('TERANOC_MSHR_CACHE_REUSE_TARGET', 0)),
         cache_timeout=int(os.environ.get('TERANOC_MSHR_CACHE_TIMEOUT', 0)),
