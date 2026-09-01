@@ -910,7 +910,14 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
 // 6.3M cycles without finishing against 19,321 with the MSHR disabled entirely,
 // and 6,031 in RTL.
 #define MSHR_CFG_HOLD_CNT_MAX 8191
-#define MSHR_CFG_SHIFT_MIN 5
+// mempool_group_mshr_cfg.sv:48 BankShiftMin. Lowered from 5 to 4 with the
+// bank-hash fix: the burst field must be allowed to sit ON the burst boundary,
+// which is exactly where a contiguous group span is indexed (every decode
+// shape). The static window is not the whole rule -- see the burst_hash guard
+// on ENABLE below.
+#define MSHR_CFG_SHIFT_MIN 4
+#define MSHR_CFG_BURST_ALIGN_BITS 4
+#define MSHR_CFG_BANK_BURST_BITS_MAX 1
 #define MSHR_CFG_SHIFT_MAX 10
 
 bool GroupMshr::mshr_busy() const
@@ -959,7 +966,23 @@ void GroupMshr::cfg_apply(int idx, bool is_write, uint32_t data, uint32_t *rdata
     switch (idx)
     {
     case MSHR_CSR_ENABLE:
-        this->cfg_enable = (data & 1) != 0;
+        // Arming with an overlapping burst hash silently halves the bank count,
+        // so the RTL refuses to arm and raises RANGE instead
+        // (mempool_group_mshr_cfg.sv: burst_hash_ok, evaluated on the SETTLED
+        // config because the two fields arrive in separate writes).
+        if (!(data & 1))
+        {
+            this->cfg_enable = false;
+        }
+        else if (this->bank_shift_burst >=
+                 MSHR_CFG_BURST_ALIGN_BITS + this->bank_burst_bits)
+        {
+            this->cfg_enable = true;
+        }
+        else
+        {
+            this->cfg_status |= MSHR_STATUS_RANGE;
+        }
         break;
     case MSHR_CSR_HOLD_SUBS_SINGLE:
         if (data >= 1 && data <= (uint32_t)this->merge_reqs) this->hold_subs_single = (int)data;
@@ -988,8 +1011,15 @@ void GroupMshr::cfg_apply(int idx, bool is_write, uint32_t data, uint32_t *rdata
         else this->bank_shift_burst = (int)data;
         break;
     case MSHR_CSR_BANK_BURST_BITS:
+        // RANGE-CHECKED like every other CSR. This used to store data & 1 with
+        // no check, so a software-derived 2/3/4 was silently truncated to its
+        // LSB -- the one CSR that could be mis-set without ever raising
+        // MSHR_STATUS_RANGE, and the reason a degenerate burst bank hash went
+        // unnoticed on both sides (mempool_group_mshr_cfg.sv, burst_bits_ok).
         if (this->mshr_busy()) this->cfg_status |= MSHR_STATUS_BANK_BUSY;
-        else this->bank_burst_bits = (int)(data & 1);
+        else if (data > (uint32_t)MSHR_CFG_BANK_BURST_BITS_MAX)
+            this->cfg_status |= MSHR_STATUS_RANGE;
+        else this->bank_burst_bits = (int)data;
         break;
     case MSHR_CSR_SERVE_TIMEOUT:
         if (data > MSHR_CFG_HOLD_CNT_MAX)
