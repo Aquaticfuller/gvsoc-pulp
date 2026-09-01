@@ -311,6 +311,8 @@ private:
     std::vector<uint64_t> bank_alloc;
     std::vector<uint64_t> bank_full_miss;
     uint64_t stat_cache_evict = 0;
+    uint64_t stat_fetch_issued = 0;   // fetches accepted by the NoC
+    uint64_t stat_resp_beats_in = 0;  // response beats captured for our entries
     std::vector<L1NocFlit *> lane_pending;    // parked flit per lane (door input)
     std::vector<bool> lane_retry_owed;
     std::vector<bool> req_out_blocked;
@@ -1605,6 +1607,7 @@ void GroupMshr::forward_fetch(Entry *e)
         return;
     }
     e->issued = true;
+    this->stat_fetch_issued++;
     e->issued_cycle = this->clock.get_cycles();
 }
 
@@ -1729,6 +1732,7 @@ vp::IoReqStatus GroupMshr::capture_response(L1NocFlit *flit, int lane)
             idx, flit->mshr_tag);
         return vp::IO_REQ_DONE;
     }
+    this->stat_resp_beats_in++;
     e.resp_words[idx] = flit->beat_data;
     // resp_in spill: with spill on, the beat becomes drain-visible NEXT cycle
     // (arrive_pending moves into arrived_mask on the next clock edge).
@@ -2020,12 +2024,95 @@ void GroupMshr::door_handler(vp::Block *__this, vp::ClockEvent *)
     {
         _this->fsm_event.enqueue(1);
     }
+    else
+    {
+        // LOST-WAKEUP DETECTOR. The fsm event self-stops here. If any entry is
+        // still VALID at this moment, nothing is scheduled to advance it: its
+        // release_cycle can never fire, its subscribers are never served, and
+        // the requesting core waits forever while the rest of the machine spins
+        // at the barrier. That is a deadlock, not slowness, and it is invisible
+        // to every other probe because the MSHR is quiescent rather than busy.
+        static const char *lp = nullptr; static bool lck = false;
+        if (!lck) { lck = true; lp = getenv("TERANOC_MSHR_LOSTWAKE_PATH"); }
+        if (lp)
+        {
+            // Age gate. The fsm stopping with valid entries is NORMAL -- entries
+            // awaiting an in-flight response are exactly why it has nothing to do.
+            // Only an entry that has been outstanding far longer than any real
+            // round trip is evidence of a lost response. Threshold in cycles via
+            // TERANOC_MSHR_STUCK_AGE (default 20000; a remote round trip on this
+            // mesh is O(100)).
+            static int64_t stuck_age = 20000;
+            static bool ack = false;
+            if (!ack)
+            {
+                ack = true;
+                const char *sa = getenv("TERANOC_MSHR_STUCK_AGE");
+                if (sa) stuck_age = strtoll(sa, nullptr, 0);
+            }
+            int64_t now_c = _this->clock.get_cycles();
+            int nvalid = 0, st[5] = {0,0,0,0,0}, armed = 0, nstuck = 0;
+            for (const Entry &e : _this->entries)
+            {
+                if (!e.valid) continue;
+                nvalid++;
+                if (e.state >= 0 && e.state < 5) st[e.state]++;
+                if (e.release_cycle >= 0) armed++;
+                if (e.issued && now_c - e.issued_cycle > stuck_age) nstuck++;
+            }
+            if (nstuck)
+            {
+                static std::set<const void *> lseen;
+                if (lseen.insert((const void *)_this).second)
+                {
+                    static FILE *lf = nullptr;
+                    if (!lf) lf = fopen(lp, "a");
+                    if (lf)
+                    {
+                        fprintf(lf, "[LOSTWAKE] %s cyc=%ld fsm_stopping valid=%d"
+                            " st[idle=%d wait=%d resphold=%d drain=%d cached=%d]"
+                            " deadline_armed=%d bypass_q=%d fetch_issued=%lu resp_beats_in=%lu stuck=%d\n",
+                            _this->get_path().c_str(),
+                            (long)_this->clock.get_cycles(), nvalid,
+                            st[0], st[1], st[2], st[3], st[4], armed,
+                            (int)_this->bypass_q_total,
+                            (unsigned long)_this->stat_fetch_issued,
+                            (unsigned long)_this->stat_resp_beats_in, nstuck);
+                        for (size_t i = 0; i < _this->entries.size(); i++)
+                        {
+                            const Entry &e = _this->entries[i];
+                            if (!e.valid) continue;
+                            fprintf(lf, "    e[%2d] st=%d burst=%d subs=%d/%d issued=%d"
+                                " rel=%ld age=%ld addr=0x%lx grp=%d\n",
+                                (int)i, e.state, e.burst_len, (int)e.subs.size(),
+                                (e.burst_len == 1) ? _this->hold_subs_single
+                                                   : _this->hold_subs_burst,
+                                (int)e.issued, (long)e.release_cycle,
+                                (long)(e.issued ? now_c - e.issued_cycle : -1),
+                                (unsigned long)e.base_addr, e.tgt_group);
+                        }
+                        fflush(lf);
+                    }
+                }
+            }
+        }
+    }
 
     {
         // Is the MSHR the component that owes the wedged ports their retry?
         static const char *mp = nullptr; static bool ck = false;
-        if (!ck) { ck = true; mp = getenv("TERANOC_MSHR_OWED_PATH"); }
-        if (mp && _this->clock.get_cycles() > 350000)
+        static int64_t owed_after = 350000;
+        if (!ck)
+        {
+            ck = true;
+            mp = getenv("TERANOC_MSHR_OWED_PATH");
+            // Arming cycle: the census is only interesting once the run has had
+            // time to reach steady state, but on a collapsing arm 350k cycles is
+            // hours of wall time. Let the caller move it.
+            const char *ap = getenv("TERANOC_MSHR_OWED_AFTER");
+            if (ap) owed_after = strtoll(ap, nullptr, 0);
+        }
+        if (mp && _this->clock.get_cycles() > owed_after)
         {
             static std::set<const void *> seen;
             int owed = 0;

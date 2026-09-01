@@ -97,7 +97,18 @@ class VlsuBurstConfig:
     # (>= FullBurstBytes, <= rob_words*4, 64 B alignment) and a 64 B burst is 16
     # four-byte memory words regardless of element width, so nothing else moves.
     # Default OFF: matches the RTL default and every calibration run to date.
-    sub_word:        bool = False  # e16 may burst
+    sub_word:        bool = True   # e16 may burst (RTL BurstSubWord). The
+                                     # spatz_vlsu.sv localparam falls back to 0,
+                                     # but the shipping image sets
+                                     # spatz_vlsu_burst_ew16 ?= 1
+                                     # (config/terapool_spatz4_fpu.mk:677 ->
+                                     #  hardware/Makefile:511 -DSPATZ_VLSU_BURST_EW16).
+                                     # With this off, fp16 vector loads never take
+                                     # the burst path: measured 140,304 single
+                                     # requests and 0 bursts on one group of
+                                     # sp-decode-4x4-fp16-ks2-16x128x4096, against
+                                     # 4,288 bursts + 3,592 singles for its
+                                     # equal-byte fp32 twin -- ~18x the requests.
     burst_issue_latency: int = 3   # BlockAlloc decide->reserve->send cadence
     walk_issue_latency:  int = 18  # non-BlockAlloc per-burst cadence
 
@@ -141,7 +152,8 @@ class GroupMshrConfig:
     bank_shift_burst:    int  = 7    # group_mshr_bank_shift_burst
     bank_burst_bits:     int  = 1    # group_mshr_bank_burst_bits
     serve_timeout:       int  = 2047 # group_mshr_serve_timeout (singles only)
-    resp_cache:          bool = True # EnableRespCache (single-word CACHED state)
+    resp_cache:          bool = bool(int(os.environ.get('TERANOC_MSHR_RESP_CACHE', 1)))
+                                     # EnableRespCache (single-word CACHED state).
     stall_on_resp:       bool = True # group_mshr_stall_on_resp
     bypass_track_ways:   int  = 4    # bypass retag table ways per tile
                                      # (group_mshr_bypass_ways; the decode campaign's
@@ -691,7 +703,7 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
         # pins ROB0=128, so this must be settable to compare against it; the base
         # config/terapool_spatz4_fpu.mk default is 64.
         rob_depth=int(os.environ.get('TERANOC_VLSU_ROB_DEPTH', 64)),
-        sub_word=bool(int(os.environ.get('TERANOC_VLSU_BURST_EW16', 0))),
+        sub_word=bool(int(os.environ.get('TERANOC_VLSU_BURST_EW16', 1))),
         block_alloc=True, dual_load=2, recv_ports=2),
     # MSHR knobs default to config/terapool_spatz4_fpu.mk's built defaults
     # (2026-08-15 state: hold_window_burst and serve_timeout track the uniform

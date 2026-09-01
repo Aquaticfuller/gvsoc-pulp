@@ -96,6 +96,20 @@ private:
     bool resp_blocked = false;
 };
 
+// Expander event log (diagnostic). The expander's clock events self-stop when
+// it is blocked, so a snapshot probe can never fire at a stall. Instead log the
+// state TRANSITIONS -- context acquire/release and lane park/unpark -- and read
+// the tail: a context acquired with no matching release is one that never
+// completed, and its parked lane names the sub-request whose retry was lost.
+// TERANOC_EXPANDER_LOG=<path>. WARNING: ~190 MB per 45k cycles on a
+// 256-core arm -- enable only for a short bounded run, and delete after.
+static FILE *xp_log()
+{
+    static bool ck = false; static FILE *f = nullptr;
+    if (!ck) { ck = true; const char *p = getenv("TERANOC_EXPANDER_LOG"); if (p) f = fopen(p, "w"); }
+    return f;
+}
+
 TeranocL1BurstExpander::TeranocL1BurstExpander(vp::ComponentConf &config)
     : vp::Component(config)
 {
@@ -163,6 +177,13 @@ vp::IoReqStatus TeranocL1BurstExpander::in_req(vp::Block *__this, vp::IoReq *req
     ctx->nb_words = nb_words;
     ctx->words_issued = 0;
     ctx->words_completed = 0;
+    if (FILE *xf = xp_log())
+    {
+        fprintf(xf, "ACQ %s cyc=%ld ctx=%d addr=0x%lx words=%d\n",
+            _this->get_path().c_str(), (long)_this->clock.get_cycles(),
+            (int)(ctx - &_this->ctxs[0]), (unsigned long)req->get_addr(), nb_words);
+        fflush(xf);
+    }
 
     // Fall-through: the first beats leave in the accept cycle.
     _this->pump();
@@ -296,6 +317,13 @@ void TeranocL1BurstExpander::pump()
         {
             this->lane_parked[lane] = sub;
             this->lane_blocked[lane] = true;
+            if (FILE *xf = xp_log())
+            {
+                fprintf(xf, "PARK %s cyc=%ld lane=%d addr=0x%lx\n",
+                    this->get_path().c_str(), (long)this->clock.get_cycles(),
+                    lane, (unsigned long)sub->get_addr());
+                fflush(xf);
+            }
             continue;
         }
         if (st == vp::IO_REQ_DONE)
@@ -394,6 +422,12 @@ bool TeranocL1BurstExpander::try_emit_beat(vp::IoReq *sub)
     if (ctx->words_completed == ctx->nb_words)
     {
         ctx->busy = false;
+        if (FILE *xf = xp_log())
+        {
+            fprintf(xf, "REL %s cyc=%ld ctx=%d\n", this->get_path().c_str(),
+                (long)this->clock.get_cycles(), (int)(ctx - &this->ctxs[0]));
+            fflush(xf);
+        }
         // A context freed: wake any requester parked behind it.
         this->in.retry(vp::IO_RETRY_ANY);
     }
@@ -408,6 +442,12 @@ void TeranocL1BurstExpander::out_retry_muxed(vp::Block *__this, int lane,
 {
     auto *_this = static_cast<TeranocL1BurstExpander *>(__this);
     _this->lane_blocked[lane] = false;
+    if (FILE *xf = xp_log())
+    {
+        fprintf(xf, "UNPARK %s cyc=%ld lane=%d\n", _this->get_path().c_str(),
+            (long)_this->clock.get_cycles(), lane);
+        fflush(xf);
+    }
     _this->pump();
 }
 
