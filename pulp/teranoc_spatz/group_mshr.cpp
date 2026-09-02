@@ -317,6 +317,7 @@ private:
     std::vector<uint64_t> bank_full_miss;
     uint64_t stat_cache_evict = 0;
     uint64_t stat_lockout_hist[17] = {0};
+    uint64_t stat_bypass_retag = 0;
     // Cache-hit gather window, in cycles (TERANOC_MSHR_CACHE_GATHER, default 2;
     // 0 restores the legacy drain-on-first-hit). See the CACHED hit path.
     int cache_gather_w = -1;
@@ -637,6 +638,8 @@ GroupMshr::~GroupMshr()
             (unsigned long)this->byp_exit_blocked, (unsigned long)this->byp_exit_denied,
             this->byp_depth_n ? (double)this->byp_depth_sum / this->byp_depth_n : 0.0,
             (unsigned long)this->byp_depth_max);
+        fprintf(f, "  %s bypass_retag: beats_retagged=%lu\n",
+            this->get_path().c_str(), (unsigned long)this->stat_bypass_retag);
         fprintf(f, "  %s bypass_delivery: beats=%lu cycles=%lu width=%.4f hol_stalls=%lu\n",
             this->get_path().c_str(), (unsigned long)this->byp_out_beats,
             (unsigned long)this->byp_out_cycles,
@@ -1860,7 +1863,61 @@ vp::IoReqStatus GroupMshr::capture_response(L1NocFlit *flit, int lane)
         if (flit->get_is_write()) this->stat_bypass_wr++;
         else if (flit->beat_idx >= 0) this->stat_bypass_rd_burst++;
         else this->stat_bypass_rd_single++;
-        this->bypass_q_lane[lane].push_back(flit);
+        // PARITY RETAG FOR BYPASSED BURSTS (RTL gen_bypass_retag, guarded by
+        // PD2 = DrainBeatsPerEntry > 1; design doc 4.6).
+        //
+        // A bypassed multi-beat load is served under the legacy contract: every
+        // beat echoes the ORIGINAL core_id, so all beats collapse onto one core
+        // data port and drain 1 beat/cycle -- even though they already ARRIVE
+        // spread across both tile response ports. The RTL's side table retags
+        // beat b to port 1+(b&1) so a bypassed burst uses BOTH response ports,
+        // exactly like an MSHR-drained entry, restoring 2 beats/cycle.
+        //
+        // Without this the model queued every beat on its ARRIVAL lane, so a
+        // bypassed burst serialised on one lane. That is the path the
+        // hold_subs_burst == 1 shapes take EXCLUSIVELY -- our three worst fp16
+        // arms (grid sharers = 1) sit at +1437%, +3352% and +4068%.
+        //
+        // Same law as the MSHR drain above: lane = tile*ports_per_tile + (beat&1).
+        // Restricted to multi-beat READS: single-word entries and the response
+        // cache take the byte-identical legacy path in the RTL too (b=0 is the
+        // +0 identity), and writes are not retagged.
+        //
+        // The RTL's table is BypassTrackWays deep per tile and it proves depth 2
+        // sufficient (one memory instruction in flight, at most two bursts, and
+        // it asserts the bound). We do not model the depth limit -- an overflow
+        // cannot occur under that proof -- but the retag is gated on the knob so
+        // bypass_track_ways=0 restores the arrival-lane behaviour. Until now that
+        // config value was read and never used.
+        // OFF BY DEFAULT (TERANOC_MSHR_BYPASS_RETAG=1 to enable). As written this
+        // regresses the calibrated anchor gemm_128x128x512 to 12,893 against its
+        // 11,445 reference (+12.6%, outside tolerance) while buying only 3.7% on
+        // the arm it targets (fp16 KS8 B=8: 245,822 -> 236,681 against RTL 5,898).
+        // The retag itself fires correctly -- beats_retagged 525,824 equals
+        // read_burst 525,824, i.e. every bypassed burst beat -- so the mechanism
+        // works and the lane MAPPING is the suspect: the RTL sends beat b to resp
+        // port 1+(b&1) and declares its port arrays [N-1:1], indexed from ONE,
+        // whereas this maps to ports 0 and 1. Do not enable until that is settled
+        // against the RTL's port numbering.
+        static int retag_en = -1;
+        if (retag_en < 0)
+        {
+            const char *re = getenv("TERANOC_MSHR_BYPASS_RETAG");
+            retag_en = re ? atoi(re) : 0;
+        }
+        int q_lane = lane;
+        if (retag_en && this->drain_beats > 1 && this->bypass_track_ways > 0 &&
+            flit->beat_idx >= 0 && !flit->get_is_write())
+        {
+            int tile = lane / this->nb_ports_per_tile;
+            int cand = tile * this->nb_ports_per_tile + (flit->beat_idx & 1);
+            if (cand >= 0 && cand < this->nb_lanes)
+            {
+                q_lane = cand;
+                this->stat_bypass_retag++;
+            }
+        }
+        this->bypass_q_lane[q_lane].push_back(flit);
         this->bypass_q_total++;
         this->fsm_event.enqueue(0);
         return vp::IO_REQ_DONE;
