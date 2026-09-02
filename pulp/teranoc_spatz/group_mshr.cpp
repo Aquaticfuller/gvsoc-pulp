@@ -1890,6 +1890,48 @@ vp::IoReqStatus GroupMshr::capture_response(L1NocFlit *flit, int lane)
         // per lane and measured 454,116 HOL stalls at depth 128 on
         // fp16 KS8 B=8. That divergence, not the retag, is where the bypass
         // bandwidth goes.
+        // COMBINATIONAL PASS-THROUGH (RTL :3558-3571). For an MSHR-targeted
+        // response the RTL backpressures on resp_buf slot availability, but for
+        // a BYPASS response `resp_in_ready = resp_out_ready` in the same
+        // always_comb -- no register, no FIFO, no held-beat state on that path.
+        // "Non-backpressurable" means the MSHR never ADDS backpressure of its
+        // own; a denied bypass beat is simply not transferred that cycle, which
+        // is legal, and it stays with the UPSTREAM owner that offered it.
+        //
+        // That is what discharges the io_v2 duty here: by never returning
+        // GRANTED for a beat it cannot place, the MSHR never becomes the
+        // resending owner, so backpressure travels up out of the group in the
+        // same cycle instead of accumulating in MSHR-local storage. The old
+        // per-lane queue absorbed it instead, and reported the accumulation as
+        // 454,116 head-of-line stalls at depth 128 on fp16 KS8 B=8.
+        //
+        // OFF BY DEFAULT: as written this DEADLOCKS. Returning DENIED upstream
+        // makes the beat the upstream's to resend, but the retry handshake that
+        // must then fire does not close -- the anchor suite, normally 80 s, was
+        // still running after 15 minutes with 5 sims live. The io_v2 duty is not
+        // discharged simply by declining ownership: something must guarantee the
+        // upstream is woken, and resp_out_retry only fires if the DOWNSTREAM
+        // denied us, which is not the only path into this state.
+        // TERANOC_MSHR_BYPASS_PASSTHROUGH=1 re-enables it for debugging.
+        static int bp_pass = -1;
+        if (bp_pass < 0)
+        {
+            const char *bp = getenv("TERANOC_MSHR_BYPASS_PASSTHROUGH");
+            bp_pass = bp ? atoi(bp) : 0;
+        }
+        if (bp_pass)
+        {
+            vp::IoReqStatus st = this->resp_out_v[lane]->req(flit);
+            if (st == vp::IO_REQ_DENIED)
+            {
+                // Not transferred. Ownership stays upstream; our resp_out retry
+                // re-offers it by retrying the resp_in channel.
+                this->byp_exit_denied++;
+                return vp::IO_REQ_DENIED;
+            }
+            this->ldh_count(lane, 1);
+            return st;
+        }
         this->bypass_q_lane[lane].push_back(flit);
         this->bypass_q_total++;
         this->fsm_event.enqueue(0);
@@ -2851,6 +2893,10 @@ void GroupMshr::resp_out_retry(vp::Block *__this, int lane, vp::IoRetryChannel)
         // measures how much of the traffic needs a deny/retry round trip.
         _this->ldh_count(lane, 2);
     }
+    // A bypass beat denied under pass-through was never taken into MSHR
+    // storage, so the upstream owner still holds it: wake that channel so it
+    // re-offers. Harmless when nothing is pending.
+    _this->resp_in_v[lane]->retry(vp::IO_RETRY_ANY);
     _this->fsm_event.enqueue(0);
 }
 
