@@ -126,6 +126,11 @@ private:
         int resp_rd = 0;          // read cursor (word index being drained)
         int beats_arrived = 0;    // total beats captured
         uint32_t served_mask = 0; // per-head-beat pending bitmap over subs
+        // Diagnostic: lanes that were stall-denied against this entry while it
+        // drained. popcount at retire = DISTINCT requesters that wanted this
+        // line but were locked out, which is the merge degree the model loses
+        // to serialising what the RTL evaluates in one cycle across 32 ports.
+        uint64_t stall_lane_mask = 0;
         int beats_drained = 0;    // beats fully delivered to all subscribers
         int served_cnt = 0;       // total shares served (cache self-invalidate)
         uint32_t cache_word = 0;
@@ -311,6 +316,10 @@ private:
     std::vector<uint64_t> bank_alloc;
     std::vector<uint64_t> bank_full_miss;
     uint64_t stat_cache_evict = 0;
+    uint64_t stat_lockout_hist[17] = {0};
+    // Cache-hit gather window, in cycles (TERANOC_MSHR_CACHE_GATHER, default 2;
+    // 0 restores the legacy drain-on-first-hit). See the CACHED hit path.
+    int cache_gather_w = -1;
     uint64_t stat_single_off[4] = {0,0,0,0};
     uint64_t stat_cache_hit_attempt = 0;
     // Why a CACHED line released its way: reached its reuse target (healthy
@@ -744,6 +753,14 @@ GroupMshr::~GroupMshr()
             (unsigned long)this->stat_single_off[0], (unsigned long)this->stat_single_off[1],
             (unsigned long)this->stat_single_off[2], (unsigned long)this->stat_single_off[3],
             (unsigned long)this->stat_cache_hits);
+        {
+            uint64_t tot=0, wsum=0;
+            for (int i=0;i<17;i++){ tot+=this->stat_lockout_hist[i]; wsum+=(uint64_t)i*this->stat_lockout_hist[i]; }
+            fprintf(f, "  %s lockout: entries=%lu mean_distinct_locked_out=%.2f  hist[0..8]=",
+                this->get_path().c_str(), (unsigned long)tot, tot ? (double)wsum/tot : 0.0);
+            for (int i=0;i<9;i++) fprintf(f, "%lu ", (unsigned long)this->stat_lockout_hist[i]);
+            fprintf(f, "\n");
+        }
         fprintf(f, "  %s cache: selfinval=%lu aged_out=%lu (%.1f%% aged) mean_served=%.1f target=%d\n",
             this->get_path().c_str(),
             (unsigned long)this->stat_cache_selfinval, (unsigned long)this->stat_cache_aged,
@@ -1366,10 +1383,38 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             // new subscriber set — otherwise the drain never fires.
             if (hit->state == ST_CACHED)
             {
-                hit->state = ST_DRAIN_RESP;
-                hit->served_mask = (1u << hit->subs.size()) - 1;
-                hit->drain_not_before = this->clock.get_cycles() + this->spill;
                 this->stat_cache_hits++;
+                if (this->cache_gather_w < 0)
+                {
+                    const char *gw = getenv("TERANOC_MSHR_CACHE_GATHER");
+                    this->cache_gather_w = gw ? atoi(gw) : 2;
+                }
+                // GATHER, rather than draining on the first hit. The RTL
+                // evaluates all request ports in one cycle, so several
+                // requesters hit a cached line together and merge into it
+                // before it drains. This model retires one request per call, so
+                // an immediate CACHED->DRAIN_RESP locks out every peer arriving
+                // while the drain runs -- measured 2.08 distinct requesters
+                // stall-denied per entry, with fp16 merging 1.8 requests/entry
+                // against fp32's 8.0. Holding the line in CACHED for a short
+                // window lets those peers join and then be served in one
+                // multicast, which is what the parallel hardware does for free.
+                //
+                // fp32 is untouched by construction: it merges everything
+                // pre-response and takes ZERO cache hits on these shapes.
+                if ((int)hit->subs.size() >= this->hold_subs_single ||
+                    this->cache_gather_w == 0)
+                {
+                    hit->state = ST_DRAIN_RESP;
+                    hit->served_mask = (1u << hit->subs.size()) - 1;
+                    hit->drain_not_before = this->clock.get_cycles() + this->spill;
+                }
+                else
+                {
+                    // Stay CACHED and let peers accumulate; the timer below
+                    // converts it to a multicast drain.
+                    hit->release_cycle = this->clock.get_cycles() + this->cache_gather_w;
+                }
             }
             // Burst hold window early release.
             if (!hit->issued && is_burst && (int)hit->subs.size() >= this->hold_subs_burst)
@@ -1399,6 +1444,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
                     (int)o.subs.size() < this->merge_reqs)
                 {
                     this->stat_deny_stall++;
+                    if (lane < 64) o.stall_lane_mask |= (1ULL << lane);
                     this->lane_retry_owed[lane] = true;
                     this->fsm_event.enqueue(1);
                     return vp::IO_REQ_DENIED;
@@ -1451,6 +1497,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             e->issued = false;
             e->fetch_blocked = false;
             e->subs.clear();
+            e->stall_lane_mask = 0;
             e->subs.push_back(Sub{tile, port, flit->src_core, flit, false, flit->burst, flit->src_x, flit->src_y, flit->initiator_addr});
             e->resp_rd = 0;
             e->arrived_mask = 0;
@@ -2546,6 +2593,11 @@ void GroupMshr::retire_if_done(Entry *e)
     {
         return;
     }
+    {
+        int lo = __builtin_popcountll(e->stall_lane_mask);
+        if (lo > 16) lo = 16;
+        this->stat_lockout_hist[lo]++;
+    }
     // Subscriber histogram at retire (merge-efficiency measure).
     {
         int sc = (int)e->subs.size(); if (sc > 8) sc = 8;
@@ -2696,6 +2748,15 @@ void GroupMshr::serve_timeouts(int64_t cycles)
             e.drain_not_before = this->clock.get_cycles() + this->spill;
             this->fsm_event.enqueue(0);
             e.release_cycle = -1;
+        }
+        else if (e.state == ST_CACHED && !e.subs.empty())
+        {
+            // Gather window expired: multicast to everyone who joined.
+            e.state = ST_DRAIN_RESP;
+            e.served_mask = (1u << e.subs.size()) - 1;
+            e.drain_not_before = this->clock.get_cycles() + this->spill;
+            e.release_cycle = -1;
+            this->fsm_event.enqueue(0);
         }
         else if (e.state == ST_CACHED)
         {
