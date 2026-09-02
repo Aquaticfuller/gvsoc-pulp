@@ -311,6 +311,14 @@ private:
     std::vector<uint64_t> bank_alloc;
     std::vector<uint64_t> bank_full_miss;
     uint64_t stat_cache_evict = 0;
+    uint64_t stat_single_off[4] = {0,0,0,0};
+    uint64_t stat_cache_hit_attempt = 0;
+    // Why a CACHED line released its way: reached its reuse target (healthy
+    // turnover) vs aged out on serve_timeout (target unreachable -- the line
+    // pinned a way for the whole window, which is what fills banks).
+    uint64_t stat_cache_selfinval = 0;
+    uint64_t stat_cache_aged = 0;
+    uint64_t stat_cache_served_sum = 0;
     uint64_t stat_fetch_issued = 0;   // fetches accepted by the NoC
     uint64_t stat_resp_beats_in = 0;  // response beats captured for our entries
     std::vector<L1NocFlit *> lane_pending;    // parked flit per lane (door input)
@@ -731,6 +739,21 @@ GroupMshr::~GroupMshr()
             this->get_path().c_str(), (unsigned long)this->stat_deny_stall,
             (unsigned long)this->stat_deny_meta, (unsigned long)this->stat_deny_slot,
             (unsigned long)this->stat_deny_bankfull, (int)this->bankfull_bp);
+        fprintf(f, "  %s single_byte_off: 0=%lu 1=%lu 2=%lu 3=%lu  cache_hits=%lu\n",
+            this->get_path().c_str(),
+            (unsigned long)this->stat_single_off[0], (unsigned long)this->stat_single_off[1],
+            (unsigned long)this->stat_single_off[2], (unsigned long)this->stat_single_off[3],
+            (unsigned long)this->stat_cache_hits);
+        fprintf(f, "  %s cache: selfinval=%lu aged_out=%lu (%.1f%% aged) mean_served=%.1f target=%d\n",
+            this->get_path().c_str(),
+            (unsigned long)this->stat_cache_selfinval, (unsigned long)this->stat_cache_aged,
+            (this->stat_cache_selfinval + this->stat_cache_aged) ?
+                100.0 * this->stat_cache_aged /
+                (this->stat_cache_selfinval + this->stat_cache_aged) : 0.0,
+            (this->stat_cache_selfinval + this->stat_cache_aged) ?
+                (double)this->stat_cache_served_sum /
+                (this->stat_cache_selfinval + this->stat_cache_aged) : 0.0,
+            this->cache_reuse_target ? this->cache_reuse_target : this->hold_subs_single);
         fprintf(f, "  %s cfg: enable=%d merge_reqs=%d hss=%d hsb=%d hws=%d hwb=%d st=%d bss=%d bsb=%d bbb=%d status=0x%x\n",
             this->get_path().c_str(), (int)this->cfg_enable, this->merge_reqs,
             this->hold_subs_single, this->hold_subs_burst,
@@ -1260,10 +1283,30 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
     int tgt_group = (int)((addr >> 10) & (uint32_t)(this->nb_groups - 1));
     bool clamped_single = !is_burst;   // type bit for the bank hash
     int bank = this->mshr_bank_of(addr, clamped_single);
-    uint64_t base_addr = is_burst ? addr : addr;
+    // MERGE KEY. The RTL keys on tcdm_addr_t, a WORD address, so it "merges only
+    // exact 32-bit words" (mempool_group_mshr.sv:489) and the two halves of an
+    // fp16 flh pair are ONE key. This model carries BYTE addresses, so the key
+    // must be word-aligned explicitly or addr and addr+2 become two entries that
+    // never merge and never hit each other's cached line.
+    //
+    // Measured on sp-decode-4x4-fp16-ks8-16x128x4096, one group: 34,382,237 of
+    // 49,490,055 single loads arrive at byte offset 2 -- the half-word partners.
+    // Without this mask: cache_hits=0, mean_served pinned at exactly 8 (the
+    // offset-0 cohort alone), cache_reuse_target=2*hold_subs_single=16 therefore
+    // unreachable, 100% of lines aged out holding a way for the full
+    // serve_timeout, and 82.9M bank-full denials.
+    //
+    // Bursts are already MaxBurstWords-aligned by the VLSU admission rule, so the
+    // mask is a no-op for them; fp32 lands entirely at offset 0 and is unaffected.
+    uint64_t base_addr = addr & ~(uint64_t)3;
 
     this->stat_reqs++;
     if (is_burst) this->stat_reqs_burst++; else if (is_load) this->stat_reqs_single++;
+    // Sub-word offset histogram for SINGLE loads. The RTL keys the merge on a
+    // WORD address (tcdm_addr_t); this model keys on the byte address. If fp16
+    // half-word partners arrive at addr and addr+2 they are one line to the RTL
+    // and two distinct keys here -- which would explain zero cache hits.
+    if (is_load && !is_burst) this->stat_single_off[addr & 3]++;
     // Intra-group request path: tile flit creation -> this door.
     if (flit->t_created >= 0 && !flit->t_priced && is_load)
     {
@@ -1532,6 +1575,18 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
 // (GRANTED upstream: the MSHR takes ownership), so the remapper's marker
 // always matches one outstanding flit per lane. While a flit is held, new
 // sends on the lane are denied upstream and woken when the lane frees.
+// Request-lane block/unblock log (diagnostic). A lane blocked with a held flit
+// denies EVERY later request on it, including scalar stores that never allocate
+// an entry -- so an entry-based census cannot see the resulting stall. Log the
+// transitions and read the tail: a BLOCK with no matching UNBLOCK is a lane whose
+// downstream retry never came. TERANOC_MSHR_LANE_LOG=<path>.
+static FILE *lane_log()
+{
+    static bool ck = false; static FILE *f = nullptr;
+    if (!ck) { ck = true; const char *p = getenv("TERANOC_MSHR_LANE_LOG"); if (p) f = fopen(p, "w"); }
+    return f;
+}
+
 vp::IoReqStatus GroupMshr::passthrough(L1NocFlit *flit, int lane)
 {
     if (this->req_out_blocked[lane])
@@ -1543,6 +1598,13 @@ vp::IoReqStatus GroupMshr::passthrough(L1NocFlit *flit, int lane)
     {
         this->req_out_blocked[lane] = true;
         this->req_out_held[lane] = flit;
+        if (FILE *lf = lane_log())
+        {
+            fprintf(lf, "BLOCK %s cyc=%ld lane=%d src=passthrough addr=0x%lx\n",
+                this->get_path().c_str(), (long)this->clock.get_cycles(), lane,
+                (unsigned long)flit->get_addr());
+            fflush(lf);
+        }
         return vp::IO_REQ_GRANTED;
     }
     return st;
@@ -1634,6 +1696,13 @@ void GroupMshr::forward_fetch(Entry *e)
         this->req_out_blocked[lane] = true;
         this->req_out_held[lane] = owner.flit;
         e->fetch_blocked = true;
+        if (FILE *lf = lane_log())
+        {
+            fprintf(lf, "BLOCK %s cyc=%ld lane=%d src=fetch addr=0x%lx\n",
+                this->get_path().c_str(), (long)this->clock.get_cycles(), lane,
+                (unsigned long)owner.flit->get_addr());
+            fflush(lf);
+        }
         return;
     }
     e->issued = true;
@@ -1687,6 +1756,12 @@ void GroupMshr::replay_holds()
 void GroupMshr::req_out_retry(vp::Block *__this, int lane, vp::IoRetryChannel)
 {
     auto *_this = static_cast<GroupMshr *>(__this);
+    if (FILE *lf = lane_log())
+    {
+        fprintf(lf, "UNBLOCK %s cyc=%ld lane=%d\n", _this->get_path().c_str(),
+            (long)_this->clock.get_cycles(), lane);
+        fflush(lf);
+    }
     _this->req_out_blocked[lane] = false;
     L1NocFlit *held = _this->req_out_held[lane];
     if (held != nullptr)
@@ -2568,12 +2643,15 @@ void GroupMshr::store_update(uint64_t addr, const uint8_t *data, uint64_t size)
     {
         return;
     }
+    // Same word-aligned key as the request path: a half-word store must find the
+    // cached word it aliases, or the cache serves stale data to a later load.
+    uint64_t key = addr & ~(uint64_t)3;
     int bank = this->mshr_bank_of(addr, true);
     int tgt_group = (int)((addr >> 10) & (uint32_t)(this->nb_groups - 1));
     for (int idx : this->bank_ways[bank])
     {
         Entry &e = this->entries[idx];
-        if (!e.valid || e.state != ST_CACHED || e.base_addr != addr ||
+        if (!e.valid || e.state != ST_CACHED || e.base_addr != key ||
             e.tgt_group != tgt_group)
         {
             continue;
@@ -2624,6 +2702,8 @@ void GroupMshr::serve_timeouts(int64_t cycles)
             // Below the sharing target: age out.
             if (e.served_cnt < this->cache_target(e))
             {
+                this->stat_cache_aged++;
+                this->stat_cache_served_sum += (uint64_t)e.served_cnt;
                 e.valid = false;
                 e.state = ST_IDLE;
             }
@@ -2641,6 +2721,8 @@ void GroupMshr::serve_timeouts(int64_t cycles)
     {
         if (e.valid && e.state == ST_CACHED && e.served_cnt >= this->cache_target(e))
         {
+            this->stat_cache_selfinval++;
+            this->stat_cache_served_sum += (uint64_t)e.served_cnt;
             e.valid = false;
             e.state = ST_IDLE;
         }
