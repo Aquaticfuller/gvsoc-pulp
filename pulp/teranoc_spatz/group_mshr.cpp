@@ -92,6 +92,11 @@ private:
         int src_x;
         int src_y;
         uint64_t initiator_addr;
+        // Cycle this subscriber JOINED the entry. sub_arrival measures the
+        // offset from the entry's birth, which for a long-lived CACHED entry
+        // is dominated by the entry's age and says nothing about how long the
+        // requester waited. This is the requester-side latency: join -> served.
+        int64_t join_cycle;
     };
 
     enum EntryState : int { ST_IDLE = 0, ST_WAIT_RESP, ST_RESP_HOLD, ST_DRAIN_RESP, ST_CACHED };
@@ -126,6 +131,11 @@ private:
         int resp_rd = 0;          // read cursor (word index being drained)
         int beats_arrived = 0;    // total beats captured
         uint32_t served_mask = 0; // per-head-beat pending bitmap over subs
+        bool cached_once = false; // entry has been CACHED at least once
+        // Allocated for an address whose cohort a just-retired line already
+        // served: no peers remain, so this entry must not wait for a target it
+        // can never reach. See spent_note()/spent_recent().
+        bool cohort_spent = false;
         // Diagnostic: lanes that were stall-denied against this entry while it
         // drained. popcount at retire = DISTINCT requesters that wanted this
         // line but were locked out, which is the merge degree the model loses
@@ -407,6 +417,52 @@ private:
     uint64_t arr_hist[33] = {0};        // index = min(offset, 32)
     std::vector<uint64_t> arr_tile_sum, arr_tile_n;
     uint64_t arr_n = 0, arr_sum = 0, arr_max = 0;
+    // Subscriber service latency: join -> served, the quantity
+    // sub_arrival cannot measure. Bucketed in 32-cycle steps.
+    uint64_t svc_n = 0, svc_sum = 0, svc_max = 0;
+    uint64_t svc_hist[33] = {0};
+    uint64_t svc_cached_n = 0, svc_cached_sum = 0;
+    // RESP_HOLD timeout census: for every entry that reaches its response
+    // below hold_subs_single and eats the full serve_timeout, record how many
+    // subscribers it DID gather and whether another entry for the same word was
+    // live in its bank at that moment. Separates "cohort split by a live line"
+    // from "cohort genuinely smaller than the programmed target" -- the two
+    // remaining stories, which need different fixes.
+    uint64_t tmo_subs_hist[17] = {0};
+    uint64_t stat_dup_bypass = 0;   // singles bypassed instead of duplicating a line
+    uint64_t tmo_peer_cached = 0, tmo_peer_other = 0, tmo_peer_none = 0;
+    uint64_t stat_straggler = 0;      // entries allocated onto a spent cohort
+    uint64_t stat_straggler_rel = 0;  // ... that skipped the RESP_HOLD wait
+    // Per-bank ring of recently retired {base_addr, tgt_group}. A CACHED line
+    // that self-invalidates or ages out has consumed its cohort; a later
+    // request for the same word is a STRAGGLER whose peers are already served.
+    //
+    // WHY THIS EXISTS. The RTL evaluates every request port in one cycle, so a
+    // cohort merges into its line atomically and a straggler entry never forms
+    // (measured: their self_inval == alloc to the unit, aged_out == 0). This
+    // model retires one request per lane per cycle, which manufactures
+    // stragglers: 12% of entries at fp16 ks2, 22% at ks4, each waiting out the
+    // full serve_timeout (8,128 cyc) with ~19 subscribers stranded behind it.
+    // Releasing a straggler on first response restores the RTL's behaviour --
+    // the line that served its peers already fetched the word, so the data is
+    // there and nothing is being short-circuited.
+    std::vector<std::deque<std::pair<uint64_t, int>>> spent_ring;
+    int spent_depth = 0;              // 0 = feature off
+    int dup_bypass = 0;               // TERANOC_MSHR_DUP_BYPASS
+    void spent_note(int bank, uint64_t base_addr, int tgt_group)
+    {
+        if (this->spent_depth <= 0) return;
+        auto &r = this->spent_ring[bank];
+        r.push_back({base_addr, tgt_group});
+        while ((int)r.size() > this->spent_depth) r.pop_front();
+    }
+    bool spent_recent(int bank, uint64_t base_addr, int tgt_group) const
+    {
+        if (this->spent_depth <= 0) return false;
+        for (const auto &p : this->spent_ring[bank])
+            if (p.first == base_addr && p.second == tgt_group) return true;
+        return false;
+    }
     std::vector<int64_t> bank_alloc_cycle;      // last cycle THIS group allocated, per bank
     std::vector<const void *> bank_alloc_owner; // self-check only; always `this`
     uint64_t stat_mshr_timeout = 0;   // hold windows expired below the sub target
@@ -729,6 +785,23 @@ GroupMshr::~GroupMshr()
         }
         if (this->arr_n)
         {
+        fprintf(f, "  %s dup_bypass: n=%lu enabled=%d\n",
+            this->get_path().c_str(), (unsigned long)this->stat_dup_bypass, this->dup_bypass);
+        fprintf(f, "  %s tmo_census: peer_cached=%lu peer_other=%lu peer_none=%lu | subs:",
+            this->get_path().c_str(), (unsigned long)this->tmo_peer_cached,
+            (unsigned long)this->tmo_peer_other, (unsigned long)this->tmo_peer_none);
+        for (int i = 0; i <= 16; i++) fprintf(f, " %d:%lu", i, (unsigned long)this->tmo_subs_hist[i]);
+        fprintf(f, "\n");
+        fprintf(f, "  %s straggler: alloc_on_spent=%lu released=%lu depth=%d\n",
+            this->get_path().c_str(), (unsigned long)this->stat_straggler,
+            (unsigned long)this->stat_straggler_rel, this->spent_depth);
+        fprintf(f, "  %s sub_service: n=%lu mean=%.2f max=%lu cached_n=%lu cached_mean=%.2f |",
+            this->get_path().c_str(), (unsigned long)this->svc_n,
+            this->svc_n ? (double)this->svc_sum / this->svc_n : 0.0,
+            (unsigned long)this->svc_max, (unsigned long)this->svc_cached_n,
+            this->svc_cached_n ? (double)this->svc_cached_sum / this->svc_cached_n : 0.0);
+        for (int i = 0; i <= 32; i++) fprintf(f, " %d:%lu", i * 32, (unsigned long)this->svc_hist[i]);
+        fprintf(f, "\n");
             fprintf(f, "  %s sub_arrival: n=%lu mean=%.2f max=%lu |",
                 this->get_path().c_str(), (unsigned long)this->arr_n,
                 (double)this->arr_sum / this->arr_n, (unsigned long)this->arr_max);
@@ -869,6 +942,18 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->arr_tile_sum.resize(this->nb_tiles_per_group, 0);
     this->arr_tile_n.resize(this->nb_tiles_per_group, 0);
     this->bank_alloc_cycle.resize(this->nb_banks, -1);
+    this->spent_ring.resize(this->nb_banks);
+    {
+        // Straggler release (see spent_ring). Depth = ways per bank: only the
+        // lines a bank could have been holding when the cohort drained are
+        // relevant. 0 disables and is bit-identical to the previous model.
+        const char *db = getenv("TERANOC_MSHR_DUP_BYPASS");
+        this->dup_bypass = db ? atoi(db) : 0;
+        const char *sr = getenv("TERANOC_MSHR_STRAGGLER_RELEASE");
+        this->spent_depth = sr ? atoi(sr) : 0;
+        if (this->spent_depth < 0) this->spent_depth = 0;
+        if (sr && atoi(sr) == 1) this->spent_depth = this->ways_per_bank;
+    }
     this->bank_alloc_owner.resize(this->nb_banks, nullptr);
     for (int b = 0; b < this->nb_banks; b++)
         for (int w = 0; w < this->ways_per_bank; w++)
@@ -1347,7 +1432,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
                 "MSHR_MERGE lane=%d addr=0x%lx entry=%d subs=%d\n",
                 lane, (unsigned long)addr, (int)(hit - this->entries.data()),
                 (int)hit->subs.size());
-            hit->subs.push_back(Sub{tile, port, flit->src_core, flit, true, flit->burst, flit->src_x, flit->src_y, flit->initiator_addr});
+            hit->subs.push_back(Sub{tile, port, flit->src_core, flit, true, flit->burst, flit->src_x, flit->src_y, flit->initiator_addr, this->clock.get_cycles()});
             {
                 // Offset from the entry's FIRST request (birth), which is the
                 // same origin the RTL tracer differences against.
@@ -1484,6 +1569,35 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             }
         }
 
+        // DUPLICATE-LINE BYPASS. A single whose word already has a live entry
+        // in this bank did not merge (find_hit only admits the merge window,
+        // RESP_HOLD and CACHED; an entry mid-DRAIN_RESP with a full sub list is
+        // neither hittable nor stallable). Allocating a SECOND entry for the
+        // same word is what this model used to do, and it is the fp16 defect:
+        // the duplicate then waits for hold_subs_single peers that the first
+        // line is busy serving, and eats the whole serve_timeout. Measured on
+        // the RESP_HOLD timeout census: 79% (ks2) and 99% (ks4) of timed-out
+        // entries had a live CACHED entry for the SAME word in the SAME bank.
+        //
+        // The RTL does not duplicate -- it bypasses. Its single-class split on
+        // this arm is 85.5% merged / 2.8% allocated / 11.8% TRUE bypass, while
+        // this model bypassed 0% of singles and routed every one through the
+        // MSHR. Bypassing here fetches the word independently, which is both
+        // what the hardware does and what the requester actually needs.
+        if (!is_burst && this->dup_bypass)
+        {
+            for (int idx : this->bank_ways[bank])
+            {
+                const Entry &o = this->entries[idx];
+                if (o.valid && o.base_addr == base_addr &&
+                    o.tgt_group == tgt_group && o.burst_len == burst_len)
+                {
+                    this->stat_dup_bypass++;
+                    return this->passthrough(flit, lane);
+                }
+            }
+        }
+
         // Miss: allocate (<=1 allocation per bank per cycle, RR over lanes).
         Entry *e = this->alloc_entry(bank);
         if (e != nullptr)
@@ -1501,7 +1615,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             e->fetch_blocked = false;
             e->subs.clear();
             e->stall_lane_mask = 0;
-            e->subs.push_back(Sub{tile, port, flit->src_core, flit, false, flit->burst, flit->src_x, flit->src_y, flit->initiator_addr});
+            e->subs.push_back(Sub{tile, port, flit->src_core, flit, false, flit->burst, flit->src_x, flit->src_y, flit->initiator_addr, this->clock.get_cycles()});
             e->resp_rd = 0;
             e->arrived_mask = 0;
             e->arrive_pending = 0;
@@ -1509,6 +1623,9 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             e->drain_not_before = 0;
             e->beats_arrived = 0;
             e->served_mask = 0;
+            e->cached_once = false;
+            e->cohort_spent = this->spent_recent(bank, base_addr, tgt_group);
+            if (e->cohort_spent) this->stat_straggler++;
             e->beats_drained = 0;
             e->served_cnt = 0;
             flit->mshr_tag = (int)(e - this->entries.data()) + 1;
@@ -1985,7 +2102,13 @@ vp::IoReqStatus GroupMshr::capture_response(L1NocFlit *flit, int lane)
     if (e.state == ST_WAIT_RESP)
     {
         if (e.burst_len == 1 && this->resp_wait_subs_single &&
-            (int)e.subs.size() < this->hold_subs_single)
+            (int)e.subs.size() < this->hold_subs_single && e.cohort_spent)
+        {
+            this->stat_straggler_rel++;   // would have held; released instead
+        }
+        if (e.burst_len == 1 && this->resp_wait_subs_single &&
+            (int)e.subs.size() < this->hold_subs_single &&
+            !e.cohort_spent)
         {
             // Single word with subscribers below target: hold for more.
             //
@@ -2588,6 +2711,12 @@ void GroupMshr::drain_cycle()
             e.served_cnt++;
             {
                 int64_t onow = this->clock.get_cycles();
+                int64_t wait = onow - sub.join_cycle;
+                if (wait < 0) wait = 0;
+                this->svc_n++; this->svc_sum += (uint64_t)wait;
+                if ((uint64_t)wait > this->svc_max) this->svc_max = (uint64_t)wait;
+                this->svc_hist[wait / 32 > 32 ? 32 : wait / 32]++;
+                if (e.cached_once) { this->svc_cached_n++; this->svc_cached_sum += (uint64_t)wait; }
                 this->rout_beats++;
                 if (e.burst_len > 1) this->rout_burst++; else this->rout_single++;
                 if (onow != this->rout_last_cycle) { this->rout_last_cycle = onow; this->rout_cycles++; }
@@ -2742,6 +2871,7 @@ void GroupMshr::retire_if_done(Entry *e)
     {
         // Single-word entries become CACHED, keeping the word for hits.
         e->state = ST_CACHED;
+        e->cached_once = true;
         e->cache_word = e->resp_words[0];
         e->resp_rd = 0;
         e->arrived_mask = 1;   // the cached word sits at index 0
@@ -2814,6 +2944,23 @@ void GroupMshr::serve_timeouts(int64_t cycles)
                 // serve_timeout expiry below the release target = stall-miss.
                 this->stat_resp_hold_timeout++;
                 this->auto_stall_miss(0);
+                {
+                    int n = (int)e.subs.size();
+                    this->tmo_subs_hist[n > 16 ? 16 : n]++;
+                    int bank = this->mshr_bank_of(e.base_addr, e.burst_len == 1);
+                    bool cached = false, other = false;
+                    for (int idx : this->bank_ways[bank])
+                    {
+                        const Entry &o = this->entries[idx];
+                        if (&o == &e || !o.valid) continue;
+                        if (o.base_addr != e.base_addr ||
+                            o.tgt_group != e.tgt_group) continue;
+                        if (o.state == ST_CACHED) cached = true; else other = true;
+                    }
+                    if (cached)      this->tmo_peer_cached++;
+                    else if (other)  this->tmo_peer_other++;
+                    else             this->tmo_peer_none++;
+                }
             }
             e.state = ST_DRAIN_RESP;
             e.served_mask = (1u << e.subs.size()) - 1;
@@ -2836,6 +2983,8 @@ void GroupMshr::serve_timeouts(int64_t cycles)
             if (e.served_cnt < this->cache_target(e))
             {
                 this->stat_cache_aged++;
+                this->spent_note(this->mshr_bank_of(e.base_addr, e.burst_len == 1),
+                                 e.base_addr, e.tgt_group);
                 this->stat_cache_served_sum += (uint64_t)e.served_cnt;
                 e.valid = false;
                 e.state = ST_IDLE;
@@ -2855,6 +3004,8 @@ void GroupMshr::serve_timeouts(int64_t cycles)
         if (e.valid && e.state == ST_CACHED && e.served_cnt >= this->cache_target(e))
         {
             this->stat_cache_selfinval++;
+            this->spent_note(this->mshr_bank_of(e.base_addr, e.burst_len == 1),
+                             e.base_addr, e.tgt_group);
             this->stat_cache_served_sum += (uint64_t)e.served_cnt;
             e.valid = false;
             e.state = ST_IDLE;
