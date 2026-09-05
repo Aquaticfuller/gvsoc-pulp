@@ -948,7 +948,7 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
         // lines a bank could have been holding when the cohort drained are
         // relevant. 0 disables and is bit-identical to the previous model.
         const char *db = getenv("TERANOC_MSHR_DUP_BYPASS");
-        this->dup_bypass = db ? atoi(db) : 0;
+        this->dup_bypass = db ? atoi(db) : 1;
         const char *sr = getenv("TERANOC_MSHR_STRAGGLER_RELEASE");
         this->spent_depth = sr ? atoi(sr) : 0;
         if (this->spent_depth < 0) this->spent_depth = 0;
@@ -1475,9 +1475,20 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
                 if (this->cache_gather_w < 0)
                 {
                     const char *gw = getenv("TERANOC_MSHR_CACHE_GATHER");
-                    this->cache_gather_w = gw ? atoi(gw) : 2;
+                    this->cache_gather_w = gw ? atoi(gw) : 0;
                 }
-                // GATHER, rather than draining on the first hit. The RTL
+                // GATHER, rather than draining on the first hit. DEFAULT OFF:
+                // this window has NO counterpart in mempool_group_mshr.sv --
+                // it was a compensation for the door serialisation below, and
+                // measured as a regression (+8.9% at 4x4, +51% at 8x8) that
+                // bought nothing: sweeping it 0/2/8/16/64 gives 58,770 /
+                // 59,498 / 81,191 / 57,302 / 55,666 on fp16 ks2 2x128x8192,
+                // all far from the 5,364 that removing the response cache
+                // gives. The serialised door remains a known modelling
+                // limitation; it is not to be papered over with a tuned
+                // window. Kept behind TERANOC_MSHR_CACHE_GATHER for A/B.
+                //
+                // Original rationale, retained for the record: the RTL
                 // evaluates all request ports in one cycle, so several
                 // requesters hit a cached line together and merge into it
                 // before it drains. This model retires one request per call, so
@@ -1584,6 +1595,9 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
         // this model bypassed 0% of singles and routed every one through the
         // MSHR. Bypassing here fetches the word independently, which is both
         // what the hardware does and what the requester actually needs.
+        // DEFAULT ON: this is what the hardware does. Its single-class
+        // split on these arms is 85.5% merged / 2.8% allocated / 11.8%
+        // TRUE bypass; this model bypassed 0% before the flag existed.
         if (!is_burst && this->dup_bypass)
         {
             for (int idx : this->bank_ways[bank])
