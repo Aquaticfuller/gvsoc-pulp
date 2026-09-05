@@ -948,7 +948,7 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
         // lines a bank could have been holding when the cohort drained are
         // relevant. 0 disables and is bit-identical to the previous model.
         const char *db = getenv("TERANOC_MSHR_DUP_BYPASS");
-        this->dup_bypass = db ? atoi(db) : 1;
+        this->dup_bypass = db ? atoi(db) : 0;
         const char *sr = getenv("TERANOC_MSHR_STRAGGLER_RELEASE");
         this->spent_depth = sr ? atoi(sr) : 0;
         if (this->spent_depth < 0) this->spent_depth = 0;
@@ -1537,10 +1537,25 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             for (int idx : this->bank_ways[bank])
             {
                 Entry &o = this->entries[idx];
+                // NO sub-count guard. mempool_group_mshr.sv:1049-1056 states it
+                // directly -- "A same-address entry that cannot be merged into
+                // right now makes the request WAIT rather than allocate a second
+                // entry for the same line" -- and req_addr_hit_drain_way carries
+                // no condition on sub_reqs_num. The RTL then refuses allocation
+                // (req_alloc_cand needs !req_addr_hit_drain, :1194) and drives
+                // req_in_ready low (:2150-2153), so the request retries and
+                // MERGES once the entry reaches CACHED, getting coalesced service
+                // and no second fetch.
+                //
+                // This model previously skipped the stall when the sub list was
+                // full and allocated a duplicate line, which then waited out
+                // serve_timeout for peers the first line was serving -- the fp16
+                // defect. Bypassing instead (TERANOC_MSHR_DUP_BYPASS) also avoids
+                // the duplicate but issues a second FETCH where the hardware
+                // coalesces, so it is not the RTL's behaviour either.
                 if (o.valid && o.state == ST_DRAIN_RESP &&
                     o.base_addr == base_addr && o.burst_len == burst_len &&
-                    o.tgt_group == tgt_group &&
-                    (int)o.subs.size() < this->merge_reqs)
+                    o.tgt_group == tgt_group)
                 {
                     this->stat_deny_stall++;
                     if (lane < 64) o.stall_lane_mask |= (1ULL << lane);
@@ -1595,9 +1610,10 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
         // this model bypassed 0% of singles and routed every one through the
         // MSHR. Bypassing here fetches the word independently, which is both
         // what the hardware does and what the requester actually needs.
-        // DEFAULT ON: this is what the hardware does. Its single-class
-        // split on these arms is 85.5% merged / 2.8% allocated / 11.8%
-        // TRUE bypass; this model bypassed 0% before the flag existed.
+        // DEFAULT OFF. The RTL's 11.8% true-bypass population is requests
+        // that lost the per-bank allocation arbitration (req_alloc_found,
+        // :1292), NOT duplicate suppression -- the hardware suppresses
+        // duplicates by STALLING and later merging. Kept as a diagnostic.
         if (!is_burst && this->dup_bypass)
         {
             for (int idx : this->bank_ways[bank])
