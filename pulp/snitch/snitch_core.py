@@ -323,6 +323,19 @@ class SnitchFast(cpu.iss.riscv.RiscvCommon):
     def o_BARRIER_REQ(self, itf: gvsoc.systree.SlaveItf):
         self.itf_bind('barrier_req', itf, signature='wire<bool>')
 
+    def o_VECTOR_STATUS(self, itf: gvsoc.systree.SlaveItf):
+        """Demand this core places on a SHARED vector unit (CachePool dual-Snitch core complex).
+
+        bit0 = vector instructions in flight, bit1 = stalled wanting to issue. Only meaningful when
+        the Spatz is shared; leave unbound otherwise (the core is then always granted).
+        """
+        self.itf_bind('vector_status', itf, signature='wire<int>')
+
+    def i_VECTOR_GRANT(self) -> gvsoc.systree.SlaveItf:
+        """Ownership grant for a SHARED vector unit. While low, this core's vector issue stalls
+        (the model of acc_mux refusing acc_qready to a non-owner). Unbound = always granted."""
+        return gvsoc.systree.SlaveItf(self, 'vector_grant', signature='wire<int>')
+
     def o_VLSU(self, port: int, itf: gvsoc.systree.SlaveItf):
         """Binds the vector data port.
 

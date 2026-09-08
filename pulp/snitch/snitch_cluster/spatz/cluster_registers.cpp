@@ -53,6 +53,21 @@ private:
 
     vp::Trace     trace;
     bool          cachepool_mode = false;
+    // CachePool peripheral register map generation. The offsets moved on the RTL branch
+    // dev/multi-scalar when SPATZ_LOCK_ACQUIRE/RELEASE were inserted at 0x4/0x8:
+    //
+    //             legacy (cachepool_fpu_512, the ELFs we run)   multi_scalar (dev/multi-scalar)
+    //   HW_BARRIER            0x10                                       0x00
+    //   BOOT_CONTROL          0x20                                       0x18
+    //   EOC_EXIT              0x24                                       0x1c
+    //   L1D block         0x28..0x4c                                 0x28..0x4c  (unchanged)
+    //
+    // Getting this wrong is silent, not loud: the barrier read lands on scratch and never blocks,
+    // and the EOC write goes nowhere so the run simply never terminates.
+    uint64_t      cachepool_barrier_off = 0x10;
+    uint64_t      cachepool_boot_off    = 0x20;
+    uint64_t      cachepool_eoc_off     = 0x24;
+    uint32_t      cachepool_boot_scratch = 0;
     // CachePool L1D-config scratch. Two layouts share it: the older block (0x28..0x4c -> idx 0..9)
     // and the newer block (0x58..0xa4 -> idx 10..29). MUST be >= 30: the old 16-entry array let
     // newer-block writes (idx up to 29, e.g. the XBAR_OFFSET write at 0x98) run off the end and
@@ -109,6 +124,13 @@ ClusterRegisters::ClusterRegisters(vp::ComponentConf &config)
     this->nb_cores = this->get_js_config()->get("nb_cores")->get_int();
     auto cp = this->get_js_config()->get("cachepool");
     this->cachepool_mode = (cp != NULL) && cp->get_bool();
+    auto cm = this->get_js_config()->get("cachepool_map");
+    if (cm != NULL && cm->get_str() == "multi_scalar")
+    {
+        this->cachepool_barrier_off = 0x00;
+        this->cachepool_boot_off    = 0x18;
+        this->cachepool_eoc_off     = 0x1c;
+    }
 
     // F1: flush fan-out ports (0 = the accept-as-scratch fallback; the structural cache wires N).
     auto nf = this->get_js_config()->get("nb_flush");
@@ -191,9 +213,9 @@ vp::IoReqStatus ClusterRegisters::core_req(vp::Block *__this, vp::IoReq *req, in
     // result[]) mixed values from different iterations — a timing-sensitive wrong result. Route 0x10 to the
     // real counting barrier, which parks each arriving core with IO_REQ_PENDING and responds to all of them
     // once the last one checks in.
-    if (_this->cachepool_mode && offset == 0x10)
+    if (_this->cachepool_mode && offset == _this->cachepool_barrier_off)
     {
-        _this->hw_barrier_req(0x10, size, data, is_write);
+        _this->hw_barrier_req(_this->cachepool_barrier_off, size, data, is_write);
         if (!is_write && data != nullptr) memset(data, 0, size);
         req->inc_latency(11);
         if (_this->stall_core)
@@ -309,7 +331,7 @@ bool ClusterRegisters::cachepool_access(uint64_t offset, int size, uint8_t *data
     // 0x68. Both are supported: swallowing 0x24 as perf-counter scratch makes the older binaries never
     // terminate (they hang with no output). 0x24 is PERF_COUNTER_0+4 in the new layout, which software
     // only ever reads, so treating a WRITE as EOC is safe for both revisions.
-    if (offset == 0x24 && is_write && data != NULL && (data[0] & 0x1))
+    if (offset == this->cachepool_eoc_off && is_write && data != NULL && (data[0] & 0x1))
     {
         int retval = (data[0] >> 1) & 0x7;
         fprintf(stderr, "[EOC] Simulation exiting: retval=%d cycles=%ld\n",
@@ -324,7 +346,29 @@ bool ClusterRegisters::cachepool_access(uint64_t offset, int size, uint8_t *data
     // The swallow must stop at 0x28 (NOT 0x30): 0x28..0x2f are the CachePool L1D config block
     // (CFG_L1D_SPM @0x28, CFG_L1D_INSN @0x2c) and belong to the L1D block below — swallowing them as
     // perf-scratch discards the flush INSN code, so a flush commit arrives with insn=0 (a no-op).
-    if (offset < 0x28 && offset != 0x20)
+    // BOOT_CONTROL is modelled as an explicit scratch word rather than left to fall through to
+    // whichever spatz regmap register happens to sit at that offset (PERF_COUNTER_0 at 0x20 in the
+    // legacy map -- a coincidence that does not repeat at 0x18 in the multi_scalar map, where the
+    // spatz regmap has HART_SELECT_1 and would mask the stored entry point).
+    if (offset == this->cachepool_boot_off && offset >= 0x18)
+    {
+        if (is_write)
+        {
+            if (data != nullptr) memcpy(&this->cachepool_boot_scratch, data, size < 4 ? size : 4);
+        }
+        else if (data != nullptr)
+        {
+            memset(data, 0, size);
+            memcpy(data, &this->cachepool_boot_scratch, size < 4 ? size : 4);
+        }
+        return true;
+    }
+    // Everything else below 0x28 is perf-counter scratch. NOTE this is also the path the narrow AXI
+    // req() entry point takes for the barrier offset -- req() has no barrier special-case, so a
+    // barrier-address access arriving there is swallowed rather than counted, in both maps. That is
+    // the pre-existing behaviour for legacy's 0x10 and is deliberate: only the per-core port carries
+    // the identity the counting barrier needs.
+    if (offset < 0x28)
     {
         if (!is_write && data != nullptr) memset(data, 0, size);
         return true;

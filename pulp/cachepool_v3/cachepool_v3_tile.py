@@ -14,12 +14,23 @@
 # private stack SPM, AND this tile's slice of the shared L1 (5 per-port-class crossbars + one cache
 # cell per bank, each cell = part-coalescer + per-bank AMO + cache core) all live here.
 #
-#   core.data  ─► ico[c] ─► stack SPM         (0xBFFF_F800 +2 KiB, private per core)
-#                        ─► cache i_INPUT(c*5 + 4)     scalar → LAST lane (the AMO lane)
-#                        ─► axi_ico                    ROM · peripheral · UART
-#   core.vlsu[j] ─► vico ─► cache i_INPUT(c*5 + j)     VLSU lanes 0..3
+#   core.data  ─► ico[k] ─► stack SPM         (0xBFFF_F800 +2 KiB, private per hart)
+#                        ─► cache i_INPUT(cc*n_ppc + 4 + h)   scalar hart h → its OWN lane (AMO)
+#                        ─► spatz_lock ─► peripheral          ACQUIRE/RELEASE intercepted here
+#                        ─► axi_ico                           ROM · peripheral · UART
+#   core.vlsu[j] ─► vico ─► cache i_INPUT(cc*n_ppc + j)       VLSU lanes 0..3, SHARED by the CC
 #                        ─► stack SPM
 #                        ─► axi_ico
+#
+# MULTI-SCALAR (RTL dev/multi-scalar, cachepool_cc_dual.sv). A core complex holds
+# `nb_scalar_per_cc` Snitch harts that SHARE one Spatz. Consequences modelled here:
+#   * hart index k = cc * nb_scalar_per_cc + h, so hart 0 of a pair is the even one — the
+#     numbering snrt_cluster_is_primary() (`_snrt_core_idx % 2 == 0`) and snrt_cluster_vpu_idx()
+#     (`/ 2`) assume.
+#   * port classes per CC = spatz_nb_lanes VLSU + nb_scalar_per_cc scalar
+#     (cachepool_cc_dual.sv: tcdm_req_o[NumMemPortsPerSpatz + h] is hart h's scalar port), and the
+#     VLSU classes are shared: both harts' vlsu routers land on the SAME cache input.
+#   * one CachepoolV3SpatzLock per CC arbitrates who may issue to the shared Spatz.
 #   cache.l2   ─► tile 'refill'   (wide: line refill + eviction + write-through)
 #   icache.refill ─► axi_ico
 #
@@ -35,6 +46,7 @@ from memory.memory import Memory
 from interco.router import Router
 from pulp.mempool.hierarchical_cache import Hierarchical_cache
 from cache.insitu.insitu_cache_tile import InsituCacheTile
+from pulp.cachepool_v3.cachepool_v3_spatz_lock import CachepoolV3SpatzLock
 
 STACK_BASE = 0xBFFF_F800
 STACK_SIZE = 0x800          # 2 KiB per core, same VA on every core, physically private
@@ -54,13 +66,19 @@ class CachepoolV3Tile(st.Component):
                  nb_tiles_per_group: int = 4,
                  nb_groups: int = 1,
                  spatz_nb_lanes: int = 4,
+                 nb_scalar_per_cc: int = 1,
                  axi_data_width: int = 64):
         super().__init__(parent, name)
 
         [args, _] = parser.parse_known_args()
 
-        self._nb_cores = nb_cores_per_tile
-        self._n_ppc = 1 + spatz_nb_lanes                    # 4 VLSU lanes + 1 scalar
+        # nb_cores_per_tile counts CORE COMPLEXES (RTL NumCoresTile, renamed from NumCore to NumCC
+        # on dev/multi-scalar): one Spatz and one L1 cache controller each. The hart count is
+        # nb_scalar_per_cc times that.
+        self._nb_cc = nb_cores_per_tile
+        self._nb_scalar = nb_scalar_per_cc
+        self._nb_cores = nb_cores_per_tile * nb_scalar_per_cc
+        self._n_ppc = spatz_nb_lanes + nb_scalar_per_cc     # 4 VLSU lanes + 1 scalar port per hart
         self._nb_banks = cache_config.num_controllers
         self._n_remote = cache_config.num_remote_port_core
 
@@ -72,7 +90,8 @@ class CachepoolV3Tile(st.Component):
         # ---------------- instruction side ----------------
         # The tile's L1 I$ (L0 lives inside each core). Its refill goes to the tile AXI today; in the
         # intended architecture it feeds the group's L2 I$ (v3-P3).
-        icache = Hierarchical_cache(self, 'l1_icache', nb_cores=nb_cores_per_tile)
+        icache = Hierarchical_cache(self, 'l1_icache',
+                                    nb_cores=nb_cores_per_tile * nb_scalar_per_cc)
 
         # ---------------- tile AXI ----------------
         axi_ico = Router(self, 'axi_ico', bandwidth=axi_data_width, latency=1)
@@ -80,63 +99,87 @@ class CachepoolV3Tile(st.Component):
 
         # ---------------- cores, stacks, routers ----------------
         self.int_cores = []
-        global_core_base = (group_id * nb_tiles_per_group + tile_id) * nb_cores_per_tile
+        # Global HART base: hart ids run over the whole cluster, nb_scalar_per_cc per CC.
+        global_core_base = ((group_id * nb_tiles_per_group + tile_id)
+                            * nb_cores_per_tile * nb_scalar_per_cc)
 
-        for c in range(nb_cores_per_tile):
+        # One ownership arbiter per CC (cachepool_spatz_lock + acc_mux). Only instantiated when the
+        # Spatz is actually shared — a single-scalar CC keeps the previous peripheral path untouched.
+        self._locks = []
+        if nb_scalar_per_cc > 1:
+            for cc in range(nb_cores_per_tile):
+                self._locks.append(CachepoolV3SpatzLock(self, f'spatz_lock{cc}',
+                                                        nb_hosts=nb_scalar_per_cc))
+
+        for k in range(self._nb_cores):
+            cc = k // nb_scalar_per_cc      # core complex (= Spatz, = L1 cache controller)
+            h = k % nb_scalar_per_cc        # hart within the complex; h == 0 is the primary
             # boot_addr = the bootrom (v1's flow): cores RESET into the bootrom, which WFIs and then
             # reads the ELF entry from CLUSTER_BOOT_CONTROL. fetch_enable=False so they wait for the
             # loader's FETCHEN pulse. (v2 instead pushes the entry over a 'bootaddr' wire — a
             # different contract, and the reason boot_addr=0 left every core fetching from 0.)
-            core = iss.SnitchFast(self, f'pe{c}', isa='rv32imafv',
-                                  core_id=global_core_base + c, htif=False,
+            core = iss.SnitchFast(self, f'pe{k}', isa='rv32imafv',
+                                  core_id=global_core_base + k, htif=False,
                                   boot_addr=BOOTROM_BASE, fetch_enable=False,
                                   inc_spatz=True, spatz_nb_lanes=spatz_nb_lanes,
                                   spatz_lane_width=4)
             self.int_cores.append(core)
 
-            stack = Memory(self, f'stack_mem{c}', size=STACK_SIZE)
+            stack = Memory(self, f'stack_mem{k}', size=STACK_SIZE)
 
             # Scalar data port: stack stays direct; the whole cached DRAM PMA goes through the
-            # cache on the LAST lane; the peripheral gets its OWN per-core port (the barrier needs
-            # to know which core is asking — cluster_registers::i_CORE_INPUT); the rest to the AXI.
-            ico = Router(self, f"ico{c}", bandwidth=8, latency=0)
+            # cache on this hart's OWN scalar lane (the AMO lane); the peripheral gets its OWN
+            # per-hart port (the barrier needs to know which hart is asking —
+            # cluster_registers::i_CORE_INPUT); the rest to the AXI.
+            ico = Router(self, f"ico{k}", bandwidth=8, latency=0)
             ico.add_mapping('stack', base=STACK_BASE, remove_offset=STACK_BASE, size=STACK_SIZE)
             ico.add_mapping('cache', base=DRAM_BASE, size=PERIPH_BASE - DRAM_BASE)
             ico.add_mapping('periph', base=PERIPH_BASE, remove_offset=PERIPH_BASE, size=PERIPH_SIZE)
             ico.add_mapping('axi')
             self.bind(core, 'data', ico, 'input')
             self.bind(ico, 'stack', stack, 'input')
-            self.bind(ico, 'cache', cache, f'in_{c * self._n_ppc + (self._n_ppc - 1)}')
-            self.bind(ico, 'periph', self, f'periph_{c}')
+            self.bind(ico, 'cache', cache, f'in_{cc * self._n_ppc + spatz_nb_lanes + h}')
+            if self._locks:
+                # ACQUIRE/RELEASE are intercepted on the CC's own memory path, before the shared
+                # peripheral ever sees them (cachepool_spatz_lock.sv sits in cachepool_cc_dual).
+                self.bind(ico, 'periph', self._locks[cc], f'in_{h}')
+                self._locks[cc].o_OUTPUT(h, self.i_PERIPH_FWD(k))
+                self.bind(core, 'vector_status', self._locks[cc], f'status_{h}')
+                self._locks[cc].o_GRANT(h, core.i_VECTOR_GRANT())
+            else:
+                self.bind(ico, 'periph', self, f'periph_{k}')
             self.bind(ico, 'axi', axi_ico, 'input')
 
             # Barrier request wire: core → peripheral (identity carried by the port index).
-            self.bind(core, 'barrier_req', self, f'barrier_req_{c}')
+            self.bind(core, 'barrier_req', self, f'barrier_req_{k}')
             # Barrier IRQ (19 in the spatz/cachepool cluster) — riscv.py names it external_irq_19.
-            self.bind(self, f'external_irq_{c}', core, 'external_irq_19')
+            self.bind(self, f'external_irq_{k}', core, 'external_irq_19')
 
             # VLSU lanes: same address split, one router per lane so a lane can reach the stack
-            # and the SoC as well as the cache.
+            # and the SoC as well as the cache. The CACHE side is per-CC, not per-hart: there is one
+            # physical Spatz with spatz_nb_lanes ports, so every hart of the complex lands on the
+            # same port class. Only the granted hart can have vector work in flight, so the port is
+            # never driven by two harts at once.
             for lane in range(spatz_nb_lanes):
-                vico = Router(self, f"pe{c}_vlsu{lane}_ico", bandwidth=8, latency=0)
+                vico = Router(self, f"pe{k}_vlsu{lane}_ico", bandwidth=8, latency=0)
                 vico.add_mapping('cache', base=DRAM_BASE, size=PERIPH_BASE - DRAM_BASE)
                 vico.add_mapping('stack', base=STACK_BASE, remove_offset=STACK_BASE, size=STACK_SIZE)
                 vico.add_mapping('axi')
                 self.bind(core, f'vlsu_{lane}', vico, 'input')
-                self.bind(vico, 'cache', cache, f'in_{c * self._n_ppc + lane}')
+                self.bind(vico, 'cache', cache, f'in_{cc * self._n_ppc + lane}')
                 self.bind(vico, 'stack', stack, 'input')
                 self.bind(vico, 'axi', axi_ico, 'input')
 
             # Instruction fetch + flush handshake
-            self.bind(core, 'fetch', icache, f'input_{c}')
+            self.bind(core, 'fetch', icache, f'input_{k}')
             self.bind(core, 'flush_cache_req', icache, 'flush')
             self.bind(icache, 'flush_ack', core, 'flush_cache_ack')
 
             # Boot: FETCHEN starts fetching; the bootrom then WFIs with mie=0xF (MSIE, bit 3), so the
             # wake must be MSIP — not MEIP. The loader pulses both (v1's proven sequence).
             self.bind(self, 'loader_start', core, 'fetchen')
-            self.bind(self, f'msip_{c}', core, 'msi')
-            self.bind(self, f'barrier_ack_{c}', core, 'barrier_ack')
+            self.bind(self, f'msip_{k}', core, 'msi')
+            self.bind(self, f'barrier_ack_{k}', core, 'barrier_ack')
 
         # ---------------- refill / L2 side ----------------
         # The cache's wide egress (refill + eviction) leaves the tile on its own port so the group
@@ -212,6 +255,11 @@ class CachepoolV3Tile(st.Component):
 
     def i_BARRIER_ACK(self, core: int) -> st.SlaveItf:
         return st.SlaveItf(self, f'barrier_ack_{core}', signature='wire<bool>')
+
+    def i_PERIPH_FWD(self, core: int) -> st.SlaveItf:
+        """Internal: the CC's Spatz lock forwards non-lock peripheral traffic back onto this
+        hart's boundary master."""
+        return st.SlaveItf(self, f'periph_{core}', signature='io')
 
     def o_PERIPH(self, core: int, itf: st.SlaveItf):
         """Core `core`'s peripheral-range accesses — routed to the peripheral's PER-CORE slave so

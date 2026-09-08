@@ -42,6 +42,7 @@ class CachepoolV3Group(st.Component):
                  nb_groups: int = 1,
                  nb_cores_per_tile: int = 4,
                  spatz_nb_lanes: int = 4,
+                 nb_scalar_per_cc: int = 1,
                  axi_data_width: int = 64,
                  global_tiles: int = 0):
         super().__init__(parent, name)
@@ -49,8 +50,13 @@ class CachepoolV3Group(st.Component):
             global_tiles = nb_tiles_per_group * nb_groups
 
         self._nb_tiles = nb_tiles_per_group
+        # nb_cores_per_tile = CORE COMPLEXES per tile (RTL NumCoresTile). Harts per tile is
+        # nb_scalar_per_cc times that; the crossbars and caches are per CC, the peripheral and
+        # barrier ports are per hart.
         self._nb_cores_per_tile = nb_cores_per_tile
-        self._n_ppc = 1 + spatz_nb_lanes
+        self._nb_scalar = nb_scalar_per_cc
+        self._nb_harts_per_tile = nb_cores_per_tile * nb_scalar_per_cc
+        self._n_ppc = spatz_nb_lanes + nb_scalar_per_cc
         self._nb_banks = cache_config.num_controllers
         self._n_remote = cache_config.num_remote_port_core
 
@@ -74,6 +80,7 @@ class CachepoolV3Group(st.Component):
                 nb_tiles_per_group=nb_tiles_per_group,
                 nb_groups=nb_groups,
                 spatz_nb_lanes=spatz_nb_lanes,
+                nb_scalar_per_cc=nb_scalar_per_cc,
                 axi_data_width=axi_data_width)
             self._tiles.append(tile)
 
@@ -179,7 +186,7 @@ class CachepoolV3Group(st.Component):
                 self.bind(self, f'config_core_{t}_{cb}', self._tiles[t], f'config_core_{cb}')
             for j in range(self._n_ppc):
                 self.bind(self, f'config_xbar_{t}_{j}', self._tiles[t], f'config_xbar_{j}')
-            for c in range(nb_cores_per_tile):
+            for c in range(self._nb_harts_per_tile):
                 self.bind(self, f'barrier_ack_{t}_{c}', self._tiles[t], f'barrier_ack_{c}')
                 # Per-core peripheral port + barrier request + barrier IRQ: the peripheral needs
                 # per-core identity for the counting barrier, so these stay unaggregated.
@@ -254,4 +261,5 @@ class CachepoolV3Group(st.Component):
         return st.SlaveItf(self, f'msip_{tile}_{core}', signature='wire<bool>')
 
     def nb_cores(self) -> int:
-        return self._nb_tiles * self._nb_cores_per_tile
+        """HART count of this group (CC slots x scalar harts per CC)."""
+        return self._nb_tiles * self._nb_harts_per_tile

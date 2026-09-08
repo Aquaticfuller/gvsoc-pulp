@@ -21,7 +21,8 @@ import regmap.regmap_c_header
 
 class ClusterRegisters(gvsoc.systree.Component):
 
-    def __init__(self, parent, name, boot_addr=0, nb_cores=1, binary=None, cachepool=False, nb_flush=0, nb_config=0):
+    def __init__(self, parent, name, boot_addr=0, nb_cores=1, binary=None, cachepool=False, nb_flush=0,
+                 nb_config=0, cachepool_map='legacy'):
         super(ClusterRegisters, self).__init__(parent, name)
 
         self.add_sources(['pulp/snitch/snitch_cluster/spatz/cluster_registers.cpp'])
@@ -33,6 +34,12 @@ class ClusterRegisters(gvsoc.systree.Component):
             # as RW scratch, FLUSH_STATUS 0x3c reads 0, EOC 0x24 -> quit) so the unmodified snrt CachePool
             # binaries don't fault on "invalid register". Default off -> the spatz regmap is unchanged.
             'cachepool': cachepool,
+            # Which generation of the CachePool peripheral map to answer. 'legacy' = HW_BARRIER 0x10 /
+            # BOOT_CONTROL 0x20 / EOC 0x24, what every ELF in software/build/CachePoolTests uses.
+            # 'multi_scalar' = the dev/multi-scalar map, where SPATZ_LOCK_ACQUIRE/RELEASE were inserted
+            # at 0x4/0x8 and pushed HW_BARRIER to 0x00, BOOT_CONTROL to 0x18 and EOC to 0x1c. Picking
+            # the wrong one fails SILENTLY: the barrier stops blocking and the EOC write goes nowhere.
+            'cachepool_map': cachepool_map,
             # F1: number of insitu-cache cells the COMMIT flush fans out to (0 = scratch fallback,
             # FLUSH_STATUS pinned 0). The cluster wires one flush_out_N per cell when set.
             'nb_flush': nb_flush,

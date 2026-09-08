@@ -34,6 +34,7 @@ class CachepoolV3Cluster(st.Component):
                  nb_tiles_per_group: int = 4,
                  nb_cores_per_tile: int = 4,
                  spatz_nb_lanes: int = 4,
+                 nb_scalar_per_cc: int = 1,
                  axi_data_width: int = 64,
                  dram_bases=(0x8000_0000, 0xA000_0000),
                  ni_outstanding_reqs: int = 32,
@@ -47,10 +48,13 @@ class CachepoolV3Cluster(st.Component):
         nb_groups = nb_x_groups * nb_y_groups
         self._nb_groups = nb_groups
         self._nb_tiles_per_group = nb_tiles_per_group
+        # nb_cores_per_tile counts CORE COMPLEXES (RTL NumCC), not harts.
         self._nb_cores_per_tile = nb_cores_per_tile
-        self._n_ppc = 1 + spatz_nb_lanes
+        self._nb_scalar = nb_scalar_per_cc
+        self._nb_harts_per_tile = nb_cores_per_tile * nb_scalar_per_cc
+        self._n_ppc = spatz_nb_lanes + nb_scalar_per_cc
         self._nb_banks = cache_config.num_controllers
-        total_cores = nb_groups * nb_tiles_per_group * nb_cores_per_tile
+        total_cores = nb_groups * nb_tiles_per_group * nb_cores_per_tile * nb_scalar_per_cc
 
         # ---------------- groups ----------------
         self.group_list = []
@@ -65,6 +69,7 @@ class CachepoolV3Cluster(st.Component):
                     nb_groups=nb_groups,
                     nb_cores_per_tile=nb_cores_per_tile,
                     spatz_nb_lanes=spatz_nb_lanes,
+                    nb_scalar_per_cc=nb_scalar_per_cc,
                     axi_data_width=axi_data_width,
                     global_tiles=nb_groups * nb_tiles_per_group))
 
@@ -220,8 +225,8 @@ class CachepoolV3Cluster(st.Component):
 
         for g in range(nb_groups):
             for t in range(nb_tiles_per_group):
-                for c in range(nb_cores_per_tile):
-                    gcore = (g * nb_tiles_per_group + t) * nb_cores_per_tile + c
+                for c in range(self._nb_harts_per_tile):
+                    gcore = (g * nb_tiles_per_group + t) * self._nb_harts_per_tile + c
                     self.bind(self, f'barrier_ack_{gcore}',
                               self.group_list[g], f'barrier_ack_{t}_{c}')
                     self.group_list[g].o_PERIPH(t, c, self.i_PERIPH_FWD(gcore))

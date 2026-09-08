@@ -55,7 +55,13 @@ _MEM_LATENCY       = int(os.environ.get('CACHEPOOL_V3_MEM_LATENCY', '50'))
 
 _NB_GROUPS   = _NB_X_GROUPS * _NB_Y_GROUPS
 _NB_TILES    = _NB_GROUPS * _TILES_PER_GROUP
-_TOTAL_CORES = _NB_TILES * _CORES_PER_TILE
+# Scalar Snitch harts per core complex (RTL NumScalarPerCC, config/cachepool_dual_4g.mk's
+# num_scalar_per_core). >1 = cachepool_cc_dual: several harts SHARE one Spatz and one L1 cache
+# controller, arbitrated by cachepool_spatz_lock. 1 = the single-scalar CC (unchanged).
+_SCALAR_PER_CC = int(os.environ.get('CACHEPOOL_V3_SCALAR_PER_CC', '1'))
+# _CORES_PER_TILE counts CORE COMPLEXES (RTL NumCoresTile = NumCC / NumTiles); the hart count that
+# the bootrom and the peripheral are sized to is NumCores = NumCC * NumScalarPerCC.
+_TOTAL_CORES = _NB_TILES * _CORES_PER_TILE * _SCALAR_PER_CC
 
 SPATZ_NB_LANES = 4
 DRAM_BASE   = 0x8000_0000
@@ -64,13 +70,54 @@ PERIPH_BASE = 0xC000_0000
 BOOTROM_SIZE = 0x1_0000
 
 
+# CachePool peripheral map generation, and the three offsets that move with it. The lock registers
+# inserted at 0x4/0x8 on dev/multi-scalar push everything after them down by 8 bytes.
+# Defaults to following the scalar count, because a dual-scalar build implies dev/multi-scalar
+# software. Overridable, and the override is not academic: it is how a LEGACY-map ELF is run against
+# a dual-scalar topology, which is the only way to exercise the shared-Spatz arbiter until
+# dual-scalar binaries exist.
+_PERIPH_MAP = os.environ.get('CACHEPOOL_V3_PERIPH_MAP', 'auto')
+if _PERIPH_MAP == 'auto':
+    _PERIPH_MAP = 'multi_scalar' if _SCALAR_PER_CC > 1 else 'legacy'
+assert _PERIPH_MAP in ('legacy', 'multi_scalar'), \
+    f'CACHEPOOL_V3_PERIPH_MAP must be auto|legacy|multi_scalar, got {_PERIPH_MAP!r}'
+_MULTI_SCALAR_MAP = _PERIPH_MAP == 'multi_scalar'
+_BOOT_CONTROL_OFF = 0x18 if _MULTI_SCALAR_MAP else 0x20
+
+
 def _patch_bootrom(base_path):
-    """Patch BOOTDATA core_count(@0x44) / tile_count(@0x68) to match the topology (v1/v2 mechanism)."""
+    """Patch BOOTDATA core_count(@0x44) / tile_count(@0x68) to match the topology (v1/v2 mechanism).
+
+    Also retargets the bootrom's CLUSTER_BOOT_CONTROL access when the multi_scalar peripheral map is
+    selected. The bootrom computes that address as `tcdm_start + tcdm_size + 32`:
+
+        1020: lw   t2, 12(a1)        # tcdm_start
+        1024: lw   t3, 16(a1)        # tcdm_size
+        1028: add  t2, t2, t3
+        102c: addi t2, t2, 32        <-- 0x02038393, the +0x20 in the legacy map
+        1030: lw   t2, 0(t2)         # the ELF entry the loader wrote
+        1034: jr   t2
+
+    so the constant lives in one I-type immediate at file offset 0x2c (the ROM is based at 0x1000).
+    Rewriting it to +0x18 is the whole change. Without it every core reads the entry from the wrong
+    register, gets 0, and jumps to 0 -- a silent hang with no output, the same failure mode as
+    picking the wrong peripheral map.
+    """
     data = bytearray(open(base_path, 'rb').read())
     struct.pack_into('<I', data, 0x44, _TOTAL_CORES)
     struct.pack_into('<I', data, 0x68, _NB_TILES)
+    suffix = ''
+    if _MULTI_SCALAR_MAP:
+        insn = struct.unpack_from('<I', data, 0x2c)[0]
+        # Verify it really is `addi t2, t2, 32` before rewriting, so a future bootrom rebuild that
+        # moves the instruction fails loudly here instead of producing a silently broken boot.
+        assert insn == 0x02038393, (
+            f'bootrom @0x102c is 0x{insn:08x}, expected addi t2,t2,32 (0x02038393); '
+            'the CLUSTER_BOOT_CONTROL offset patch needs updating')
+        struct.pack_into('<I', data, 0x2c, 0x01838393)   # addi t2, t2, 24
+        suffix = '_ms'
     out = os.path.join(tempfile.gettempdir(),
-                       f'cachepool_v3_bootrom_{_TOTAL_CORES}c_{_NB_TILES}t.bin')
+                       f'cachepool_v3_bootrom_{_TOTAL_CORES}c_{_NB_TILES}t{suffix}.bin')
     with open(out, 'wb') as f:
         f.write(data)
     return out
@@ -85,7 +132,10 @@ def _make_cache_config():
     cfg.num_tiles           = _NB_GROUPS * _TILES_PER_GROUP
     cfg.num_cores           = _CORES_PER_TILE
     cfg.num_controllers     = _BANKS_PER_TILE
-    cfg.tcdm_ports_per_core = 1 + SPATZ_NB_LANES
+    # Port classes per CC = the shared Spatz's VLSU lanes + one scalar port per hart
+    # (cachepool_cc_dual.sv: tcdm_req_o[NumMemPortsPerSpatz + h]).
+    cfg.num_scalar_per_core = _SCALAR_PER_CC
+    cfg.tcdm_ports_per_core = SPATZ_NB_LANES + _SCALAR_PER_CC
     cfg.interco.num_inputs  = cfg.num_cores * cfg.tcdm_ports_per_core
     cfg.interco.num_outputs = cfg.num_controllers
     cfg.structural_tile     = True
@@ -186,6 +236,7 @@ class CachepoolV3SoC(st.Component):
             nb_tiles_per_group=_TILES_PER_GROUP,
             nb_cores_per_tile=_CORES_PER_TILE,
             spatz_nb_lanes=SPATZ_NB_LANES,
+            nb_scalar_per_cc=_SCALAR_PER_CC,
             axi_data_width=axi_data_width,
             l2_noc=(not cache_config.controller.inline_sync_miss) and
                     int(os.environ.get('CACHEPOOL_V3_L2_NOC', '1')) != 0)
@@ -207,7 +258,7 @@ class CachepoolV3SoC(st.Component):
         # Flush + config endpoint counts: one flush port per bank, and one config endpoint per
         # xbar / bank / remote xbar — the numbers the peripheral's fan-outs are sized to.
         nb_banks_total = _NB_GROUPS * _TILES_PER_GROUP * _BANKS_PER_TILE
-        n_ppc = 1 + SPATZ_NB_LANES
+        n_ppc = SPATZ_NB_LANES + _SCALAR_PER_CC
         # The remote crossbars exist whenever there is ANY off-tile traffic — cross-tile within a
         # group OR cross-group over the L1 NoC — so they must be counted here on the same condition
         # the group uses to instantiate them. Gating on _TILES_PER_GROUP > 1 alone left every rxbar
@@ -225,12 +276,15 @@ class CachepoolV3SoC(st.Component):
 
         peripheral = ClusterRegisters(self, 'peripheral', boot_addr=0x1000,
                                       nb_cores=_TOTAL_CORES, binary=binary, cachepool=True,
-                                      nb_flush=nb_banks_total, nb_config=nb_config)
+                                      nb_flush=nb_banks_total, nb_config=nb_config,
+                                      cachepool_map=_PERIPH_MAP)
         uart = ns16550.Ns16550(self, 'uart')
 
-        # entry_addr = CLUSTER_BOOT_CONTROL (peripheral + 0x20) — where V1's bootrom reads the entry.
+        # entry_addr = CLUSTER_BOOT_CONTROL — where the bootrom reads the entry. 0x20 in the legacy
+        # map, 0x18 in the multi_scalar map (_patch_bootrom retargets the ROM to match).
         loader = utils.loader.loader.ElfLoader(self, 'loader', binary=binary,
-                                              entry=0x1000, entry_addr=PERIPH_BASE + 0x20)
+                                              entry=0x1000,
+                                              entry_addr=PERIPH_BASE + _BOOT_CONTROL_OFF)
         dummy_mem = memory.Memory(self, 'dummy_mem', atomics=True, size=0x400000)
 
         # ---------------- SoC narrow interconnect ----------------
