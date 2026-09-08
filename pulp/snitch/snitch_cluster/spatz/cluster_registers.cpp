@@ -49,6 +49,9 @@ private:
     bool cachepool_access(uint64_t offset, int size, uint8_t *data, bool is_write);
     // Env-gated report of what a pre-write read of the map-critical registers returns.
     void periph_selftest();
+    // Standing invariant on the barrier release, checked at every cluster completion.
+    void barrier_release_check(int completing_core, uint64_t released_mask);
+    bool barrier_invariant_reported = false;
     // E3: push one partition-config write through the config broadcast (o_CONFIG → shim → every
     // xbar / core cell / remote xbar). One-time stderr tripwire if a partition CSR write arrives
     // with the config path unbound (the stale-gvsoc_config.json symptom).
@@ -598,6 +601,64 @@ void ClusterRegisters::periph_selftest()
     }
 }
 
+// Standing check on the barrier release, run at every cluster completion.
+//
+// Requested by the RTL-side session as a PERMANENT check rather than one tied to their pending fix,
+// because it is a property of the barrier INTERFACE, not of any one kernel: with partial barriers,
+// who is parked where determines who gets woken, and `barrier_done_o` is an unmasked broadcast that
+// only cores in Global act on. Two things must hold, and one of them was violated by the release
+// loop this model shipped until today:
+//
+//   1. every core in Global is released                (was true)
+//   2. no core still in Wait is released               (was FALSE -- it woke every parked core)
+//
+// (2) is the one that matters: a model releasing cores the hardware leaves parked lets software pass
+// here and hang on silicon. It is checked even though the current structure makes it impossible, so
+// that a later edit to the release path cannot quietly reintroduce it.
+//
+// CACHEPOOL_BARRIER_STATS=1 also reports who was released and who stayed parked -- the observable
+// this API's users need to reason about the constraint that a partial barrier is safe only when
+// nothing outside the participating set is waiting at a barrier anywhere in the cluster.
+void ClusterRegisters::barrier_release_check(int completing_core, uint64_t released_mask)
+{
+    uint64_t still_parked = 0;
+    uint64_t bad = 0;
+    for (int i = 0; i < this->nb_cores && i < 64; i++)
+    {
+        if (this->waiting_reqs[i] == nullptr) continue;
+        still_parked |= 1ULL << i;
+        // A core left parked must still be recorded as waiting in its own tile, i.e. that tile has
+        // not reached its local barrier. Anything else means the two views have diverged.
+        const int t = i / this->cores_per_tile;
+        const int lane = i % this->cores_per_tile;
+        if (((this->tile_arrived[t] >> lane) & 1) == 0)
+        {
+            bad |= 1ULL << i;
+        }
+    }
+
+    if (bad != 0 && !this->barrier_invariant_reported)
+    {
+        this->barrier_invariant_reported = true;
+        fprintf(stderr, "[BARRIER-INVARIANT] %s: cores 0x%llx are parked but absent from their "
+                        "tile's arrival set after a completion (completing core %d, released "
+                        "0x%llx). The release path has diverged from cachepool_tile_barrier.sv.\n",
+                this->get_path().c_str(), (unsigned long long)bad, completing_core,
+                (unsigned long long)released_mask);
+    }
+
+    static const bool stats = [](){ const char *e = getenv("CACHEPOOL_BARRIER_STATS");
+                                    return e && e[0] != '0'; }();
+    if (stats)
+    {
+        fprintf(stderr, "[BARRIER] completion by core %d: released=0x%llx still_parked=0x%llx "
+                        "tile_mask=0x%llx\n",
+                completing_core, (unsigned long long)released_mask,
+                (unsigned long long)still_parked,
+                (unsigned long long)(this->cluster_tile_mask & core_mask(this->nb_tiles)));
+    }
+}
+
 void ClusterRegisters::reset(bool active)
 {
     this->new_reg("barrier_status", &this->barrier_status, 0, true);
@@ -734,6 +795,7 @@ void ClusterRegisters::hw_barrier_req(uint64_t reg_offset, int size, uint8_t *va
             // got the first half right and the second half wrong: it released cores the hardware
             // leaves waiting. That is the divergence direction that matters most, because software
             // validated against it would pass here and hang on silicon.
+            uint64_t released = 0;
             for (int tt = 0; tt < this->nb_tiles; tt++)
             {
                 uint64_t g = this->tile_global[tt];
@@ -753,9 +815,11 @@ void ClusterRegisters::hw_barrier_req(uint64_t reg_offset, int size, uint8_t *va
                     this->waiting_reqs[core]->inc_latency(11);
                     this->waiting_reqs[core]->get_resp_port()->resp(this->waiting_reqs[core]);
                     this->waiting_reqs[core] = nullptr;
-                    if (core < 64) this->waiting_cores &= ~(1ULL << core);
+                    if (core < 64) { this->waiting_cores &= ~(1ULL << core); released |= 1ULL << core; }
                 }
             }
+
+            this->barrier_release_check(id, released);
         }
     }
 
