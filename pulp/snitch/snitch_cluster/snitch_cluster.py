@@ -255,7 +255,7 @@ class SnitchCluster(gvsoc.systree.Component):
         nb_flush = 0
         nb_config = 0
         if arch.use_spatz:
-            if arch.use_insitu_cache and getattr(arch, 'use_structural_insitu_cache', False):
+            if getattr(arch, 'use_insitu_cache', False) and getattr(arch, 'use_structural_insitu_cache', False):
                 _nt = getattr(arch, 'cachepool_num_tiles', 1) if getattr(arch, 'use_cachepool_group', False) else 1
                 nb_flush = _nt * getattr(arch, 'cachepool_banks_per_tile', arch.nb_core)
                 # E3: partition-config endpoints = per-port-class xbars + cells (+ group remote xbars).
@@ -309,7 +309,7 @@ class SnitchCluster(gvsoc.systree.Component):
         # this falls through to the legacy direct core↔TCDM path — no behavior change.
         # See prompt/insitu_cache_gvsoc_plan.md §5.
         insitu_cache = None
-        if arch.use_insitu_cache and getattr(arch, 'use_cachepool_group', False):
+        if getattr(arch, 'use_insitu_cache', False) and getattr(arch, 'use_cachepool_group', False):
             # Multi-tile InsituCacheGroup (RTL cachepool_fpu_512: 4 tiles × 4 cores, shared L1 across
             # tiles via the remote xbars). Same i_INPUT(port)/o_L2 facade as the tile, so the binding
             # loop below is unchanged (core c lane j → port c*5+j → tile c//4, local core c%4, lane j).
@@ -340,7 +340,7 @@ class SnitchCluster(gvsoc.systree.Component):
             import math
             cache_cfg.interco.dynamic_offset = int(math.log2(cache_cfg.controller.cache_line_bytes))
             insitu_cache = InsituCacheGroup(self, 'insitu_cache', config=cache_cfg)
-        elif arch.use_insitu_cache:
+        elif getattr(arch, 'use_insitu_cache', False):
             cache_cfg = arch.insitu_cache_cfg
             if cache_cfg is None:
                 cache_cfg = make_cachepool_512_config()
@@ -461,7 +461,7 @@ class SnitchCluster(gvsoc.systree.Component):
         tcdm_port = 0
         for core_id in range(0, arch.nb_core):
             cores[core_id].o_DATA(cores_ico[core_id].i_INPUT())
-            if arch.use_insitu_cache and cache_region is not None:
+            if getattr(arch, 'use_insitu_cache', False) and cache_region is not None:
                 # SPM (stack) → per-tile private SPM; cached DRAM region → cache (absolute addrs so the
                 # cache's refill/evict land in DRAM via the wide_axi → o_WIDE_SOC fan-out); rest → SoC.
                 # SCALAR → tile lane n_ppc-1 (the AMO/LR-SC shim lane). The tile maps i_INPUT(p)→lane p%n_ppc,
@@ -473,7 +473,7 @@ class SnitchCluster(gvsoc.systree.Component):
                     base=arch.tcdm.area.base, size=arch.tcdm.area.size, rm_base=True)
                 cores_ico[core_id].o_MAP(insitu_cache.i_INPUT(core_id * n_ppc + (n_ppc - 1)),
                     base=cache_region.base, size=cache_region.size, rm_base=False)
-            elif arch.use_insitu_cache:
+            elif getattr(arch, 'use_insitu_cache', False):
                 # Cached TCDM access goes through the cache. We keep absolute addresses
                 # (rm_base=False) so the cache's refill/evict requests land in the correct
                 # range on the wide_axi fan-out (see binding below).
@@ -489,7 +489,7 @@ class SnitchCluster(gvsoc.systree.Component):
 
             if arch.use_spatz:
                 for port in range(0, arch.spatz_nb_lanes):
-                    if arch.use_insitu_cache and cache_region is not None:
+                    if getattr(arch, 'use_insitu_cache', False) and cache_region is not None:
                         # Address-route the VLSU lane like the scalar: the cache_region goes through
                         # the cache (its per-lane port); the SPM stays direct; the rest (bootrom/
                         # peripheral/UART) falls through to the SoC. Since E4 (P2.13) cache_region
@@ -507,7 +507,7 @@ class SnitchCluster(gvsoc.systree.Component):
                         vico.o_MAP(spms[core_id // cores_per_spm].i_INPUT(),
                             base=arch.tcdm.area.base, size=arch.tcdm.area.size, rm_base=True)
                         vico.o_MAP(narrow_axi.i_INPUT())   # default: uncached (0xA0000000) + rest -> SoC
-                    elif arch.use_insitu_cache:
+                    elif getattr(arch, 'use_insitu_cache', False):
                         cores[core_id].o_VLSU(port, insitu_cache.i_INPUT(tcdm_port))
                     else:
                         cores[core_id].o_VLSU(port, tcdm.i_INPUT(tcdm_port))
@@ -524,7 +524,7 @@ class SnitchCluster(gvsoc.systree.Component):
         # TCDM-range addresses to tcdm.i_DMA_INPUT, so misses land in the SPM as expected.
         # Refills/evictions for out-of-TCDM addresses (future DDR workloads) follow the
         # wide_axi map the user sets up at the SoC level.
-        if arch.use_insitu_cache:
+        if getattr(arch, 'use_insitu_cache', False):
             insitu_cache.o_L2(wide_axi.i_INPUT())
 
 
