@@ -724,25 +724,38 @@ void ClusterRegisters::hw_barrier_req(uint64_t reg_offset, int size, uint8_t *va
 
             this->barrier_status.set(0);
             this->tile_at_barrier = 0;
+
+            // Release exactly the cores in Global -- those whose OWN tile barrier has fired.
+            // `barrier_done_o` is a single unmasked broadcast and every tile's per-port FSM takes it
+            // unconditionally (`Global: if (barrier_done_i) state_d[i] = Take;`), so a tile that
+            // reached its local barrier is released even when it is not in the cluster mask. But a
+            // core still in Wait -- its tile barrier not yet fired -- never looks at barrier_done_i
+            // and must stay parked. This loop used to wake every parked core in the cluster, which
+            // got the first half right and the second half wrong: it released cores the hardware
+            // leaves waiting. That is the divergence direction that matters most, because software
+            // validated against it would pass here and hang on silicon.
             for (int tt = 0; tt < this->nb_tiles; tt++)
             {
+                uint64_t g = this->tile_global[tt];
                 this->tile_global[tt] = 0;
-            }
-
-            for (int i=0; i<this->nb_cores; i++)
-            {
-                if (this->waiting_reqs[i] != nullptr)
+                while (g != 0)
                 {
-                    this->trace.msg(vp::Trace::LEVEL_DEBUG, "Wakeup core waiting on barrier (core: %d)\n",
-                        i);
+                    const int lane = __builtin_ctzll(g);
+                    g &= g - 1;
+                    const int core = tt * this->cores_per_tile + lane;
+                    if (core >= this->nb_cores || this->waiting_reqs[core] == nullptr)
+                    {
+                        continue;   // the arrival that completed the barrier is not parked
+                    }
+                    this->trace.msg(vp::Trace::LEVEL_DEBUG,
+                        "Wakeup core waiting on barrier (core: %d)\n", core);
                     // Barrier insert 10 cycle stall even for last one to wake-up, seem the request go through AXI
-                    this->waiting_reqs[i]->inc_latency(11);
-                    this->waiting_reqs[i]->get_resp_port()->resp(this->waiting_reqs[i]);
-                    this->waiting_reqs[i] = nullptr;
+                    this->waiting_reqs[core]->inc_latency(11);
+                    this->waiting_reqs[core]->get_resp_port()->resp(this->waiting_reqs[core]);
+                    this->waiting_reqs[core] = nullptr;
+                    if (core < 64) this->waiting_cores &= ~(1ULL << core);
                 }
             }
-
-            this->waiting_cores = 0;
         }
     }
 
