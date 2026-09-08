@@ -47,6 +47,8 @@ private:
     // CachePool-mode interception of the CachePool peripheral register block (offsets absent from the
     // spatz regmap). Returns true if handled (quit / scratch RW); false to fall through to the regmap.
     bool cachepool_access(uint64_t offset, int size, uint8_t *data, bool is_write);
+    // Env-gated report of what a pre-write read of the map-critical registers returns.
+    void periph_selftest();
     // E3: push one partition-config write through the config broadcast (o_CONFIG → shim → every
     // xbar / core cell / remote xbar). One-time stderr tripwire if a partition CSR write arrives
     // with the config path unbound (the stale-gvsoc_config.json symptom).
@@ -566,6 +568,36 @@ void ClusterRegisters::barrier_sync(vp::Block *__this, bool value, int id)
     }
 }
 
+// CACHEPOOL_PERIPH_SELFTEST=1: report what a PRE-WRITE read of the map-critical registers actually
+// returns, by driving the real decode path rather than by inspecting the variables behind it. The RTL
+// side's map probe reads the participation mask before writing it and expects its RESVAL of
+// 0xffffffff, versus 0 for the CFG_L1D_TILE_SEL that occupies the same address under a different map
+// -- a hardware signature rather than "the address tolerates a write". If this model got those reset
+// values wrong the probe would misfire against us and be read as a map error, so it is worth being
+// able to check rather than assert.
+void ClusterRegisters::periph_selftest()
+{
+    const char *e = getenv("CACHEPOOL_PERIPH_SELFTEST");
+    if (!(e && e[0] != '0'))
+    {
+        return;
+    }
+    struct { const char *name; uint64_t off; } probes[] = {
+        { "MASK_0",        this->cachepool_mask0_off },
+        { "MASK_1",        this->cachepool_mask1_off },
+        { "0x28",          0x28 },
+        { "BOOT_CONTROL",  this->cachepool_boot_off  },
+    };
+    for (auto &p : probes)
+    {
+        if (p.off == 0 && p.name[0] == 'M') { fprintf(stderr, "[PERIPH-SELFTEST] %s: absent in this map\n", p.name); continue; }
+        uint32_t v = 0xdeadbeef;
+        bool handled = this->cachepool_access(p.off, 4, (uint8_t *)&v, false);
+        fprintf(stderr, "[PERIPH-SELFTEST] %-12s off=0x%02llx handled=%d reads=0x%08x\n",
+                p.name, (unsigned long long)p.off, (int)handled, v);
+    }
+}
+
 void ClusterRegisters::reset(bool active)
 {
     this->new_reg("barrier_status", &this->barrier_status, 0, true);
@@ -588,6 +620,8 @@ void ClusterRegisters::reset(bool active)
         cp_l1d[(0x40 - 0x28) / 4] = 0;
         cp_l1d[(0x44 - 0x28) / 4] = 0xA0000000;
         cp_l1d[(0x48 - 0x28) / 4] = 0;
+
+        this->periph_selftest();
     }
 }
 
