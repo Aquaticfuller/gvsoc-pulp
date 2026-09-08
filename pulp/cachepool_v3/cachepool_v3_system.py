@@ -29,6 +29,10 @@ import tempfile
 
 import gvsoc.systree as st
 import gvsoc.runner
+# NOTE the order: `import memory.dramsys` binds the name `memory` to the PACKAGE, so it has to come
+# before the `as memory` alias below or it silently shadows it and Memory disappears.
+import memory.dramsys as dramsys_model
+import interco.interleaver as interleaver
 import memory.memory as memory
 import utils.loader.loader
 from interco.router import Router
@@ -52,6 +56,13 @@ _TILES_PER_GROUP   = int(os.environ.get('CACHEPOOL_V3_TILES_PER_GROUP', '4'))
 _CORES_PER_TILE    = int(os.environ.get('CACHEPOOL_V3_CORES_PER_TILE', '4'))
 _BANKS_PER_TILE    = int(os.environ.get('CACHEPOOL_V3_BANKS_PER_TILE', str(_CORES_PER_TILE)))
 _MEM_LATENCY       = int(os.environ.get('CACHEPOOL_V3_MEM_LATENCY', '50'))
+# Channelized DRAM behind the L2 refill mesh. OFF by default: the flat backing store is what every
+# calibrated number was measured against, and DRAMSys additionally needs SystemC preloaded and the
+# gvsoc_launcher_sc binary (see the run note below). ON, each memory channel of the mesh gets its own
+# DRAM, which is what the RTL testbench does -- cachepool_4t_fpu_512.mk sets l2_channel=4 and backs
+# each channel with its own DRAMSys instance.
+_DRAMSYS           = int(os.environ.get('CACHEPOOL_V3_DRAMSYS', '0')) != 0
+_DRAM_TYPE         = os.environ.get('CACHEPOOL_V3_DRAM_TYPE', 'hbm2-example.json')
 
 _NB_GROUPS   = _NB_X_GROUPS * _NB_Y_GROUPS
 _NB_TILES    = _NB_GROUPS * _TILES_PER_GROUP
@@ -250,12 +261,56 @@ class CachepoolV3SoC(st.Component):
                             stim_file=_patch_bootrom(
                                 self.get_file_path('pulp/cachepool/bootrom_cachepool.bin')))
 
-        # Flat backing store, one instance per DRAM window. width_log2=6 → 64 B/cycle, latency as in
-        # v1 (a 0-latency store made the whole miss path ~50 cycles too cheap).
-        l2_mem   = memory.Memory(self, 'l2_mem',   size=l2_size,
-                                 latency=_MEM_LATENCY, width_log2=6, atomics=True)
-        pdcp_mem = memory.Memory(self, 'pdcp_mem', size=0x2000_0000,
-                                 latency=_MEM_LATENCY, width_log2=6, atomics=True)
+        # Backing store. Two shapes, selected by CACHEPOOL_V3_DRAMSYS.
+        #
+        # Flat (default): one plain memory per DRAM window. width_log2=6 → 64 B/cycle, latency as in
+        # v1 (a 0-latency store made the whole miss path ~50 cycles too cheap). Every calibrated
+        # number in this project was measured against this.
+        #
+        # DRAMSys: one DRAM per MEMORY CHANNEL of the refill mesh, which is what the RTL testbench
+        # has. The two DRAM windows are contiguous — DRAM_BASE 0x8000_0000 + 0x2000_0000 runs
+        # straight into PDCP_BASE 0xA000_0000 + 0x2000_0000 — so they collapse into one 1 GiB space
+        # striped across the channels, exactly one address space as in hardware rather than two
+        # windows that happen to share a store.
+        #
+        # The striping agrees with the mesh by construction and not by coincidence: the mesh selects
+        # a channel on addr[12:10] (base=c*0x400, size=0x400, period=nb_chan*0x400) and the
+        # interleaver selects a slave on the same bits with interleaving_bits=10. A refill routed to
+        # mesh channel 3 therefore lands in DRAM 3 — if either granule ever changes, the other must
+        # change with it or the mesh will model contention on a channel the data does not live in.
+        dram_target = None          # set when DRAMSys is on; everything then maps here instead
+        if _DRAMSYS:
+            nb_dram = cluster.nb_channels or 1
+            dram_ico = interleaver.Interleaver(self, 'dram_ico', nb_slaves=nb_dram,
+                                               interleaving_bits=10)
+            for c in range(nb_dram):
+                dram = dramsys_model.Dramsys(self, f'dram_ch{c}')
+                dram.add_properties({'dram-type': _DRAM_TYPE})
+                self.bind(dram_ico, f'out_{c}', dram, 'input')
+            dram_target = dram_ico
+            l2_mem = pdcp_mem = None
+        else:
+            l2_mem   = memory.Memory(self, 'l2_mem',   size=l2_size,
+                                     latency=_MEM_LATENCY, width_log2=6, atomics=True)
+            pdcp_mem = memory.Memory(self, 'pdcp_mem', size=0x2000_0000,
+                                     latency=_MEM_LATENCY, width_log2=6, atomics=True)
+
+        def _map_dram(router, name_prefix=''):
+            """Give `router` its DRAM decode. One contiguous mapping when DRAMSys is on, the two
+            separate windows otherwise, so the flat path stays byte-for-byte what it was."""
+            if dram_target is not None:
+                router.add_mapping('dram', base=DRAM_BASE, remove_offset=DRAM_BASE,
+                                   size=(PDCP_BASE + 0x2000_0000) - DRAM_BASE)
+            else:
+                router.add_mapping('l2',   base=DRAM_BASE, remove_offset=DRAM_BASE, size=l2_size)
+                router.add_mapping('pdcp', base=PDCP_BASE, remove_offset=PDCP_BASE, size=0x2000_0000)
+
+        def _bind_dram(router):
+            if dram_target is not None:
+                self.bind(router, 'dram', dram_target, 'input')
+            else:
+                self.bind(router, 'l2',   l2_mem,   'input')
+                self.bind(router, 'pdcp', pdcp_mem, 'input')
 
         # Flush + config endpoint counts: one flush port per bank, and one config endpoint per
         # xbar / bank / remote xbar — the numbers the peripheral's fan-outs are sized to.
@@ -313,39 +368,32 @@ class CachepoolV3SoC(st.Component):
         nb_chan = cluster.nb_channels
         for c in range(nb_chan):
             ch = Router(self, f'chan_ico_{c}', bandwidth=axi_data_width, latency=0)
-            ch.add_mapping('l2',   base=DRAM_BASE, remove_offset=DRAM_BASE, size=l2_size)
-            ch.add_mapping('pdcp', base=PDCP_BASE, remove_offset=PDCP_BASE, size=0x2000_0000)
+            _map_dram(ch)
             ch.add_mapping('soc')
             cluster.o_CHANNEL(c, ch.i_INPUT())
-            self.bind(ch, 'l2',   l2_mem,   'input')
-            self.bind(ch, 'pdcp', pdcp_mem, 'input')
+            _bind_dram(ch)
             self.bind(ch, 'soc',  soc_ico,  'input')
 
         for g in range(_NB_GROUPS):
             if nb_chan == 0:
                 wide = Router(self, f'wide_ico_{g}', bandwidth=axi_data_width, latency=0)
-                wide.add_mapping('l2',   base=DRAM_BASE, remove_offset=DRAM_BASE, size=l2_size)
-                wide.add_mapping('pdcp', base=PDCP_BASE, remove_offset=PDCP_BASE, size=0x2000_0000)
+                _map_dram(wide)
                 wide.add_mapping('soc')
                 cluster.o_WIDE(g, wide.i_INPUT())
-                self.bind(wide, 'l2',   l2_mem,   'input')
-                self.bind(wide, 'pdcp', pdcp_mem, 'input')
+                _bind_dram(wide)
                 self.bind(wide, 'soc',  soc_ico,  'input')
 
             narrow = Router(self, f'narrow_ico_{g}', bandwidth=8, latency=1)
-            narrow.add_mapping('l2',   base=DRAM_BASE, remove_offset=DRAM_BASE, size=l2_size)
-            narrow.add_mapping('pdcp', base=PDCP_BASE, remove_offset=PDCP_BASE, size=0x2000_0000)
+            _map_dram(narrow)
             narrow.add_mapping('soc')
             cluster.o_NARROW(g, narrow.i_INPUT())
-            self.bind(narrow, 'l2',   l2_mem,   'input')
-            self.bind(narrow, 'pdcp', pdcp_mem, 'input')
+            _bind_dram(narrow)
             self.bind(narrow, 'soc',  soc_ico,  'input')
 
         # ---------------- loader ----------------
         loader_router = Router(self, 'loader_router', bandwidth=64, latency=1)
         loader_router.add_mapping('dummy', base=0x0000_0000, remove_offset=0x0000_0000, size=0x400000)
-        loader_router.add_mapping('mem',   base=DRAM_BASE, remove_offset=DRAM_BASE, size=l2_size)
-        loader_router.add_mapping('pdcp',  base=PDCP_BASE, remove_offset=PDCP_BASE, size=0x2000_0000)
+        _map_dram(loader_router)
         loader_router.add_mapping('soc',   base=PERIPH_BASE, size=0x1000_0000)
         # v1's proven wake sequence: START pulses FETCHEN and every core's MSIP (the bootrom WFIs
         # with mie=0xF = MSIE, so MEIP would never wake it). The ELF entry is written to
@@ -355,8 +403,7 @@ class CachepoolV3SoC(st.Component):
             loader.o_START(cluster.i_MSIP(i))
         self.bind(loader, 'out',   loader_router, 'input')
         self.bind(loader_router, 'dummy', dummy_mem, 'input')
-        self.bind(loader_router, 'mem',   l2_mem,    'input')
-        self.bind(loader_router, 'pdcp',  pdcp_mem,  'input')
+        _bind_dram(loader_router)
         self.bind(loader_router, 'soc',   soc_ico,   'input')
 
         # ---------------- peripheral ↔ cores ----------------
