@@ -79,10 +79,11 @@ BOOTROM_SIZE = 0x1_0000
 _PERIPH_MAP = os.environ.get('CACHEPOOL_V3_PERIPH_MAP', 'auto')
 if _PERIPH_MAP == 'auto':
     _PERIPH_MAP = 'multi_scalar' if _SCALAR_PER_CC > 1 else 'legacy'
-assert _PERIPH_MAP in ('legacy', 'multi_scalar'), \
-    f'CACHEPOOL_V3_PERIPH_MAP must be auto|legacy|multi_scalar, got {_PERIPH_MAP!r}'
-_MULTI_SCALAR_MAP = _PERIPH_MAP == 'multi_scalar'
-_BOOT_CONTROL_OFF = 0x18 if _MULTI_SCALAR_MAP else 0x20
+assert _PERIPH_MAP in ('legacy', 'rlc_next', 'multi_scalar'), \
+    f'CACHEPOOL_V3_PERIPH_MAP must be auto|legacy|rlc_next|multi_scalar, got {_PERIPH_MAP!r}'
+# CLUSTER_BOOT_CONTROL offset per map, and the bootrom immediate that has to match it.
+_BOOT_OFF_BY_MAP = {'legacy': 0x20, 'rlc_next': 0x10, 'multi_scalar': 0x18}
+_BOOT_CONTROL_OFF = _BOOT_OFF_BY_MAP[_PERIPH_MAP]
 
 
 def _patch_bootrom(base_path):
@@ -107,15 +108,16 @@ def _patch_bootrom(base_path):
     struct.pack_into('<I', data, 0x44, _TOTAL_CORES)
     struct.pack_into('<I', data, 0x68, _NB_TILES)
     suffix = ''
-    if _MULTI_SCALAR_MAP:
+    if _BOOT_CONTROL_OFF != 0x20:
         insn = struct.unpack_from('<I', data, 0x2c)[0]
         # Verify it really is `addi t2, t2, 32` before rewriting, so a future bootrom rebuild that
         # moves the instruction fails loudly here instead of producing a silently broken boot.
         assert insn == 0x02038393, (
             f'bootrom @0x102c is 0x{insn:08x}, expected addi t2,t2,32 (0x02038393); '
             'the CLUSTER_BOOT_CONTROL offset patch needs updating')
-        struct.pack_into('<I', data, 0x2c, 0x01838393)   # addi t2, t2, 24
-        suffix = '_ms'
+        # I-type: imm[11:0] << 20, rest of `addi t2,t2,_` unchanged.
+        struct.pack_into('<I', data, 0x2c, (_BOOT_CONTROL_OFF << 20) | 0x00038393)
+        suffix = f'_b{_BOOT_CONTROL_OFF:02x}'
     out = os.path.join(tempfile.gettempdir(),
                        f'cachepool_v3_bootrom_{_TOTAL_CORES}c_{_NB_TILES}t{suffix}.bin')
     with open(out, 'wb') as f:
@@ -277,11 +279,11 @@ class CachepoolV3SoC(st.Component):
         peripheral = ClusterRegisters(self, 'peripheral', boot_addr=0x1000,
                                       nb_cores=_TOTAL_CORES, binary=binary, cachepool=True,
                                       nb_flush=nb_banks_total, nb_config=nb_config,
-                                      cachepool_map=_PERIPH_MAP)
+                                      cachepool_map=_PERIPH_MAP, nb_tiles=_NB_TILES)
         uart = ns16550.Ns16550(self, 'uart')
 
         # entry_addr = CLUSTER_BOOT_CONTROL — where the bootrom reads the entry. 0x20 in the legacy
-        # map, 0x18 in the multi_scalar map (_patch_bootrom retargets the ROM to match).
+        # map, 0x10 in rlc_next, 0x18 in multi_scalar (_patch_bootrom retargets the ROM to match).
         loader = utils.loader.loader.ElfLoader(self, 'loader', binary=binary,
                                               entry=0x1000,
                                               entry_addr=PERIPH_BASE + _BOOT_CONTROL_OFF)

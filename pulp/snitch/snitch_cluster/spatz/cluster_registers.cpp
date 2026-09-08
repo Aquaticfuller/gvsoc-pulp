@@ -16,6 +16,7 @@
  */
 
 #include <vector>
+#include <cstdlib>
 #include <vp/vp.hpp>
 #include <vp/itf/io.hpp>
 #include <vp/itf/wire.hpp>
@@ -53,17 +54,30 @@ private:
 
     vp::Trace     trace;
     bool          cachepool_mode = false;
-    // CachePool peripheral register map generation. The offsets moved on the RTL branch
-    // dev/multi-scalar when SPATZ_LOCK_ACQUIRE/RELEASE were inserted at 0x4/0x8:
+    // CachePool peripheral register map generation. THREE are in circulation, all confirmed against
+    // the generated register packages on both RTL branches:
     //
-    //             legacy (cachepool_fpu_512, the ELFs we run)   multi_scalar (dev/multi-scalar)
-    //   HW_BARRIER            0x10                                       0x00
-    //   BOOT_CONTROL          0x20                                       0x18
-    //   EOC_EXIT              0x24                                       0x1c
-    //   L1D block         0x28..0x4c                                 0x28..0x4c  (unchanged)
+    //                                    legacy      rlc_next     multi_scalar
+    //   HW_BARRIER                        0x10         0x00           0x00
+    //   SPATZ_LOCK_ACQUIRE / RELEASE       -            -          0x04 / 0x08
+    //   CLUSTER_BOOT_CONTROL              0x20         0x10           0x18
+    //   CLUSTER_EOC_EXIT                  0x24         0x14           0x1c
+    //   HW_BARRIER_PARTICIPATION_MASK_0/1  -       0x28 / 0x2c    0x30 / 0x34
+    //   L1D block                      0x28..0x4c   (shifted)      (shifted)
+    //
+    //   legacy       cachepool_fpu_512 -- everything in software/build/CachePoolTests
+    //   rlc_next     the RTL working tree, i.e. the frozen ELF sets under reports/handover/
+    //   multi_scalar dev/multi-scalar, where the two lock registers pushed everything down by 8
     //
     // Getting this wrong is silent, not loud: the barrier read lands on scratch and never blocks,
     // and the EOC write goes nowhere so the run simply never terminates.
+    //
+    // NOT MODELLED, and it matters for the two newer maps: HW_BARRIER_PARTICIPATION_MASK. The
+    // barrier here is a plain counter to nb_cores that discards the value software writes (see
+    // hw_barrier_req), so snrt_barrier_set_tile_mask() lands in scratch and a partial barrier over a
+    // subset does not release when that subset arrives -- it waits for every core. Conservative
+    // rather than wrong for throughput, but it cannot answer a question about partial-barrier
+    // semantics, and a run of a kernel that depends on early release is not measuring that kernel.
     uint64_t      cachepool_barrier_off = 0x10;
     uint64_t      cachepool_boot_off    = 0x20;
     uint64_t      cachepool_eoc_off     = 0x24;
@@ -110,6 +124,35 @@ private:
 
     std::vector<vp::IoReq *> waiting_reqs;
 
+    // ---- two-level masked barrier (cachepool_tile_barrier.sv + cachepool_cluster_barrier.sv) ----
+    // The participant set is NOT a global count. It is carried by the access itself and by one
+    // register, at two levels:
+    //
+    //   tile level    a WRITE to the barrier address carries a per-core-within-tile participant
+    //                 mask as its write data; a READ means "all cores of this tile". The first core
+    //                 to arrive in a round latches the mask for that round, and the tile signals
+    //                 the cluster once every core selected by that mask has arrived.
+    //   cluster level HW_BARRIER_PARTICIPATION_MASK_0/1 is a cluster-global mask with one bit per
+    //                 TILE, latched when the round starts; the barrier completes when every
+    //                 participating tile has signalled.
+    //
+    // Counting arrivals globally instead is not a conservative approximation, it is a different
+    // barrier: with disjoint participant sets -- which is exactly how the RLC kernel is written,
+    // producers and idle cores parked on the full barrier while consumers loop on partial ones --
+    // the parked cores' arrivals top up the same counter and release everyone spuriously.
+    int nb_tiles = 1;
+    int cores_per_tile = 1;
+    std::vector<uint64_t> tile_arrived;      // cores of this tile currently in Wait (bit = lane)
+    std::vector<uint64_t> tile_mask;         // participant mask latched for the current round
+    std::vector<bool>     tile_mask_active;  // a round is open on this tile
+    std::vector<uint64_t> tile_global;       // cores captured at local_barrier, awaiting cluster done
+    uint64_t tile_at_barrier = 0;            // bit per tile: tile_barrier_o asserted
+    uint64_t cluster_tile_mask = ~0ULL;      // participation-mask register; all tiles until written
+    // Offsets of HW_BARRIER_PARTICIPATION_MASK_0/1, or 0 when the map has no such register
+    // (the legacy map predates partial barriers).
+    uint64_t cachepool_mask0_off = 0;
+    uint64_t cachepool_mask1_off = 0;
+
     static inline uint64_t core_mask(int nb_cores) {
         return nb_cores >= 64 ? ~0ULL : ((1ULL << nb_cores) - 1);
     }
@@ -125,12 +168,35 @@ ClusterRegisters::ClusterRegisters(vp::ComponentConf &config)
     auto cp = this->get_js_config()->get("cachepool");
     this->cachepool_mode = (cp != NULL) && cp->get_bool();
     auto cm = this->get_js_config()->get("cachepool_map");
-    if (cm != NULL && cm->get_str() == "multi_scalar")
+    std::string map = cm != NULL ? cm->get_str() : "legacy";
+    if (map == "multi_scalar")
     {
         this->cachepool_barrier_off = 0x00;
         this->cachepool_boot_off    = 0x18;
         this->cachepool_eoc_off     = 0x1c;
+        this->cachepool_mask0_off   = 0x30;
+        this->cachepool_mask1_off   = 0x34;
     }
+    else if (map == "rlc_next")
+    {
+        this->cachepool_barrier_off = 0x00;
+        this->cachepool_boot_off    = 0x10;
+        this->cachepool_eoc_off     = 0x14;
+        this->cachepool_mask0_off   = 0x28;
+        this->cachepool_mask1_off   = 0x2c;
+    }
+
+    auto nt = this->get_js_config()->get("nb_tiles");
+    this->nb_tiles = (nt != NULL && nt->get_int() > 0) ? nt->get_int() : 1;
+    if (this->nb_cores % this->nb_tiles != 0)
+    {
+        this->nb_tiles = 1;     // not a tiled topology; treat the cluster as one tile
+    }
+    this->cores_per_tile = this->nb_cores / this->nb_tiles;
+    this->tile_arrived.resize(this->nb_tiles, 0);
+    this->tile_mask.resize(this->nb_tiles, 0);
+    this->tile_mask_active.resize(this->nb_tiles, false);
+    this->tile_global.resize(this->nb_tiles, 0);
 
     // F1: flush fan-out ports (0 = the accept-as-scratch fallback; the structural cache wires N).
     auto nf = this->get_js_config()->get("nb_flush");
@@ -350,6 +416,32 @@ bool ClusterRegisters::cachepool_access(uint64_t offset, int size, uint8_t *data
     // whichever spatz regmap register happens to sit at that offset (PERF_COUNTER_0 at 0x20 in the
     // legacy map -- a coincidence that does not repeat at 0x18 in the multi_scalar map, where the
     // spatz regmap has HART_SELECT_1 and would mask the stored entry point).
+    // HW_BARRIER_PARTICIPATION_MASK_0/1 -- the cluster-level, one-bit-per-TILE participation mask
+    // (cachepool_cluster_barrier.sv barrier_mask_i). Only exists in the maps that have partial
+    // barriers; in the legacy map these offsets are L1D config and must fall through.
+    if (this->cachepool_mask0_off != 0 &&
+        (offset == this->cachepool_mask0_off || offset == this->cachepool_mask1_off))
+    {
+        const bool high = offset == this->cachepool_mask1_off;
+        if (is_write)
+        {
+            uint32_t v = 0;
+            if (data != nullptr) memcpy(&v, data, size < 4 ? (size_t)size : 4);
+            if (high) this->cluster_tile_mask = (this->cluster_tile_mask & 0x00000000ffffffffULL)
+                                              | ((uint64_t)v << 32);
+            else      this->cluster_tile_mask = (this->cluster_tile_mask & 0xffffffff00000000ULL)
+                                              | (uint64_t)v;
+            this->trace.msg(vp::Trace::LEVEL_DEBUG, "Barrier tile mask now 0x%llx\n",
+                (unsigned long long)this->cluster_tile_mask);
+        }
+        else if (data != nullptr)
+        {
+            uint32_t v = (uint32_t)(high ? (this->cluster_tile_mask >> 32) : this->cluster_tile_mask);
+            memset(data, 0, size);
+            memcpy(data, &v, size < 4 ? (size_t)size : 4);
+        }
+        return true;
+    }
     if (offset == this->cachepool_boot_off && offset >= 0x18)
     {
         if (is_write)
@@ -477,6 +569,15 @@ void ClusterRegisters::reset(bool active)
     {
         this->waiting_cores = 0;
         this->stall_core = false;
+        this->tile_at_barrier = 0;
+        this->cluster_tile_mask = ~0ULL;    // RTL reset is "all tiles participate"
+        for (int t = 0; t < this->nb_tiles; t++)
+        {
+            this->tile_arrived[t] = 0;
+            this->tile_mask[t] = 0;
+            this->tile_mask_active[t] = false;
+            this->tile_global[t] = 0;
+        }
         // RTL reset values for the partition registers in the older block (0x28..0x4c):
         // L1D_PRIVATE (0x40) = 0, L1D_ADDR (0x44) = 0xA0000000, XBAR_OFFSET (0x48) = 0.
         cp_l1d[(0x40 - 0x28) / 4] = 0;
@@ -507,14 +608,87 @@ void ClusterRegisters::hw_barrier_req(uint64_t reg_offset, int size, uint8_t *va
 {
     if (this->core_access != -1)
     {
-        const uint64_t count = this->barrier_status.get() + 1;
-        this->barrier_status.set(count);
+        const int id = this->core_access;
+        const int t = id / this->cores_per_tile;
+        const int lane = id % this->cores_per_tile;
+        const uint64_t lane_all = core_mask(this->cores_per_tile);
+        const uint64_t tile_all = core_mask(this->nb_tiles);
 
-        if (count >= (uint64_t)this->nb_cores)
+        // cachepool_tile_barrier.sv: req_mask = q.write ? q.data[NrPorts-1:0] : all ones.
+        // A read is snrt_cluster_hw_barrier() (full tile); a write is
+        // snrt_cluster_partial_barrier(mask), whose data IS the participant mask.
+        uint64_t req_mask = lane_all;
+        if (is_write && value != nullptr)
+        {
+            uint64_t written = 0;
+            memcpy(&written, value, size < 8 ? (size_t)size : 8);
+            req_mask = written & lane_all;
+            if (req_mask == 0)
+            {
+                req_mask = lane_all;    // an all-zero mask would complete trivially; treat as full
+            }
+        }
+
+        // CACHEPOOL_BARRIER_COUNTING=1 restores the pre-2026-09-08 global counting barrier, so the
+        // difference between two runs is exactly what the masked two-level barrier changes. Kept
+        // because the old behaviour is what every result recorded before this date was measured on.
+        static const bool counting = [](){ const char *e = getenv("CACHEPOOL_BARRIER_COUNTING");
+                                           return e && e[0] != '0'; }();
+        if (counting)
+        {
+            req_mask = lane_all;
+            this->cluster_tile_mask = ~0ULL;
+        }
+
+        // "Whichever port's request is first to arrive in a round has its mask latched."
+        if (!this->tile_mask_active[t])
+        {
+            this->tile_mask[t] = req_mask;
+            this->tile_mask_active[t] = true;
+        }
+        this->tile_arrived[t] |= 1ULL << lane;
+        this->barrier_status.set(this->barrier_status.get() + 1);   // debug visibility only
+
+        // local_barrier = (is_barrier & core_mask_q) == core_mask_q
+        if ((this->tile_arrived[t] & this->tile_mask[t]) != this->tile_mask[t])
+        {
+            this->trace.msg(vp::Trace::LEVEL_DEBUG,
+                "Stall core, tile barrier not reached (core: %d, tile: %d, arrived: 0x%llx, mask: 0x%llx)\n",
+                id, t, (unsigned long long)this->tile_arrived[t],
+                (unsigned long long)this->tile_mask[t]);
+            if (id < 64) this->waiting_cores |= 1ULL << id;
+            this->stall_core = true;
+            return;
+        }
+
+        // The tile has reached its barrier. Every core waiting here moves to Global -- including any
+        // that are not in the mask, which is what the RTL does (the per-port FSM advances on
+        // local_barrier regardless of the mask bit).
+        this->tile_global[t] |= this->tile_arrived[t];
+        this->tile_arrived[t] = 0;
+        this->tile_mask_active[t] = false;
+        this->tile_at_barrier |= 1ULL << t;
+
+        const uint64_t cmask = this->cluster_tile_mask & tile_all;
+        if ((this->tile_at_barrier & cmask) != cmask)
+        {
+            this->trace.msg(vp::Trace::LEVEL_DEBUG,
+                "Stall core, cluster barrier not reached (core: %d, tiles: 0x%llx, mask: 0x%llx)\n",
+                id, (unsigned long long)this->tile_at_barrier, (unsigned long long)cmask);
+            if (id < 64) this->waiting_cores |= 1ULL << id;
+            this->stall_core = true;
+            return;
+        }
+
         {
             this->trace.msg(vp::Trace::LEVEL_DEBUG, "Barrier reached\n");
 
             this->barrier_status.set(0);
+            this->tile_at_barrier = 0;
+            for (int tt = 0; tt < this->nb_tiles; tt++)
+            {
+                this->tile_global[tt] = 0;
+            }
 
             for (int i=0; i<this->nb_cores; i++)
             {
@@ -530,15 +704,6 @@ void ClusterRegisters::hw_barrier_req(uint64_t reg_offset, int size, uint8_t *va
             }
 
             this->waiting_cores = 0;
-        }
-        else
-        {
-            this->trace.msg(vp::Trace::LEVEL_DEBUG, "Stall core due to barrier not reached (core: %d)\n",
-                this->core_access);
-
-            if (this->core_access < 64) this->waiting_cores |= 1ULL << this->core_access;
-            this->stall_core = true;
-            return;
         }
     }
 

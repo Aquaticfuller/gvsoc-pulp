@@ -330,7 +330,11 @@ void SpatzLock::arb_schedule()
     }
     for (int h = 0; h < this->nb_hosts; h++)
     {
-        if (this->status[h] != 0)
+        // wants(), not status != 0. A request level that has stopped being refreshed leaves its bit
+        // set in our copy forever, so testing the raw word would re-arm this event every cycle for
+        // the rest of the simulation -- on every lock in the cluster -- long after the hart that
+        // asked has moved on. wants() lets an expired request stop the clock.
+        if (this->wants(h))
         {
             this->arb_event.enqueue(1);
             return;
