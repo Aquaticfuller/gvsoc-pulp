@@ -442,7 +442,12 @@ bool ClusterRegisters::cachepool_access(uint64_t offset, int size, uint8_t *data
         }
         return true;
     }
-    if (offset == this->cachepool_boot_off && offset >= 0x18)
+    // No `offset >= 0x18` guard here. There was one, and it silently broke the rlc_next map, whose
+    // BOOT_CONTROL is at 0x10: the branch was skipped, the offset fell through to the scratch
+    // swallow below, the bootrom read 0 and every core jumped to address 0 -- a run with no output
+    // at all, which I misread as "this ELF is not the rlc_next map". The barrier and boot offsets
+    // are distinct in all three maps (0x10/0x20, 0x00/0x10, 0x00/0x18), so no guard is needed.
+    if (offset == this->cachepool_boot_off)
     {
         if (is_write)
         {
