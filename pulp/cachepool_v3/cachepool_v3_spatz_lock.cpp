@@ -82,6 +82,7 @@
 #include <vp/vp.hpp>
 #include <vp/itf/io.hpp>
 #include <vp/itf/wire.hpp>
+#include <vp/clock/clock_event.hpp>
 
 // Response payload, cachepool_spatz_lock.sv.
 #define OUTCOME_FAIL         0
@@ -113,6 +114,13 @@ private:
     static void grant(vp::Block *__this, vp::IoReq *req, int host);
     static void response(vp::Block *__this, vp::IoReq *req, int host);
     static void status_sync(vp::Block *__this, int value, int host);
+    static void arb_handler(vp::Block *__this, vp::ClockEvent *event);
+    // True while hart `h` is asking for the shared unit. "Asking" is a LEVEL: the core republishes
+    // it every cycle it spends stalled on the gate, and an assertion that is not refreshed this
+    // cycle has expired. That expiry is the whole point -- a hart that stalls, is granted and then
+    // does something else simply stops refreshing, where a latched bit would pin the unit forever.
+    bool wants(int host);
+    void arb_schedule();
 
     // One acquire/release attempt from `host`; returns the word software reads back.
     uint32_t lock_op(int host, bool is_acquire);
@@ -124,6 +132,13 @@ private:
     const char *state_name();
 
     vp::Trace trace;
+    // Re-runs arbitration once per cycle while anyone is asking. acc_mux is combinational: it looks
+    // at both harts' acc_qvalid levels every cycle and grants one. Modelling that with edge-triggered
+    // status syncs alone does not work, and the failure modes are not subtle -- a stale want latch
+    // pins the unit and one hart never runs again; clearing the bit on grant instead makes the pair
+    // trade the unit 16.7 million times without either ever issuing. Sampling levels on a clock is
+    // the structure that matches the hardware.
+    vp::ClockEvent arb_event;
 
     std::vector<vp::IoSlave *> in_itf;
     std::vector<vp::IoMaster *> out_itf;
@@ -148,6 +163,8 @@ private:
     // so a hand-over alternates instead of letting one hart re-take the unit forever.
     int free_holder;
     int free_last;
+    // Cycle each hart last asserted its request, for the level expiry described on wants().
+    std::vector<int64_t> want_ts;
 
     // ---- diagnostics (SPATZ_LOCK_STATS=1) ----
     // Without these a run only proves "did not crash": if the two harts never actually contend, the
@@ -165,7 +182,7 @@ private:
 };
 
 SpatzLock::SpatzLock(vp::ComponentConf &config)
-    : vp::Component(config)
+    : vp::Component(config), arb_event(this, &SpatzLock::arb_handler)
 {
     this->traces.new_trace("trace", &this->trace, vp::DEBUG);
 
@@ -178,6 +195,7 @@ SpatzLock::SpatzLock(vp::ComponentConf &config)
 
     this->status.resize(this->nb_hosts, 0);
     this->granted.resize(this->nb_hosts, 0);
+    this->want_ts.resize(this->nb_hosts, INT64_MIN);
 
     for (int h = 0; h < this->nb_hosts; h++)
     {
@@ -215,6 +233,7 @@ void SpatzLock::reset(bool active)
         for (int h = 0; h < this->nb_hosts; h++)
         {
             this->status[h] = 0;
+            this->want_ts[h] = INT64_MIN;
             this->granted[h] = -1;      // force the first push_grants() to actually push
         }
         const char *stats_env = getenv("SPATZ_LOCK_STATS");
@@ -287,6 +306,44 @@ bool SpatzLock::lsu_busy()
     return false;
 }
 
+bool SpatzLock::wants(int host)
+{
+    if (this->status[host] & 1)
+    {
+        return true;        // work in flight: the unit is in use, not merely requested
+    }
+    if ((this->status[host] & 2) == 0)
+    {
+        return false;
+    }
+    // A request level counts only while it is being refreshed. The core republishes it on every
+    // stalled retry, so "asserted no later than the previous cycle" is still asking; anything older
+    // is a hart that has moved on.
+    return this->want_ts[host] + 1 >= this->clock.get_cycles();
+}
+
+void SpatzLock::arb_schedule()
+{
+    if (this->arb_event.is_enqueued())
+    {
+        return;
+    }
+    for (int h = 0; h < this->nb_hosts; h++)
+    {
+        if (this->status[h] != 0)
+        {
+            this->arb_event.enqueue(1);
+            return;
+        }
+    }
+}
+
+void SpatzLock::arb_handler(vp::Block *__this, vp::ClockEvent *event)
+{
+    SpatzLock *_this = (SpatzLock *)__this;
+    _this->update();
+}
+
 void SpatzLock::push_grants()
 {
     std::vector<int> next(this->nb_hosts, 0);
@@ -313,40 +370,22 @@ void SpatzLock::push_grants()
                 }
                 break;
             }
-            // One hart at a time. Release rule, and this is the subtle part: the holder is kept
-            // while it has work IN FLIGHT (bit0), but NOT merely because it still has its "wanting
-            // to issue" bit set. That bit is a latch -- it is published when a hart stalls on the
-            // gate and only cleared when it actually enqueues or retires a vector instruction -- so
-            // a hart that stalls, gets the grant and is then diverted (a barrier IRQ, a branch out
-            // of the loop) would otherwise keep bit1 asserted forever and pin the unit, starving
-            // its partner permanently. Observed as exactly that: hart 3 never finishing while its
-            // CC partner sat at the final barrier. The RTL has no such latch -- acc_qvalid is a
-            // level that simply deasserts -- so keying retention on bit0 is also the faithful
-            // reading. An idle holder is therefore handed over as soon as anyone else asks, and
-            // kept otherwise so a grant is not revoked before its owner can use it.
-            if (this->free_holder >= 0 && !(this->status[this->free_holder] & 1))
+            // One hart at a time, recomputed from the current levels. The holder keeps the unit for
+            // as long as it is still using it or still asking (rr_arb_tree's LockIn: the RTL arbiter
+            // cannot switch away from its chosen requester before the transfer completes); it drops
+            // out the moment it does neither, which for a request level means the cycle after it
+            // stops refreshing.
+            if (this->free_holder >= 0 && !this->wants(this->free_holder))
             {
-                bool other_wants = false;
-                for (int h = 0; h < this->nb_hosts; h++)
-                {
-                    if (h != this->free_holder && this->status[h] != 0)
-                    {
-                        other_wants = true;
-                        break;
-                    }
-                }
-                if (other_wants || this->status[this->free_holder] == 0)
-                {
-                    this->free_last = this->free_holder;
-                    this->free_holder = -1;
-                }
+                this->free_last = this->free_holder;
+                this->free_holder = -1;
             }
             if (this->free_holder < 0)
             {
                 for (int i = 1; i <= this->nb_hosts; i++)
                 {
                     int h = (this->free_last + i) % this->nb_hosts;
-                    if (this->status[h] != 0)
+                    if (this->wants(h))
                     {
                         this->free_holder = h;
                         this->n_handover++;
@@ -397,6 +436,7 @@ void SpatzLock::update()
     }
 
     this->push_grants();
+    this->arb_schedule();
 }
 
 uint32_t SpatzLock::lock_op(int host, bool is_acquire)
@@ -528,6 +568,11 @@ void SpatzLock::status_sync(vp::Block *__this, int value, int host)
 {
     SpatzLock *_this = (SpatzLock *)__this;
     _this->status[host] = value;
+
+    if (value & 2)
+    {
+        _this->want_ts[host] = _this->clock.get_cycles();
+    }
 
     if ((value & 2) && _this->granted[host] == 0)
     {

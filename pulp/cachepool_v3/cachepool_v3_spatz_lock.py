@@ -11,6 +11,8 @@
 # Model of cachepool_spatz_lock.sv / acc_mux.sv (RTL branch dev/multi-scalar).
 #
 
+import os
+
 import gvsoc.systree
 
 # Offsets inside the cluster peripheral window, cachepool_peripheral_reg_pkg.sv /
@@ -47,7 +49,10 @@ class CachepoolV3SpatzLock(gvsoc.systree.Component):
             # acc_mux's lsu_busy_q: in Free mode no new acc grant is offered to EITHER hart while a
             # vector load/store is still draining (spatz_mem_finished is per drained op). This is the
             # dominant Free-mode cost for load-bound kernels; False disables it for A/B.
-            'free_mode_lsu_gate': free_mode_lsu_gate,
+            # SPATZ_LOCK_NO_LSU_GATE=1 disables it for A/B — the difference between the two runs is
+            # exactly what acc_mux's Free-mode serialisation costs.
+            'free_mode_lsu_gate': (free_mode_lsu_gate
+                                   and os.environ.get('SPATZ_LOCK_NO_LSU_GATE', '0') == '0'),
         })
 
     def i_INPUT(self, host: int) -> gvsoc.systree.SlaveItf:
