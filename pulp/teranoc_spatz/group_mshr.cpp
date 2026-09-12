@@ -66,6 +66,7 @@
 #include <vp/itf/io_v2.hpp>
 
 #include "l1_interconnect/floonoc.hpp"
+#include "mshr_request_order.hpp"
 
 class GroupMshr : public vp::Component
 {
@@ -212,6 +213,8 @@ private:
 
     // ---------------- door (request path)
     vp::IoReqStatus handle_request(L1NocFlit *flit, int lane);
+    vp::IoReqStatus admit_request(L1NocFlit *flit, int lane);
+    void arbitrate_requests();
     vp::IoReqStatus passthrough(L1NocFlit *flit, int lane);
     int mshr_bank_of(uint64_t addr, bool is_single) const;
     Entry *find_hit(int bank, uint64_t base_addr, int burst_len, int tgt_group);
@@ -389,7 +392,17 @@ private:
     // (presenting next cycle), 2=presenting (resend is processed).
     std::vector<int> req_spill_state;
     std::vector<L1NocFlit *> req_spill_flit;
-    int alloc_rr = 0;                          // lane RR base for allocation
+    bool legacy_request_schedule = false;
+    bool trace_request_schedule = false;
+    int64_t last_request_arbitration = -1;
+    std::vector<std::vector<int>> request_orders;
+    // Borrowed requests: ownership remains upstream until GRANTED. Collect
+    // one clock's presentations before arbitrating, rather than granting the
+    // first C++ callback. This is an admission timing approximation, not an
+    // additional modeled RTL SpillReqIn register.
+    std::vector<L1NocFlit *> request_pending;
+    std::vector<L1NocFlit *> request_dispatch;
+    std::vector<int64_t> request_presented_cycle;
     int64_t last_spill_move = -1;              // cycle-gate for the resp_in spill move
     int replay_rr = 0;                         // entry RR base for hold replay
     int drain_rr = 0;                          // entry RR base for drain
@@ -962,6 +975,17 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
         return value == nullptr || atoi(value) != 0;
     };
     this->one_merge_per_bank = enabled("TERANOC_MSHR_ONE_MERGE_PER_BANK");
+    const char *legacy_schedule = getenv("TERANOC_MSHR_LEGACY_SCHEDULE");
+    this->legacy_request_schedule = legacy_schedule && atoi(legacy_schedule);
+    const char *schedule_trace = getenv("TERANOC_MSHR_ARB_TRACE");
+    this->trace_request_schedule = schedule_trace && atoi(schedule_trace);
+    if (!this->legacy_request_schedule)
+        for (int base = 0; base < this->nb_lanes; ++base)
+            this->request_orders.push_back(teranoc::mshr_request_order(
+                this->nb_lanes, this->nb_ports_per_tile, base));
+    this->request_pending.resize(this->nb_lanes, nullptr);
+    this->request_dispatch.resize(this->nb_lanes, nullptr);
+    this->request_presented_cycle.resize(this->nb_lanes, -1);
     this->single_fetch_hold = enabled("TERANOC_MSHR_SINGLE_FETCH_HOLD");
     const char *relaxed_tags = getenv("TERANOC_MSHR_DISTRIBUTED_TAGS");
     this->distributed_rob_tags = enabled("TERANOC_VLSU_DISTRIBUTED_ROB") &&
@@ -1322,7 +1346,7 @@ vp::IoReqStatus GroupMshr::req_in(vp::Block *__this, vp::IoReq *req, int lane)
             return vp::IO_REQ_DENIED;
         }
         // st == 2 and this is the presenting flit: process it now.
-        vp::IoReqStatus rst = _this->handle_request(flit, lane);
+        vp::IoReqStatus rst = _this->admit_request(flit, lane);
         if (rst != vp::IO_REQ_DENIED)
         {
             // Accepted: register frees for the next flit.
@@ -1331,7 +1355,54 @@ vp::IoReqStatus GroupMshr::req_in(vp::Block *__this, vp::IoReq *req, int lane)
         }
         return rst;
     }
-    return _this->handle_request(flit, lane);
+    return _this->admit_request(flit, lane);
+}
+
+vp::IoReqStatus GroupMshr::admit_request(L1NocFlit *flit, int lane)
+{
+    uint64_t size = flit->get_size(), addr = flit->get_addr();
+    bool single = size <= 4;
+    bool eligible = flit->get_opcode() == vp::READ && !flit->get_is_write() &&
+        this->cfg_enable && (single ?
+            (this->enable_single && this->hold_subs_single > 1 && (addr & 3) + size <= 4) :
+            (this->hold_subs_burst > 1 && (addr & (this->max_burst_words * 4 - 1)) == 0));
+    bool dispatched = this->request_dispatch[lane] == flit;
+    this->request_dispatch[lane] = nullptr;
+    if (!this->legacy_request_schedule && eligible && !dispatched)
+    {
+        if (this->request_pending[lane] == nullptr)
+        {
+            this->request_pending[lane] = flit;
+            this->request_presented_cycle[lane] = this->clock.get_cycles();
+        }
+        this->fsm_event.enqueue(1);
+        return vp::IO_REQ_DENIED;
+    }
+    auto status = this->handle_request(flit, lane);
+    if (this->trace_request_schedule && dispatched)
+        teranoc_telemetry::emit(*this, this->clock.get_cycles(), 20,
+            lane, this->mshr_bank_of(addr, single), status);
+    if (status != vp::IO_REQ_DENIED && this->request_pending[lane] == flit)
+        this->request_pending[lane] = nullptr;
+    return status;
+}
+
+void GroupMshr::arbitrate_requests()
+{
+    int64_t now = this->clock.get_cycles();
+    if (this->legacy_request_schedule || this->last_request_arbitration == now) return;
+    this->last_request_arbitration = now;
+    // RTL's allocation base advances even while idle; event invocation count
+    // must not be used as the rotation clock. Both ports share that base.
+    const auto &order = this->request_orders[now % this->nb_lanes];
+    for (int lane : order)
+    {
+        if (!this->request_pending[lane] || this->request_presented_cycle[lane] >= now) continue;
+        this->lane_retry_owed[lane] = false;
+        this->request_dispatch[lane] = this->request_pending[lane];
+        this->req_in_v[lane]->retry(vp::IO_RETRY_ANY);
+        this->request_dispatch[lane] = nullptr;
+    }
 }
 
 vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
@@ -1351,6 +1422,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
     // globally invalidates the response cache.
     if (opc != vp::READ)
     {
+        std::vector<int> amo_cached_matches;
         if (opc == vp::WRITE && burst_len == 1 &&
             (!getenv("TERANOC_MSHR_CACHE_STORE_UPDATE") || atoi(getenv("TERANOC_MSHR_CACHE_STORE_UPDATE"))))
         {
@@ -1365,13 +1437,27 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             teranoc_telemetry::emit(*this,this->clock.get_cycles(),19,addr,opc,cached);
             if (!invalidate && this->resp_cache) {
                 for (int e=0;e<(int)this->entries.size();++e)
-                    if (this->entries[e].valid && this->entries[e].state==ST_CACHED)
+                    if (this->entries[e].valid && this->entries[e].state==ST_CACHED) {
                         teranoc_telemetry::emit(*this,this->clock.get_cycles(),13,e,addr,opc);
+                        // RTL bacf64bb: only an accepted AMO reaching this
+                        // key and target group violates cache_amo_never_hits.
+                        if (this->entries[e].base_addr == (addr & ~uint64_t(3)) &&
+                            this->entries[e].tgt_group == int((addr >> 10) & (this->nb_groups - 1)))
+                            amo_cached_matches.push_back(e);
+                    }
             }
             if (invalidate) this->amo_invalidate_all();
         }
         flit->mshr_tag = 0;
-        return this->passthrough(flit, lane);
+        auto status = this->passthrough(flit, lane);
+        if (opc >= vp::SWAP && status != vp::IO_REQ_DENIED)
+        {
+            teranoc_telemetry::emit(*this, this->clock.get_cycles(), 24,
+                addr, opc, amo_cached_matches.size());
+            for (int entry : amo_cached_matches)
+                teranoc_telemetry::emit(*this, this->clock.get_cycles(), 23, entry, addr, opc);
+        }
+        return status;
     }
 
     // Misaligned bursts are barred from merging (RTL clamps them to len 1 and
@@ -2409,6 +2495,7 @@ void GroupMshr::door_handler(vp::Block *__this, vp::ClockEvent *)
     _this->drain_cycle();
     _this->replay_holds();
     _this->serve_timeouts(_this->clock.get_cycles());
+    _this->arbitrate_requests();
 
     // Wake lanes stalled at the door or by a full response buffer.
     for (int lane = 0; lane < _this->nb_lanes; lane++)
@@ -2416,7 +2503,8 @@ void GroupMshr::door_handler(vp::Block *__this, vp::ClockEvent *)
         if (_this->lane_retry_owed[lane])
         {
             _this->lane_retry_owed[lane] = false;
-            _this->req_in_v[lane]->retry(vp::IO_RETRY_ANY);
+            if (!_this->request_pending[lane])
+                _this->req_in_v[lane]->retry(vp::IO_RETRY_ANY);
             _this->resp_in_v[lane]->retry(vp::IO_RETRY_ANY);
         }
     }
@@ -2439,7 +2527,7 @@ void GroupMshr::door_handler(vp::Block *__this, vp::ClockEvent *)
     {
         for (int lane = 0; lane < _this->nb_lanes; lane++)
         {
-            if (_this->lane_retry_owed[lane])
+            if (_this->lane_retry_owed[lane] || _this->request_pending[lane])
             {
                 work = true;
                 break;
