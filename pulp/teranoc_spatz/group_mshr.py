@@ -48,12 +48,13 @@ class GroupMshr(gvsoc.systree.Component):
             spill: int = 1, spill_req_in: int = 0, cfg_enable_reset: int = 1,
             auto_bypass: int = 0, auto_bypass_threshold: int = 4,
             auto_bypass_probe: int = 16, auto_probe_window: int = 255,
-            nb_groups: int = 16, nb_x_groups: int = 4, max_burst_words: int = 16):
+            nb_groups: int = 16, nb_x_groups: int = 4, max_burst_words: int = 16, num_banks_per_tile: int = 16):
         super().__init__(parent, name)
 
         self.add_sources(['pulp/teranoc_spatz/group_mshr.cpp'])
         self.add_properties({
             'nb_lanes': nb_lanes,
+            'num_banks_per_tile': num_banks_per_tile,
             'nb_tiles_per_group': nb_tiles_per_group,
             'nb_inter_group_ports_per_tile': nb_inter_group_ports_per_tile,
             'num_entries': num_entries,

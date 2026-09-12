@@ -21,7 +21,7 @@
  *
  * Position (mempool_group.sv): on the NoC-bound remote lanes only — per-tile
  * ports [NumRemoteReqPortsPerTile-1:1]; intra-group traffic bypasses it. Both
- * single-word and (aligned) burst loads allocate/merge; stores/AMOs pass
+ * single-word and tile-contained burst loads allocate/merge; stores/AMOs pass
  * through (a store write-updates a matching CACHED word and an AMO globally
  * invalidates the response cache).
  *
@@ -288,6 +288,7 @@ private:
     int nb_groups;
     int nb_x_groups;
     int max_burst_words;
+    int num_banks_per_tile;
     int nb_banks;
     int spill;   // 1: +1-cycle spill register on req_out/resp_in/resp_out
                  // (RTL SpillReqOut/SpillRespIn/SpillRespOut default 1). 0: off.
@@ -924,6 +925,8 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->nb_groups = cfg->get_int("nb_groups");
     this->nb_x_groups = cfg->get_int("nb_x_groups");
     this->max_burst_words = cfg->get_int("max_burst_words");
+    this->num_banks_per_tile = cfg->get_int("num_banks_per_tile");
+    if (this->num_banks_per_tile <= 0) this->trace.fatal("Missing tile bank geometry\n");
     this->nb_banks = this->num_entries / this->ways_per_bank;
     {
         const char *wpp = getenv("TERANOC_MSHR_WIN_PERIOD");
@@ -1365,7 +1368,9 @@ vp::IoReqStatus GroupMshr::admit_request(L1NocFlit *flit, int lane)
     bool eligible = flit->get_opcode() == vp::READ && !flit->get_is_write() &&
         this->cfg_enable && (single ?
             (this->enable_single && this->hold_subs_single > 1 && (addr & 3) + size <= 4) :
-            (this->hold_subs_burst > 1 && (addr & (this->max_burst_words * 4 - 1)) == 0));
+            (this->hold_subs_burst > 1 && addr % 4 == 0 && size % 4 == 0 &&
+             size <= this->max_burst_words * 4 &&
+             (addr / 4) % this->num_banks_per_tile + size / 4 <= this->num_banks_per_tile));
     bool dispatched = this->request_dispatch[lane] == flit;
     this->request_dispatch[lane] = nullptr;
     if (!this->legacy_request_schedule && eligible && !dispatched)
@@ -1460,17 +1465,14 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
         return status;
     }
 
-    // Misaligned bursts are barred from merging (RTL clamps them to len 1 and
-    // bypasses with the original burst_len).
-    bool aligned = (addr & (uint64_t)(this->max_burst_words * 4 - 1)) == 0;
-    bool mergeable = (is_load && this->enable_single) || (is_load && is_burst && aligned);
-    // A single merge key covers exactly one word; a cross-word unaligned
-    // access must retain the ordinary transport's splitting semantics.
+    // Requests here retain full byte addresses. Only contained exact ranges are legal.
+    bool contained = addr % 4 == 0 && size % 4 == 0 &&
+        burst_len <= this->max_burst_words &&
+        (addr / 4) % this->num_banks_per_tile + burst_len <= this->num_banks_per_tile;
+    if (is_load && is_burst && !contained)
+        this->trace.fatal("MSHR invalid crossing/oversized burst: addr=0x%lx size=%lu\n", addr, size);
+    bool mergeable = is_load && (is_burst || this->enable_single);
     if (!is_burst && (addr & 3) + size > 4) mergeable = false;
-    if (is_load && is_burst && !aligned)
-    {
-        mergeable = false;
-    }
     if (is_load && !is_burst && !this->enable_single)
     {
         mergeable = false;
@@ -1527,8 +1529,8 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
     // unreachable, 100% of lines aged out holding a way for the full
     // serve_timeout, and 82.9M bank-full denials.
     //
-    // Bursts are already MaxBurstWords-aligned by the VLSU admission rule, so the
-    // mask is a no-op for them; fp32 lands entirely at offset 0 and is unaffected.
+    // Burst keys retain the exact word-aligned start, including the bank offset.
+    // Registered and allocation-forwarding matches also compare length and group.
     uint64_t base_addr = addr & ~(uint64_t)3;
 
     this->stat_reqs++;
@@ -1913,7 +1915,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
         return vp::IO_REQ_DENIED;
     }
 
-    // Not mergeable (stores/AMOs handled above; misaligned bursts here).
+    // Not mergeable (stores/AMOs handled above; non-mergeable loads here).
     flit->mshr_tag = 0;
     return this->passthrough(flit, lane);
 }

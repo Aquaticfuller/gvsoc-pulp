@@ -79,6 +79,8 @@ private:
     vp::ClockEvent resp_retry_event{this, &TeranocL1BurstExpander::resp_retry_handler};
 
     int issue_width;
+    int num_banks_per_tile;
+    int max_burst_words;
     int nb_contexts;
     bool interleave;
 
@@ -116,6 +118,10 @@ TeranocL1BurstExpander::TeranocL1BurstExpander(vp::ComponentConf &config)
     this->traces.new_trace("trace", &this->trace, vp::DEBUG);
     this->new_slave_port("input", &this->in);
 
+    this->num_banks_per_tile = this->get_js_config()->get_int("num_banks_per_tile");
+    this->max_burst_words = this->get_js_config()->get_int("max_burst_words");
+    if (this->num_banks_per_tile <= 0 || this->max_burst_words <= 0)
+        this->trace.fatal("Missing burst geometry\n");
     this->issue_width = this->get_js_config()->get_int("issue_width");
     if (this->issue_width <= 0)
         this->issue_width = 1;
@@ -145,6 +151,12 @@ vp::IoReqStatus TeranocL1BurstExpander::in_req(vp::Block *__this, vp::IoReq *req
 
     int nb_words = ((int)req->get_size() + 3) / 4;
     bool is_burst = nb_words > 1 && !req->get_is_write();
+
+    if (is_burst && (req->get_addr() % 4 || req->get_size() % 4 ||
+        nb_words > _this->max_burst_words ||
+        (req->get_addr() / 4) % _this->num_banks_per_tile + nb_words > _this->num_banks_per_tile))
+        _this->trace.fatal("Expander invalid crossing/oversized burst: addr=0x%lx size=%lu\n",
+            req->get_addr(), req->get_size());
 
     if (!is_burst)
     {

@@ -46,6 +46,7 @@ class SnitchMempoolConfig(RiscvConfig):
     # Spatz port-0 burst loads (RTL spatz_vlsu.sv). All off/zero = legacy behavior.
     vlsu_burst_enable: int = cfg_field(default=0, dump=True,
         desc="Enable port-0 64B burst loads (vector only).")
+    vlsu_burst_tile_banks: int = cfg_field(default=16, dump=True, desc="SRAM banks per tile stripe.")
     vlsu_burst_max_words: int = cfg_field(default=16, dump=True,
         desc="Words per full burst (RTL MaxBurstWords).")
     vlsu_burst_rob_depth: int = cfg_field(default=64, dump=True,
@@ -217,6 +218,7 @@ class SnitchMempool(RiscvCommon):
                 reduction_is_serial=True, reduction_step_latency=3,
                 vlsu_burst_enable=config.vlsu_burst_enable,
                 vlsu_burst_max_words=config.vlsu_burst_max_words,
+                vlsu_burst_tile_banks=config.vlsu_burst_tile_banks,
                 vlsu_burst_rob_depth=config.vlsu_burst_rob_depth,
                 vlsu_burst_block_alloc=config.vlsu_burst_block_alloc,
                 vlsu_burst_dual_load=config.vlsu_burst_dual_load,

@@ -109,7 +109,7 @@ class L1_subsystem(gvsoc.systree.Component):
             if burst_enable:
                 # RTL i_local_burst_expander (IssueWidth=1) on the local path.
                 local_exp = TeranocL1BurstExpander(self, f'local_burst_exp{i}',
-                    issue_width=burst_local_issue, interleave=burst_interleave)
+                    issue_width=burst_local_issue, interleave=burst_interleave, num_banks_per_tile=nb_banks_per_tile)
                 shim.o_TCDM_LOCAL(local_exp.i_INPUT())
                 assert burst_local_issue == 1
                 local_exp.o_OUTPUT(0, bank_interco.i_NARROW(i))
@@ -130,7 +130,7 @@ class L1_subsystem(gvsoc.systree.Component):
                     # RTL i_remote_burst_expander (IssueWidth = nr response
                     # ports): one bank-interco narrow input per issue lane.
                     exp = TeranocL1BurstExpander(self, f'{kind}_burst_exp{i}',
-                        issue_width=burst_remote_issue, interleave=burst_interleave)
+                        issue_width=burst_remote_issue, interleave=burst_interleave, num_banks_per_tile=nb_banks_per_tile)
                     self.itf_bind(f'{kind}_in_{i}', exp.i_INPUT(),
                         signature=IoV2SingleReq(), composite_bind=True)
                     for lane in range(burst_remote_issue):

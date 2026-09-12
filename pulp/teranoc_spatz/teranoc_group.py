@@ -98,6 +98,7 @@ class TeranocGroup(st.Component):
         group_mshr = None
         if arch.group_mshr.enable:
             group_mshr = GroupMshr(self, 'group_mshr',
+                num_banks_per_tile=arch.nb_banks_per_tile,
                 nb_lanes=(arch.nb_tiles_per_group * arch.nb_inter_group_ports_per_tile),
                 nb_tiles_per_group=arch.nb_tiles_per_group,
                 nb_inter_group_ports_per_tile=arch.nb_inter_group_ports_per_tile,

@@ -166,6 +166,7 @@ class TeranocTile(st.Component):
                 # Spatz port-0 burst loads (teranoc_spatz)
                 core_config.vlsu_burst_enable = int(arch.vlsu_burst.enable)
                 core_config.vlsu_burst_max_words = arch.vlsu_burst.max_burst_words
+                core_config.vlsu_burst_tile_banks = arch.nb_banks_per_tile
                 core_config.vlsu_burst_rob_depth = arch.vlsu_burst.rob_depth
                 core_config.vlsu_burst_block_alloc = int(arch.vlsu_burst.block_alloc)
                 core_config.vlsu_burst_dual_load = arch.vlsu_burst.dual_load

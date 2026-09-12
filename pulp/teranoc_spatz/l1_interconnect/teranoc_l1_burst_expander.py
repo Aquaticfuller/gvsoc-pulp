@@ -27,12 +27,14 @@ class TeranocL1BurstExpander(gvsoc.systree.Component):
     when enabled."""
 
     def __init__(self, parent: gvsoc.systree.Component, name: str,
-            issue_width: int = 1, interleave: bool = True):
+            issue_width: int = 1, interleave: bool = True, num_banks_per_tile: int = 16, max_burst_words: int = 16):
         super().__init__(parent, name)
 
         self.add_sources(['pulp/teranoc_spatz/l1_interconnect/teranoc_l1_burst_expander.cpp'])
         self.add_properties({
             'issue_width': issue_width,
+            'num_banks_per_tile': num_banks_per_tile,
+            'max_burst_words': max_burst_words,
             'interleave': int(interleave),
         })
 
