@@ -1,3 +1,4 @@
+#include <vp/teranoc_telemetry.hpp>
 /*
  * Copyright (C) 2026 ETH Zurich and University of Bologna
  *
@@ -330,6 +331,7 @@ vp::IoReqStatus L1_NocItf::handle_core_req(vp::IoReq *req, int port)
         return vp::IO_REQ_DENIED;
     }
 
+    teranoc_telemetry::emit(*this, cycles, 11, 0, port, 1);
     this->held_injection[port] = nullptr;
     this->noc_req_output_blocked[port] = false;
     this->core_retry_owed[port] = false;
@@ -363,6 +365,7 @@ vp::IoReqStatus L1_NocItf::handle_noc_req(L1NocFlit *flit, int port)
         return vp::IO_REQ_DENIED;
     }
 
+    teranoc_telemetry::emit(*this, cycles, 11, 1, port, 1);
     this->target_retry_owed[port] = false;
     this->held_target_flit[port] = nullptr;
     if (status == vp::IO_REQ_DONE)
@@ -418,6 +421,7 @@ bool L1_NocItf::complete_tcdm(vp::IoReq *req, L1NocFlit *flit, int port)
 
     int64_t delay = full_latency + this->outgoing_response_latency;
     this->response_queues[response_port]->push_delayed(flit, delay);
+    teranoc_telemetry::emit(*this, cycle, 11, 3, response_port, 1);
     this->response_accept_cycle[response_port] = cycle;
     if (delay == 0 && this->blocked_response_output[response_port] == nullptr)
     {
@@ -516,6 +520,7 @@ vp::IoRespAck L1_NocItf::tcdm_response(vp::Block *__this, vp::IoReq *req, int po
         // let latency annotations from the request path account twice.
         int64_t delay = _this->outgoing_response_latency;
         _this->response_queues[response_port]->push_delayed(resp_flit, delay);
+        teranoc_telemetry::emit(*_this, cycle, 11, 3, response_port, 1);
         _this->response_accept_cycle[response_port] = cycle;
         if (delay == 0 && _this->blocked_response_output[response_port] == nullptr)
         {
@@ -636,6 +641,7 @@ vp::IoReqStatus L1_NocItf::handle_noc_resp(L1NocFlit *flit, int port)
         return vp::IO_REQ_DENIED;
     }
 
+    teranoc_telemetry::emit(*this, cycle, 11, 2, port, 1);
     this->core_blocked_response_inputs[source_port][port] = false;
     delete flit;
     return vp::IO_REQ_DONE;

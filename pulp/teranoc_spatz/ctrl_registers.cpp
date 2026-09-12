@@ -1,3 +1,4 @@
+#include <vp/teranoc_telemetry.hpp>
 /*
  * Copyright (C) 2026 ETH Zurich and University of Bologna
  *
@@ -155,6 +156,7 @@ vp::IoReqStatus CtrlRegisters::req(vp::Block *__this, vp::IoReq *req)
         {
             _this->eoc_reached = true;
             uint32_t retval = value >> 1;
+            teranoc_telemetry::emit(*_this, _this->clock.get_cycles(), 15, retval);
             int dpi_errors = 0;
             std::cout << "EOC register return value: 0x" << std::hex
                       << ((value - 1) >> 1) << std::dec << std::endl;

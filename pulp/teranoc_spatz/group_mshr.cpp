@@ -1,3 +1,4 @@
+#include <vp/teranoc_telemetry.hpp>
 /*
  * Copyright (C) 2026 ETH Zurich and University of Bologna
  *
@@ -73,6 +74,11 @@ public:
     ~GroupMshr() override;
 
 private:
+    void telemetry_snapshot();
+    struct TelemetryGuard {
+        GroupMshr *p;
+        ~TelemetryGuard() { if (teranoc_telemetry::sink()) p->telemetry_snapshot(); }
+    };
     // ---------------- per-subscriber record (owner + merged requesters)
     struct Sub
     {
@@ -202,7 +208,7 @@ private:
     // in which case every retirement lands in ONE window and time evolution is
     // invisible. TERANOC_MSHR_WIN_PERIOD makes it resolvable.
     int win_period = 8192;
-    void reset(bool active) override { if (active) { this->hb_event.enqueue(65536); this->win_event.enqueue(this->win_period); } }
+    void reset(bool active) override { if (active) { if(teranoc_telemetry::sink()) telemetry_snapshot(); this->hb_event.enqueue(65536); this->win_event.enqueue(this->win_period); } }
 
     // ---------------- door (request path)
     vp::IoReqStatus handle_request(L1NocFlit *flit, int lane);
@@ -1095,6 +1101,7 @@ void GroupMshr::cfg_apply(int idx, bool is_write, uint32_t data, uint32_t *rdata
         const char *p = getenv("TERANOC_MSHR_CSR_LOG");
         if (p) csrlog = fopen(p, "w");
     }
+    TelemetryGuard telemetry_guard{this};
     uint32_t status_before = this->cfg_status;
 
     *rdata = 0;
@@ -1289,6 +1296,7 @@ int GroupMshr::mshr_bank_of(uint64_t addr, bool is_single) const
 vp::IoReqStatus GroupMshr::req_in(vp::Block *__this, vp::IoReq *req, int lane)
 {
     auto *_this = static_cast<GroupMshr *>(__this);
+    TelemetryGuard telemetry_guard{_this};
     auto *flit = static_cast<L1NocFlit *>(req);
 
     // req_in spill register (SpillReqIn, bypassed in the shipping RTL since
@@ -1343,13 +1351,24 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
     // globally invalidates the response cache.
     if (opc != vp::READ)
     {
-        if (opc == vp::WRITE && burst_len == 1)
+        if (opc == vp::WRITE && burst_len == 1 &&
+            (!getenv("TERANOC_MSHR_CACHE_STORE_UPDATE") || atoi(getenv("TERANOC_MSHR_CACHE_STORE_UPDATE"))))
         {
             this->store_update(addr, flit->burst ? flit->burst->get_data() : nullptr, size);
         }
         if (opc >= vp::SWAP)
         {
-            this->amo_invalidate_all();
+            bool invalidate = !getenv("TERANOC_MSHR_CACHE_AMO_INVAL") ||
+                atoi(getenv("TERANOC_MSHR_CACHE_AMO_INVAL"));
+            int cached=0;
+            for (const Entry &e : this->entries) cached += e.valid && e.state==ST_CACHED;
+            teranoc_telemetry::emit(*this,this->clock.get_cycles(),19,addr,opc,cached);
+            if (!invalidate && this->resp_cache) {
+                for (int e=0;e<(int)this->entries.size();++e)
+                    if (this->entries[e].valid && this->entries[e].state==ST_CACHED)
+                        teranoc_telemetry::emit(*this,this->clock.get_cycles(),13,e,addr,opc);
+            }
+            if (invalidate) this->amo_invalidate_all();
         }
         flit->mshr_tag = 0;
         return this->passthrough(flit, lane);
@@ -1999,6 +2018,7 @@ void GroupMshr::replay_holds()
 void GroupMshr::req_out_retry(vp::Block *__this, int lane, vp::IoRetryChannel)
 {
     auto *_this = static_cast<GroupMshr *>(__this);
+    TelemetryGuard telemetry_guard{_this};
     if (FILE *lf = lane_log())
     {
         fprintf(lf, "UNBLOCK %s cyc=%ld lane=%d\n", _this->get_path().c_str(),
@@ -2043,6 +2063,7 @@ vp::IoRespAck GroupMshr::req_out_resp(vp::Block *__this, vp::IoReq *, int)
 vp::IoReqStatus GroupMshr::resp_in(vp::Block *__this, vp::IoReq *req, int lane)
 {
     auto *_this = static_cast<GroupMshr *>(__this);
+    TelemetryGuard telemetry_guard{_this};
     auto *flit = static_cast<L1NocFlit *>(req);
     return _this->capture_response(flit, lane);
 }
@@ -2339,6 +2360,7 @@ void GroupMshr::hb_handler(vp::Block *__this, vp::ClockEvent *)
 void GroupMshr::door_handler(vp::Block *__this, vp::ClockEvent *)
 {
     auto *_this = static_cast<GroupMshr *>(__this);
+    TelemetryGuard telemetry_guard{_this};
 
     if (_this->spill_req_in)
     {
@@ -3124,6 +3146,7 @@ void GroupMshr::resp_in_retry(vp::Block *__this, int lane, vp::IoRetryChannel)
 void GroupMshr::resp_out_retry(vp::Block *__this, int lane, vp::IoRetryChannel)
 {
     auto *_this = static_cast<GroupMshr *>(__this);
+    TelemetryGuard telemetry_guard{_this};
     _this->resp_out_blocked[lane] = false;
     L1NocFlit *held = _this->resp_out_held[lane];
     if (held != nullptr)
@@ -3157,4 +3180,36 @@ vp::IoRespAck GroupMshr::resp_out_resp(vp::Block *__this, vp::IoReq *, int)
 extern "C" vp::Component *gv_new(vp::ComponentConf &config)
 {
     return new GroupMshr(config);
+}
+
+// Observe callback-visible state transitions without changing scheduling. The
+// adapter integrates each state until the next change (including idle periods).
+void GroupMshr::telemetry_snapshot()
+{
+    struct Snapshot { std::vector<int> state, klass; std::vector<int64_t> csr; };
+    static std::map<const void *,Snapshot> last;
+    Snapshot &old=last[this];
+    if (old.state.empty()) {
+        old.state.resize(this->entries.size(),-1);
+        old.klass.resize(this->entries.size(),-1);
+        old.csr.resize(12,-1);
+        teranoc_telemetry::emit(*this,this->clock.get_cycles(),16,5,this->num_entries,this->ways_per_bank);
+    }
+    for (int i=0;i<(int)this->entries.size();++i) {
+        const Entry &e=this->entries[i];
+        int state=e.valid ? e.state : 0;
+        int klass=e.valid ? e.burst_len+((e.state==ST_WAIT_RESP && !e.issued)?65536:0) : 0;
+        if (old.state[i]!=state || old.klass[i]!=klass) {
+            teranoc_telemetry::emit(*this,this->clock.get_cycles(),5,i,state,klass);
+            old.state[i]=state;old.klass[i]=klass;
+        }
+    }
+    int64_t csr[]={this->cfg_enable,this->hold_subs_single,this->hold_subs_burst,
+        this->hold_window_single,this->hold_window_burst,this->bank_shift_single,
+        this->bank_shift_burst,this->bank_burst_bits,this->serve_timeout,
+        this->cache_reuse_target,this->cache_timeout,this->bankfull_bp};
+    for(int i=0;i<12;++i) if(old.csr[i]!=csr[i]) {
+        teranoc_telemetry::emit(*this,this->clock.get_cycles(),6,i,csr[i],this->cfg_status);
+        old.csr[i]=csr[i];
+    }
 }

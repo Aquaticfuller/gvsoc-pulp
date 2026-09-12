@@ -1,3 +1,4 @@
+#include <vp/teranoc_telemetry.hpp>
 /*
  * Copyright (C) 2026 ETH Zurich and University of Bologna
  *
@@ -134,6 +135,8 @@ bool TeranocL1NocRouter::link_req(vp::Block *__this, FloonocReqV2 *req, int inpu
 
 void TeranocL1NocRouter::fsm_handler(vp::Block *__this, vp::ClockEvent *) {
     auto *_this = static_cast<TeranocL1NocRouter *>(__this);
+    for(int d=0;d<4;++d) teranoc_telemetry::emit(*_this,_this->clock.get_cycles(),10,d,
+        _this->stalled_outputs[d] && !_this->output_queues[d]->empty());
     bool input_elected[DIR_NB] = {false};
     FloonocReqV2 *input_heads[DIR_NB] = {nullptr};
     int input_outputs[DIR_NB] = {-1, -1, -1, -1, -1};
@@ -223,6 +226,8 @@ void TeranocL1NocRouter::fsm_handler(vp::Block *__this, vp::ClockEvent *) {
     // only this output; all other outputs remain independently active.
     for (int output = 0; output < DIR_NB; output++) {
         progressed |= _this->drain_output(output);
+        if(output<4) teranoc_telemetry::emit(*_this,_this->clock.get_cycles(),10,output,
+            _this->stalled_outputs[output] && !_this->output_queues[output]->empty());
     }
 
 #ifdef CONFIG_GVSOC_STATS_ACTIVE
@@ -322,15 +327,19 @@ bool TeranocL1NocRouter::drain_output(int output) {
         }
     }
 #endif
+    if (output<4) teranoc_telemetry::emit(*this,cycles,9,output);
     if (this->output_ports[output].req(req)) {
         this->stalled_outputs[output] = true;
     }
+    if (output<4) teranoc_telemetry::emit(*this, cycles, 10, output,
+        this->stalled_outputs[output] && !this->output_queues[output]->empty());
     return true;
 }
 
 void TeranocL1NocRouter::link_unstall(vp::Block *__this, int output) {
     auto *_this = static_cast<TeranocL1NocRouter *>(__this);
     _this->stalled_outputs[output] = false;
+    if(output<4) teranoc_telemetry::emit(*_this,_this->clock.get_cycles(),10,output,0);
     // The RTL link's ready is combinational: the cycle the downstream frees a
     // FIFO slot, this output may already drive the next flit into it. Only
     // rescheduling the FSM would insert a one-cycle bubble on every
@@ -351,6 +360,7 @@ int TeranocL1NocRouter::get_output(int next_x, int next_y) {
 }
 
 void TeranocL1NocRouter::reset(bool active) {
+    if(active) teranoc_telemetry::emit(*this,0,16,9,this->x,this->y);
     if (active) {
         for (int direction = 0; direction < DIR_NB; direction++) {
             this->stalled_outputs[direction] = false;

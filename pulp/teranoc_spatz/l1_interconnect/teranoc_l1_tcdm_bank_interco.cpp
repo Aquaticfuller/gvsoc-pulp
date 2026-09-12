@@ -1,3 +1,4 @@
+#include <vp/teranoc_telemetry.hpp>
 /*
  * Copyright (C) 2026 ETH Zurich and University of Bologna
  *
@@ -230,6 +231,7 @@ TeranocL1TcdmBankInterco::TeranocL1TcdmBankInterco(vp::ComponentConf &config)
 }
 
 void TeranocL1TcdmBankInterco::reset(bool active) {
+    if(active) teranoc_telemetry::emit(*this,0,16,7,this->nb_banks);
     if (!active) {
         return;
     }
@@ -530,6 +532,7 @@ void TeranocL1TcdmBankInterco::unexpected_bank_retry(vp::Block *__this, int bank
 
 void TeranocL1TcdmBankInterco::accept_narrow(int bank, int input_id, vp::IoReq *req) {
     int64_t cycle = this->clock.get_cycles();
+    teranoc_telemetry::emit(*this, cycle, 7, bank, req->get_opcode());
     BankState &state = this->banks[bank];
     vp_assert_always(this->bank_can_accept(bank, cycle), &this->trace,
         "bank %d accepted a narrow request while unavailable\n", bank);
@@ -592,6 +595,7 @@ vp::IoRespStatus TeranocL1TcdmBankInterco::access_wide_lane(int bank,
     lane_req.set_memcheck_data_id(transaction->req->get_memcheck_data_id());
     lane_req.initiator = transaction->req->initiator;
 
+    teranoc_telemetry::emit(*this, this->clock.get_cycles(), 7, bank, lane_req.get_opcode());
     vp::IoReqStatus status = this->bank_itfs[bank]->req(&lane_req);
     vp_assert_always(status == vp::IO_REQ_DONE, &this->trace,
         "IoV2Sync L1 bank %d returned status %d\n", bank, status);
@@ -813,6 +817,18 @@ void TeranocL1TcdmBankInterco::fsm_handler(vp::Block *__this, vp::ClockEvent *) 
                                  cycle < _this->banks[bank].amo_block_until;
     }
 
+    for (int bank=0; bank<_this->nb_banks; ++bank) {
+        bool demand=false;
+        for (const auto &input : _this->narrow_inputs)
+            demand |= input.pending && input.target_bank==bank;
+        if (_this->active_wide) {
+            int offset=bank-_this->active_wide->superbank*_this->banks_per_superbank;
+            if (offset>=0 && offset<_this->banks_per_superbank)
+                demand |= _this->active_wide->pending_banks[offset];
+        }
+        if (demand && (blocked_at_start[bank] || !_this->bank_can_accept(bank,cycle)))
+            teranoc_telemetry::emit(*_this,cycle,8,bank);
+    }
     _this->try_wide_response();
     for (int input = 0; input < _this->nb_narrow_inputs; input++) {
         _this->try_narrow_response(input);

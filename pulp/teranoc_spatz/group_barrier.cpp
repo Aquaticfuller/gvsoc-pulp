@@ -1,3 +1,4 @@
+#include <vp/teranoc_telemetry.hpp>
 /*
  * Copyright (C) 2026 ETH Zurich and University of Bologna
  *
@@ -393,6 +394,7 @@ void GroupBarrier::release(int s)
 {
     // One response per tile per cycle: the first core of each tile goes now,
     // its tile-mates queue behind it.
+    teranoc_telemetry::emit(*this, this->clock.get_cycles(), 12, s, this->held[s].size());
     std::vector<bool> tile_taken(this->nb_tiles, false);
     for (Held &h : this->held[s])
     {
