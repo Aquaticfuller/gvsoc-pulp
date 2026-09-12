@@ -3274,7 +3274,11 @@ extern "C" vp::Component *gv_new(vp::ComponentConf &config)
 // adapter integrates each state until the next change (including idle periods).
 void GroupMshr::telemetry_snapshot()
 {
-    struct Snapshot { std::vector<int> state, klass; std::vector<int64_t> csr; };
+    struct Snapshot {
+        std::vector<int> state, klass;
+        std::vector<int64_t> csr;
+        uint64_t alloc = 0, merged = 0, cache_hits = 0;
+    };
     static std::map<const void *,Snapshot> last;
     Snapshot &old=last[this];
     if (old.state.empty()) {
@@ -3282,6 +3286,8 @@ void GroupMshr::telemetry_snapshot()
         old.klass.resize(this->entries.size(),-1);
         old.csr.resize(12,-1);
         teranoc_telemetry::emit(*this,this->clock.get_cycles(),16,5,this->num_entries,this->ways_per_bank);
+        // Explicit availability: zero events after registration means zero activity.
+        teranoc_telemetry::emit(*this,this->clock.get_cycles(),16,25,this->num_entries,0);
     }
     for (int i=0;i<(int)this->entries.size();++i) {
         const Entry &e=this->entries[i];
@@ -3291,6 +3297,19 @@ void GroupMshr::telemetry_snapshot()
             teranoc_telemetry::emit(*this,this->clock.get_cycles(),5,i,state,klass);
             old.state[i]=state;old.klass[i]=klass;
         }
+    }
+    // These count the model's actual allocation and subscriber-admission paths,
+    // including cache hits as a subset of merges. They are not inferred from
+    // endpoint amplification or entry occupancy changes.
+    if (old.alloc != this->stat_alloc || old.merged != this->stat_merged ||
+        old.cache_hits != this->stat_cache_hits)
+    {
+        teranoc_telemetry::emit(*this, this->clock.get_cycles(), 25,
+            this->stat_alloc - old.alloc, this->stat_merged - old.merged,
+            this->stat_cache_hits - old.cache_hits);
+        old.alloc = this->stat_alloc;
+        old.merged = this->stat_merged;
+        old.cache_hits = this->stat_cache_hits;
     }
     int64_t csr[]={this->cfg_enable,this->hold_subs_single,this->hold_subs_burst,
         this->hold_window_single,this->hold_window_burst,this->bank_shift_single,
