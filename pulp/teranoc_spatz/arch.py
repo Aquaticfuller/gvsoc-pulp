@@ -667,6 +667,10 @@ MEMPOOL_SPATZ4_FPU = TeranocConfig(
     nb_redmule_tiles_per_group = 0,
 )
 
+# Keep the August configuration reproducible without carrying stale defaults
+# into the September RTL profile. These values do not change component topology.
+_LEGACY_RTL_CONFIG = os.environ.get('TERANOC_RTL_LEGACY_CONFIG', '0') == '1'
+
 TERAPOOL_SPATZ4_FPU = TeranocConfig(
     # Mirrors config/terapool_spatz4_fpu.mk in TeraNoC.
     nb_snitch_per_tile       = 1,
@@ -682,12 +686,9 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
     nb_axi_masters_per_group = 1,
     l2_size                  = 0x1000000,
     nb_l2_banks              = 16,
-    # noc_router_remapping=2 (response remapping) — the RTL's shipping default
-    # since 2026-08-14 (c05d54c1); was 3 (req+resp) here before that. Property-
-    # valued only (remapper batch sizes), so env-overridable at run time:
-    # TERANOC_L1_REMAP_MODE=3 reproduces teranoc_v2's profile for fork-parity
-    # checks.
-    l1_noc_remap_mode        = int(os.environ.get('TERANOC_L1_REMAP_MODE', 2)),
+    # September RTL remaps requests and responses (mode 3). The older
+    # August profile remapped responses only; keep it explicitly selectable.
+    l1_noc_remap_mode        = int(os.environ.get('TERANOC_L1_REMAP_MODE', 2 if _LEGACY_RTL_CONFIG else 3)),
     l1_noc_remap_batch_size  = 4,
     l1_noc_remap_shuffle     = True,
     snitch                  = SNITCHMEMPOOL_VECTOR_CORE,
@@ -705,9 +706,9 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
         rob_depth=int(os.environ.get('TERANOC_VLSU_ROB_DEPTH', 64)),
         sub_word=bool(int(os.environ.get('TERANOC_VLSU_BURST_EW16', 1))),
         block_alloc=True, dual_load=2, recv_ports=2),
-    # MSHR knobs default to config/terapool_spatz4_fpu.mk's built defaults
-    # (2026-08-15 state: hold_window_burst and serve_timeout track the uniform
-    # 2047 decision; the request-input spill is bypassed — C2). Newer GEMM
+    # MSHR defaults match the reviewed September 9 config: windows8191,
+    # prescale6, merge16, bypass16. TERANOC_RTL_LEGACY_CONFIG=1 retains
+    # the older reset/timer/remap profile. Newer GEMM
     # ELFs instead program all runtime knobs per shape through the MSHR CSRs
     # (mshr_cfg.h) from their own make variables, so these only matter for
     # ELFs built before the CSR flow. Override via TERANOC_MSHR_* env vars;
@@ -718,17 +719,18 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
     # RTL's MshrCfgRuntime=1 reset state).
     group_mshr = GroupMshrConfig(
         enable=bool(int(os.environ.get('TERANOC_MSHR_ENABLE', 1))),
-        merge_reqs=int(os.environ.get('TERANOC_MSHR_MERGE_REQS', 4)),
+        merge_reqs=int(os.environ.get('TERANOC_MSHR_MERGE_REQS', 4 if _LEGACY_RTL_CONFIG else 16)),
         hold_subs_single=int(os.environ.get('TERANOC_MSHR_HOLD_SUBS_SINGLE', 4)),
         hold_subs_burst=int(os.environ.get('TERANOC_MSHR_HOLD_SUBS_BURST', 4)),
-        hold_window_single=int(os.environ.get('TERANOC_MSHR_HOLD_WINDOW_SINGLE', 0)),
-        hold_window_burst=int(os.environ.get('TERANOC_MSHR_HOLD_WINDOW_BURST', 2047)),
-        serve_timeout=int(os.environ.get('TERANOC_MSHR_SERVE_TIMEOUT', 2047)),
+        hold_window_single=int(os.environ.get('TERANOC_MSHR_HOLD_WINDOW_SINGLE', 0 if _LEGACY_RTL_CONFIG else 8191)),
+        hold_window_burst=int(os.environ.get('TERANOC_MSHR_HOLD_WINDOW_BURST', 2047 if _LEGACY_RTL_CONFIG else 8191)),
+        serve_timeout=int(os.environ.get('TERANOC_MSHR_SERVE_TIMEOUT', 2047 if _LEGACY_RTL_CONFIG else 8191)),
+        hold_prescale_w=int(os.environ.get('TERANOC_MSHR_HOLD_PRESCALE_W', 4 if _LEGACY_RTL_CONFIG else 6)),
         resp_wait_subs_single=int(os.environ.get('TERANOC_MSHR_RESP_WAIT_SUBS_SINGLE', 1)),
         bank_shift_single=int(os.environ.get('TERANOC_MSHR_BANK_SHIFT_SINGLE', 9)),
         bank_shift_burst=int(os.environ.get('TERANOC_MSHR_BANK_SHIFT_BURST', 7)),
         bank_burst_bits=int(os.environ.get('TERANOC_MSHR_BANK_BURST_BITS', 1)),
-        bypass_track_ways=int(os.environ.get('TERANOC_MSHR_BYPASS_WAYS', 4)),
+        bypass_track_ways=int(os.environ.get('TERANOC_MSHR_BYPASS_WAYS', 4 if _LEGACY_RTL_CONFIG else 16)),
         bankfull_bp=int(os.environ.get('TERANOC_MSHR_BANKFULL_BP', 1)),
         cache_reuse_target=int(os.environ.get('TERANOC_MSHR_CACHE_REUSE_TARGET', 0)),
         cache_timeout=int(os.environ.get('TERANOC_MSHR_CACHE_TIMEOUT', 0)),

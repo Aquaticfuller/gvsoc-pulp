@@ -7,6 +7,8 @@
 #include <map>
 #include <memory>
 #include <vector>
+#include <cstdlib>
+#include "remapper_mapping.hpp"
 
 #include <vp/vp.hpp>
 #include <vp/itf/io_v2.hpp>
@@ -112,24 +114,12 @@ int L1NocRouterRemapper::get_mapped_port(int input)
         % this->remap_batch_size;
     this->remap_timestamp = this->clock.get_cycles();
 
-    int offset_in_group;
-    int group_start;
-    if (this->shuffle)
-    {
-        offset_in_group = input / this->nb_groups;
-        group_start = (input % this->nb_groups) * this->remap_batch_size;
-    }
-    else
-    {
-        offset_in_group = input % this->remap_batch_size;
-        group_start = input - offset_in_group;
-    }
-    int adjusted_offset =
-        (offset_in_group + this->remap_pos) % this->remap_batch_size;
-    int half = this->remap_batch_size / 2;
-    int mapped_offset =
-        (adjusted_offset % half) * 2 + adjusted_offset / half;
-    int output = group_start + mapped_offset;
+    static const bool legacy_output = []() {
+        const char *value = std::getenv("TERANOC_L1_REMAP_LEGACY_OUTPUT");
+        return value != nullptr && std::atoi(value) != 0;
+    }();
+    int output = teranoc::remap_port(input, this->nb_ports,
+        this->remap_batch_size, this->shuffle, this->remap_pos, legacy_output);
     if (output < 0 || output >= this->nb_ports)
     {
         this->trace.fatal("L1 remapper mapped input %d to invalid output %d\n", input, output);

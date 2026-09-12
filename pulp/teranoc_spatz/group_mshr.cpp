@@ -103,6 +103,10 @@ private:
 
     struct Entry
     {
+        // A coalesced single fetches a complete aligned memory word. The
+        // subscriber's (possibly subword) destination must not be its buffer.
+        vp::IoReq single_fetch_req;
+        uint32_t single_fetch_word = 0;
         bool valid = false;
         int state = ST_IDLE;
         uint64_t base_addr = 0;   // burst base byte address
@@ -463,6 +467,10 @@ private:
             if (p.first == base_addr && p.second == tgt_group) return true;
         return false;
     }
+    std::vector<int64_t> bank_merge_cycle;
+    bool one_merge_per_bank = false;
+    bool single_fetch_hold = false;
+    bool distributed_rob_tags = false;
     std::vector<int64_t> bank_alloc_cycle;      // last cycle THIS group allocated, per bank
     std::vector<const void *> bank_alloc_owner; // self-check only; always `this`
     uint64_t stat_mshr_timeout = 0;   // hold windows expired below the sub target
@@ -942,6 +950,16 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->arr_tile_sum.resize(this->nb_tiles_per_group, 0);
     this->arr_tile_n.resize(this->nb_tiles_per_group, 0);
     this->bank_alloc_cycle.resize(this->nb_banks, -1);
+    this->bank_merge_cycle.resize(this->nb_banks, -1);
+    auto enabled = [](const char *name) {
+        const char *value = getenv(name);
+        return value == nullptr || atoi(value) != 0;
+    };
+    this->one_merge_per_bank = enabled("TERANOC_MSHR_ONE_MERGE_PER_BANK");
+    this->single_fetch_hold = enabled("TERANOC_MSHR_SINGLE_FETCH_HOLD");
+    const char *relaxed_tags = getenv("TERANOC_MSHR_DISTRIBUTED_TAGS");
+    this->distributed_rob_tags = enabled("TERANOC_VLSU_DISTRIBUTED_ROB") &&
+        relaxed_tags != nullptr && atoi(relaxed_tags) != 0;
     this->spent_ring.resize(this->nb_banks);
     {
         // Straggler release (see spent_ring). Depth = ways per bank: only the
@@ -1340,7 +1358,10 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
     // Misaligned bursts are barred from merging (RTL clamps them to len 1 and
     // bypasses with the original burst_len).
     bool aligned = (addr & (uint64_t)(this->max_burst_words * 4 - 1)) == 0;
-    bool mergeable = is_load && this->enable_single || (is_load && is_burst && aligned);
+    bool mergeable = (is_load && this->enable_single) || (is_load && is_burst && aligned);
+    // A single merge key covers exactly one word; a cross-word unaligned
+    // access must retain the ordinary transport's splitting semantics.
+    if (!is_burst && (addr & 3) + size > 4) mergeable = false;
     if (is_load && is_burst && !aligned)
     {
         mergeable = false;
@@ -1427,6 +1448,14 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
         Entry *hit = this->find_hit(bank, base_addr, burst_len, tgt_group);
         if (hit != nullptr && (int)hit->subs.size() < this->merge_reqs)
         {
+            if (this->one_merge_per_bank &&
+                this->bank_merge_cycle[bank] == this->clock.get_cycles())
+            {
+                this->lane_retry_owed[lane] = true;
+                this->fsm_event.enqueue(1);
+                return vp::IO_REQ_DENIED;
+            }
+            this->bank_merge_cycle[bank] = this->clock.get_cycles();
             // Merge: consume the request, no NoC traffic.
             this->trace.msg(vp::Trace::LEVEL_TRACE,
                 "MSHR_MERGE lane=%d addr=0x%lx entry=%d subs=%d\n",
@@ -1516,7 +1545,8 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
                 }
             }
             // Burst hold window early release.
-            if (!hit->issued && is_burst && (int)hit->subs.size() >= this->hold_subs_burst)
+            if (!hit->issued && (is_burst || this->single_fetch_hold) &&
+                (int)hit->subs.size() >= (is_burst ? this->hold_subs_burst : this->hold_subs_single))
             {
                 hit->release_cycle = this->clock.get_cycles();
             }
@@ -1578,7 +1608,12 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
         //    corrupted the NI's burst accounting and deadlocked the tail, so
         //    those verdicts are VOID. Re-measured on the leak-fixed control
         //    (build65: gemm512 4x4 = 44,532, bit-identical to the anchor).
-        if (is_burst)
+        // Current RTL response tags advance in lane rows, but its overlap
+        // comparator still uses the word burst_len (not ceil(len/lanes)).
+        // Preserve the conservative guard by default. Relaxing it assumes
+        // disjoint physical reservations and is an explicit experiment, not
+        // an exact implementation of the RTL's modular range comparison.
+        if (is_burst && !this->distributed_rob_tags)
         {
             for (Entry &o : this->entries)
             {
@@ -1659,6 +1694,17 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             e->beats_drained = 0;
             e->served_cnt = 0;
             flit->mshr_tag = (int)(e - this->entries.data()) + 1;
+            if (!is_burst)
+            {
+                e->single_fetch_req.prepare();
+                e->single_fetch_req.set_addr(base_addr);
+                e->single_fetch_req.set_size(4);
+                e->single_fetch_req.set_opcode(vp::READ);
+                e->single_fetch_req.set_data((uint8_t *)&e->single_fetch_word);
+                flit->burst = &e->single_fetch_req;
+                flit->set_addr(base_addr);
+                flit->set_size(4);
+            }
             this->stat_alloc++;
             this->bank_alloc[bank]++;
             if (is_burst) this->stat_alloc_burst++; else this->stat_alloc_single++;
@@ -1666,16 +1712,16 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
                 "MSHR_ALLOC lane=%d addr=0x%lx entry=%d len=%d\n",
                 lane, (unsigned long)addr, (int)(e - this->entries.data()), burst_len);
 
-            // Hold window: bursts are held to catch late merges (singles
-            // issue immediately). Auto-bypass probes arm a short window:
+            // Hold window: both classes hold their fetch when configured.
+            // Legacy single mode issues immediately. Auto-bypass probes arm a short window:
             // a probe only needs to catch barrier-aligned same-phase merges
             // (tens of cycles), and a hopeless probe must be cheap.
-            int window = this->hold_window_burst;
+            int window = is_burst ? this->hold_window_burst : this->hold_window_single;
             if (is_probe && this->auto_probe_window < window)
             {
                 window = this->auto_probe_window;
             }
-            if (is_burst && window > 0)
+            if ((is_burst || this->single_fetch_hold) && window > 0)
             {
                 int ticks = window >> this->hold_prescale_w;
                 if (ticks <= 0) ticks = 1;
@@ -2711,6 +2757,17 @@ void GroupMshr::drain_cycle()
                 break;
             }
             Sub &sub = e.subs[si];
+            // ParityDrain pins BURST beats to alternating response channels.
+            // A single-word response returns on its subscriber's mapped request
+            // port (RTL drain_sub_port), not unconditionally on channel zero.
+            static const bool legacy_single_port = []() {
+                const char *value = getenv("TERANOC_MSHR_LEGACY_SINGLE_PORT");
+                return value != nullptr && atoi(value) != 0;
+            }();
+            if (e.burst_len == 1 && !legacy_single_port)
+            {
+                port = sub.port;
+            }
             int lane = sub.tile * this->nb_ports_per_tile + port;
             if (this->resp_out_blocked[lane])
             {
@@ -2732,7 +2789,18 @@ void GroupMshr::drain_cycle()
             flit->mshr_tag = 0;
             if (sub.burst && sub.burst->get_data() != nullptr)
             {
-                *(uint32_t *)(sub.burst->get_data() + (uint64_t)beat * 4) = word;
+                if (e.burst_len == 1)
+                {
+                    unsigned offset = sub.initiator_addr & 3;
+                    unsigned bytes = sub.burst->get_size();
+                    if (offset + bytes > 4)
+                        this->trace.fatal("MSHR single subscriber crosses a word\n");
+                    memcpy(sub.burst->get_data(), (uint8_t *)&word + offset, bytes);
+                }
+                else
+                {
+                    memcpy(sub.burst->get_data() + (uint64_t)beat * 4, &word, 4);
+                }
             }
             // The flit carries the word by value; once created, delivery is
             // guaranteed (on DENY the router elected it and the same object is
