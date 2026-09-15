@@ -27,6 +27,8 @@
  *   0x108        WAKE_UP_GROUP      group mask
  *   0x10c        WAKE_UP_STRD       stride for strided wake-all
  *   0x110        WAKE_UP_OFFST      offset for strided wake-all
+ *   0x128..0x134 RO_CACHE_START[r]  read-only cache rule starts (4 rules)
+ *   0x138..0x144 RO_CACHE_END[r]    read-only cache rule ends (4 rules)
  * Each core has its own barrier_ack wire (barrier_ack_<global core id>), so
  * wakes are selective: only the addressed cores are pulsed.
  */
@@ -229,10 +231,13 @@ vp::IoReqStatus CtrlRegisters::req(vp::Block *__this, vp::IoReq *req)
         {
             _this->wake_offset = value;
         }
-        if (offset >= 0x68 && offset <= 0x74 && (offset & 0x3) == 0)
+        // RO cache rules follow the 64-group wake-up map (control_registers.hjson).
+        // The former 0x68/0x78 offsets lay inside WAKE_UP_TILE[24..31], so waking
+        // those groups rewrote cache rules.
+        if (offset >= 0x128 && offset <= 0x134 && (offset & 0x3) == 0)
         {
             IssOffloadInsn<uint32_t> insn{};
-            insn.arg_a = (offset - 0x68) >> 2;
+            insn.arg_a = (offset - 0x128) >> 2;
             insn.arg_b = 0;
             insn.arg_c = value;
             if (_this->rocache_cfg_itf.is_bound())
@@ -240,10 +245,10 @@ vp::IoReqStatus CtrlRegisters::req(vp::Block *__this, vp::IoReq *req)
                 _this->rocache_cfg_itf.sync(&insn);
             }
         }
-        if (offset >= 0x78 && offset <= 0x84 && (offset & 0x3) == 0)
+        if (offset >= 0x138 && offset <= 0x144 && (offset & 0x3) == 0)
         {
             IssOffloadInsn<uint32_t> insn{};
-            insn.arg_a = (offset - 0x78) >> 2;
+            insn.arg_a = (offset - 0x138) >> 2;
             insn.arg_b = 1;
             insn.arg_c = value;
             if (_this->rocache_cfg_itf.is_bound())
