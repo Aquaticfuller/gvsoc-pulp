@@ -2391,11 +2391,13 @@ void GroupMshr::win_handler(vp::Block *__this, vp::ClockEvent *)
 void GroupMshr::hb_handler(vp::Block *__this, vp::ClockEvent *)
 {
     auto *_this = static_cast<GroupMshr *>(__this);
+    // Opt-in: written only when TERANOC_MSHR_HB_PATH names a file. The event
+    // keeps its cadence either way, so enabling the log cannot change scheduling.
     static FILE *hb_f = nullptr;
-    if (!hb_f)
+    static const char *hb_path = getenv("TERANOC_MSHR_HB_PATH");
+    if (!hb_f && hb_path)
     {
-        const char *hb_path = getenv("TERANOC_MSHR_HB_PATH");
-        hb_f = fopen(hb_path ? hb_path : "/tmp/mshr_hb.log", "a");
+        hb_f = fopen(hb_path, "a");
     }
     if (!hb_f) { _this->hb_event.enqueue(65536); return; }
 
