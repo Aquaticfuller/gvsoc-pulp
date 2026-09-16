@@ -104,8 +104,8 @@ void IDmaBeAxi::reset(bool active)
         while (!this->free_bursts.empty()) this->free_bursts.pop();
         while (!this->pending_bursts.empty()) this->pending_bursts.pop();
         while (!this->write_fill_queue.empty()) this->write_fill_queue.pop();
-        while (!this->read_push_queue.empty()) this->read_push_queue.pop();
-        while (!this->read_ack_queue.empty()) this->read_ack_queue.pop();
+        while (!this->read_forward_order.empty()) this->read_forward_order.pop();
+        this->read_acks.clear();
 
         for (BurstInfo *info : this->burst_info)
         {
@@ -116,6 +116,8 @@ void IDmaBeAxi::reset(bool active)
             info->bytes_issued = 0;
             info->bytes_responded = 0;
             info->bytes_acked = 0;
+            info->bytes_forwarded = 0;
+            while (!info->ready_chunks.empty()) info->ready_chunks.pop();
             info->write_pending_acks.clear();
             if (info->read_req != nullptr)
             {
@@ -179,6 +181,8 @@ void IDmaBeAxi::enqueue_burst(uint64_t base, uint64_t size, bool is_write, IdmaT
     info->bytes_issued = 0;
     info->bytes_responded = 0;
     info->bytes_acked = 0;
+    info->bytes_forwarded = 0;
+    while (!info->ready_chunks.empty()) info->ready_chunks.pop();
     info->write_pending_acks.clear();
     info->is_write = is_write;
 
@@ -186,6 +190,10 @@ void IDmaBeAxi::enqueue_burst(uint64_t base, uint64_t size, bool is_write, IdmaT
     if (is_write)
     {
         this->write_fill_queue.push(info);
+    }
+    else
+    {
+        this->read_forward_order.push(info);
     }
 
     this->update();
@@ -381,12 +389,14 @@ vp::IoRespAck IDmaBeAxi::resp_meth(vp::Block *__this, vp::IoReq *req)
         return vp::IO_RESP_ACCEPTED;
     }
 
+    if (info->bytes_responded + beat_size > info->total_size)
+        self->trace.fatal("Read response exceeds its burst size\n");
     info->bytes_responded += beat_size;
 
     // Read beat: a distinct allocator-backed object whose co-allocated payload
     // carries the data (our read_req is data-less and never round-tripped).
     // Copy the payload into the slot's staging buffer — the forwarded chunk
-    // pointer may sit in read_push_queue past this call, so it must not point
+    // pointer may sit in ready_chunks past this call, so it must not point
     // into the beat — then free the beat back to its pool.
     uint64_t offset = info->bytes_responded - beat_size;
     uint8_t *chunk = self->burst_data[info->burst_id] + offset;
@@ -396,21 +406,8 @@ vp::IoRespAck IDmaBeAxi::resp_meth(vp::Block *__this, vp::IoReq *req)
     }
     req->free();
 
-    // The downstream has already paced this at the modeled ready cycle.
-    // Forward straight to the destination BE if it can take the chunk now —
-    // this saves a 1-cycle fsm hop per beat and keeps the steady-state read
-    // pipeline at 1 beat/cycle. When the destination is back-pressured we fall
-    // back to queueing and let fsm_handler drain when it becomes ready.
-    if (self->be->is_ready_to_accept_data(info->transfer))
-    {
-        self->read_ack_queue.push({info, beat_size});
-        self->be->write_data(info->transfer, chunk, beat_size);
-    }
-    else
-    {
-        self->read_push_queue.push(std::make_tuple(info, chunk, beat_size));
-        self->fsm_event.enqueue();
-    }
+    info->ready_chunks.push({chunk, beat_size});
+    self->forward_read_chunk();
 
     // Last read response received: we own read_req and free it here (nothing
     // downstream frees it). Null it so the recycled slot reallocates next time.
@@ -510,18 +507,12 @@ void IDmaBeAxi::write_data(IdmaTransfer *transfer, uint8_t *data, uint64_t size)
 
 void IDmaBeAxi::write_data_ack(uint8_t *data)
 {
-    // Read path: the destination BE has consumed the chunk at the head of
-    // read_ack_queue. Pop it, charge its size to its slot's bytes_acked, and
-    // recycle the slot when the whole burst has been acked.
-    if (this->read_ack_queue.empty())
-    {
-        return;
-    }
-
-    auto entry = this->read_ack_queue.front();
-    this->read_ack_queue.pop();
-    BurstInfo *info = entry.first;
-    uint64_t chunk = entry.second;
+    auto entry = this->read_acks.find(data);
+    if (entry == this->read_acks.end())
+        this->trace.fatal("Read acknowledgement does not name a live chunk\n");
+    BurstInfo *info = entry->second.first;
+    uint64_t chunk = entry->second.second;
+    this->read_acks.erase(entry);
 
     info->bytes_acked += chunk;
 
@@ -567,32 +558,26 @@ void IDmaBeAxi::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         _this->fsm_event.enqueue();
     }
 
-    // 2. Forward one read chunk to the destination BE per cycle. The adapter
-    //    has already paced beat arrivals at one per cycle, so the queue
-    //    naturally throttles itself — we only stall here when the
-    //    destination BE isn't ready.
-    if (!_this->read_push_queue.empty())
-    {
-        auto &front = _this->read_push_queue.front();
-        BurstInfo *info = std::get<0>(front);
-        uint8_t *data  = std::get<1>(front);
-        uint64_t size  = std::get<2>(front);
+    _this->forward_read_chunk();
+}
 
-        if (_this->be->is_ready_to_accept_data(info->transfer))
-        {
-            _this->trace.msg(vp::Trace::LEVEL_TRACE,
-                "Forwarding read chunk (slot: %ld, size: 0x%lx)\n",
-                info->burst_id, size);
-
-            _this->read_ack_queue.push({info, size});
-            _this->read_push_queue.pop();
-            _this->be->write_data(info->transfer, data, size);
-            // Stay scheduled in case more chunks are queued.
-            _this->fsm_event.enqueue();
-        }
-        // If BE not ready, leave the queue alone — be->update() will nudge us
-        // when it becomes ready.
-    }
+bool IDmaBeAxi::forward_read_chunk()
+{
+    if (this->read_forward_order.empty()) return false;
+    BurstInfo *info = this->read_forward_order.front();
+    if (info->ready_chunks.empty() || !this->be->is_ready_to_accept_data(info->transfer))
+        return false;
+    auto chunk = info->ready_chunks.front();
+    info->ready_chunks.pop();
+    if (!this->read_acks.emplace(chunk.first, std::make_pair(info, chunk.second)).second)
+        this->trace.fatal("Read chunk forwarded twice\n");
+    info->bytes_forwarded += chunk.second;
+    // Remove before the callback, which may complete and recycle this slot.
+    if (info->bytes_forwarded == info->total_size)
+        this->read_forward_order.pop();
+    this->be->write_data(info->transfer, chunk.first, chunk.second);
+    this->fsm_event.enqueue();
+    return true;
 }
 
 
@@ -612,6 +597,6 @@ bool IDmaBeAxi::is_empty()
     // returns to free_bursts; equivalently, until every queue is empty.
     return this->pending_bursts.empty()
         && this->write_fill_queue.empty()
-        && this->read_push_queue.empty()
-        && this->read_ack_queue.empty();
+        && this->read_forward_order.empty()
+        && this->read_acks.empty();
 }

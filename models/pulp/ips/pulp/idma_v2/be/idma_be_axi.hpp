@@ -21,6 +21,7 @@
 #pragma once
 
 #include <deque>
+#include <map>
 #include <queue>
 #include <tuple>
 #include <vector>
@@ -94,6 +95,8 @@ private:
         // Bytes the destination BE has acknowledged via write_data_ack(). Only
         // used by reads; the slot is recycled when bytes_acked == total_size.
         uint64_t bytes_acked = 0;
+        uint64_t bytes_forwarded = 0;
+        std::queue<std::pair<uint8_t *, uint64_t>> ready_chunks;
         // Source-side chunks received via write_data() but not yet
         // acknowledged. The destination BE owes the source one
         // ack_data(transfer, data, size) per entry; all of them are issued
@@ -127,6 +130,7 @@ private:
     // Returns true when a beat was actually issued (caller reschedules the
     // FSM for next cycle).
     bool issue_beat();
+    bool forward_read_chunk();
 
     IdmaBeProducer *be;
     // Bus-facing IoMaster. Declared with signature IoV2Beat on the Python
@@ -162,15 +166,12 @@ private:
     // Write-side fill queue: bursts whose buffer is being filled by
     // write_data(). Front-most slot is the current fill target.
     std::queue<BurstInfo *> write_fill_queue;
-    // Per-beat read chunks waiting to be forwarded to the destination BE.
-    // Pushed in order by resp_meth (already paced at 1/cycle by the adapter)
-    // and drained at the destination BE's accept rate by the FSM. One tuple
-    // per beat: (slot, data slice, size).
-    std::queue<std::tuple<BurstInfo *, uint8_t *, uint64_t>> read_push_queue;
-    // FIFO of (slot, chunk-size) entries describing chunks currently in
-    // flight downstream. Each write_data_ack() pops the head and charges its
-    // size to the slot's bytes_acked.
-    std::queue<std::pair<BurstInfo *, uint64_t>> read_ack_queue;
+    // Different AXI IDs may respond out of order. The destination fill FIFO
+    // follows descriptor order, so hold later bursts until earlier ones forward.
+    std::queue<BurstInfo *> read_forward_order;
+    // Write acknowledgements may also reorder. Match the actual source slice,
+    // rather than retiring whichever read buffer happens to be at the FIFO head.
+    std::map<uint8_t *, std::pair<BurstInfo *, uint64_t>> read_acks;
 
     // v2 deny/retry: when the AXI master gets IO_REQ_DENIED on a send, it
     // suspends issuing until retry_meth() fires.
