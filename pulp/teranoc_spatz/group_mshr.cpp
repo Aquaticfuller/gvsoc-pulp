@@ -73,6 +73,7 @@ class GroupMshr : public vp::Component
 public:
     GroupMshr(vp::ComponentConf &config);
     ~GroupMshr() override;
+    void stop() override { this->final_cycle = this->clock.get_cycles(); }
 
 private:
     void telemetry_snapshot();
@@ -616,6 +617,7 @@ private:
     uint64_t edh_visits = 0;            // drain visits (>= entry-cycles if the
                                         // door FSM runs twice in one cycle)
 
+    int64_t final_cycle = 0;
     vp::Trace trace;
     vp::IoSlave *req_in_itfs = nullptr;
     vp::IoMaster *req_out_itfs = nullptr;
@@ -705,7 +707,8 @@ GroupMshr::~GroupMshr()
                     (double)(this->f2l_beats_sum - this->f2l_entries) / this->f2l_span_sum : 0.0);
         }
         {
-            int64_t total = this->clock.get_cycles();
+            // The clock component may already be destroyed during teardown.
+            int64_t total = this->final_cycle;
             fprintf(f, "  %s occupancy: sum=%lu over %ld cyc = %.2f valid entries (of %d)"
                 " active=%lu (%.1f%%) mean_active=%.2f fsm_cyc=%lu\n",
                 this->get_path().c_str(), (unsigned long)this->occ_sum, (long)total,
