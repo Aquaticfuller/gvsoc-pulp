@@ -335,8 +335,11 @@ private:
     // Overflow pool (RTL group_mshr_overflow_entries). Entries that belong to no bank, ids
     // num_entries..num_entries+overflow_entries-1, allocated ONLY when the hashed bank has no
     // free way. They behave exactly like a bank entry otherwise -- same hold window, same cache
-    // participation, both classes -- and every lookup compares against them, so a line is never
-    // resident both in a bank way and here. They exist to break the circular wait where a bank
+    // participation, both classes -- and every lookup compares against them. That does NOT make a
+    // line unique across the pool and the table: the key is (base, burst_len, group), so a
+    // same-address pair with different burst_len may sit in both, exactly as the RTL allows.
+    //
+    // They exist to break the circular wait where a bank
     // full of held entries is waiting for a subscriber whose own prerequisite needs that bank.
     std::vector<int> overflow_ways;
     int overflow_entries = 0;
