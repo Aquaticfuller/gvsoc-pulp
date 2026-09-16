@@ -1917,6 +1917,17 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
         // load that hashes there too, and only the hold timeout breaks the circular wait.
         // A pool entry is a real entry (hold window, cache, both classes); it just belongs to
         // no bank, so any bank may borrow it. Round-robin, one allocation per cycle.
+        //
+        // Emission is not a separate path: this returns through the same entry start as a banked
+        // allocation, so a pooled fetch is issued (or hold-armed) exactly like any other. A
+        // drive condition that says "the bank is full, therefore do not emit" would silently
+        // drop every pooled request, because a pool grant implies a full bank by construction.
+        //
+        // Counters: a pool allocation resolves the bank-full case WITHOUT a deny or a bypass, so
+        // it does not move bank_full_miss / deny_bankfull / bypass -- it is attributed to the
+        // hashed bank in bank_alloc[] and to stat_overflow_alloc. A pool-enabled run therefore
+        // shows fewer denies than the same run with the pool off, and that difference is
+        // explained by the overflow counter, not by a change in the deny policy.
         if (bank_full && this->overflow_entries > 0 && this->overflow_alloc_cycle != this->clock.get_cycles())
         {
             for (int i = 0; i < this->overflow_entries; i++)
