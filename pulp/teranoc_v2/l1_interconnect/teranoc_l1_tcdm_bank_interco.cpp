@@ -408,9 +408,10 @@ vp::IoReqStatus TeranocL1TcdmBankInterco::narrow_req(vp::Block *__this, vp::IoRe
     NarrowInput &input = _this->narrow_inputs[input_id];
     int target_bank = _this->physical_bank(req->get_addr());
 
-    _this->traces.assert((req->get_addr() & (_this->narrow_width - 1)) + req->get_size() <=
-        (uint64_t)_this->narrow_width,
-        "narrow access crosses a bank word (input=%d addr=0x%lx size=%lu)",
+    // Fatal in every build: a crossing access would silently write into the next bank row.
+    vp_assert_always((req->get_addr() & (_this->narrow_width - 1)) + req->get_size() <=
+        (uint64_t)_this->narrow_width, &_this->trace,
+        "narrow access crosses a bank word (input=%d addr=0x%lx size=%lu)\n",
         input_id, req->get_addr(), req->get_size());
 
     if (!_this->accepting_consumed && _this->accepting_input == input_id &&
