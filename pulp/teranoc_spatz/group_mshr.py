@@ -29,7 +29,8 @@ class GroupMshr(gvsoc.systree.Component):
 
     def __init__(self, parent: gvsoc.systree.Component, name: str,
             nb_lanes: int, nb_tiles_per_group: int, nb_inter_group_ports_per_tile: int,
-            num_entries: int = 64, ways_per_bank: int = 4, merge_reqs: int = 4,
+            num_entries: int = 64, ways_per_bank: int = 4, overflow_entries: int = 1,
+            merge_reqs: int = 4,
             enable_single: bool = True, drain_beats: int = 2,
             bankfull_bp: int = 1,
             cache_reuse_target: int = 0, cache_timeout: int = 0,
@@ -59,6 +60,7 @@ class GroupMshr(gvsoc.systree.Component):
             'nb_inter_group_ports_per_tile': nb_inter_group_ports_per_tile,
             'num_entries': num_entries,
             'ways_per_bank': ways_per_bank,
+            'overflow_entries': overflow_entries,
             'merge_reqs': merge_reqs,
             'enable_single': int(enable_single),
             'drain_beats': drain_beats,

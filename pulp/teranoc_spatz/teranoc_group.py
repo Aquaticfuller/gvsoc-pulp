@@ -104,6 +104,8 @@ class TeranocGroup(st.Component):
                 nb_inter_group_ports_per_tile=arch.nb_inter_group_ports_per_tile,
                 num_entries=arch.group_mshr.num_entries,
                 ways_per_bank=arch.group_mshr.ways_per_bank,
+                overflow_entries=int(os.environ.get('TERANOC_MSHR_OVERFLOW_ENTRIES',
+                                                    arch.group_mshr.overflow_entries)),
                 merge_reqs=arch.group_mshr.merge_reqs,
                 enable_single=arch.group_mshr.enable_single,
                 drain_beats=arch.group_mshr.drain_beats,

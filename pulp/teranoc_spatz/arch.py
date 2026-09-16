@@ -121,6 +121,10 @@ class GroupMshrConfig:
     enable:              bool = False
     num_entries:         int  = 64   # group_mshr_num (banks = num/ways)
     ways_per_bank:       int  = 4    # group_mshr_ways_per_bank
+    overflow_entries:    int  = 1    # group_mshr_overflow_entries: bankless entries taken only
+                                     # when the hashed bank has no free way, so a bank full of
+                                     # held entries cannot block the very request they wait for.
+                                     # Ids follow the table (num_entries..); 0 = pre-2026-09-16.
     merge_reqs:          int  = 4    # group_mshr_merge_reqs (max subscribers/entry)
     enable_single:       bool = True # group_mshr_enable_single
     drain_beats:         int  = 2    # group_mshr_drain_beats (ParityDrain)

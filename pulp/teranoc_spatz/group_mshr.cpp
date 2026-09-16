@@ -332,6 +332,17 @@ private:
     // ---------------- state
     std::vector<Entry> entries;               // num_entries
     std::vector<std::vector<int>> bank_ways;  // bank -> entry indices
+    // Overflow pool (RTL group_mshr_overflow_entries). Entries that belong to no bank, ids
+    // num_entries..num_entries+overflow_entries-1, allocated ONLY when the hashed bank has no
+    // free way. They behave exactly like a bank entry otherwise -- same hold window, same cache
+    // participation, both classes -- and every lookup compares against them, so a line is never
+    // resident both in a bank way and here. They exist to break the circular wait where a bank
+    // full of held entries is waiting for a subscriber whose own prerequisite needs that bank.
+    std::vector<int> overflow_ways;
+    int overflow_entries = 0;
+    int overflow_rr = 0;
+    int64_t overflow_alloc_cycle = -1;   // <=1 pool allocation per cycle (its own port)
+    uint64_t stat_overflow_alloc = 0, stat_overflow_merge = 0;
     // Per-bank allocation and bank-full histogram. The hash matches the RTL,
     // but a shift that CONCENTRATES entries into few banks pushes traffic onto
     // the bypass path, whose timing differs sharply -- the candidate mechanism
@@ -902,6 +913,7 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->nb_ports_per_tile = cfg->get_int("nb_inter_group_ports_per_tile");
     this->num_entries = cfg->get_int("num_entries");
     this->ways_per_bank = cfg->get_int("ways_per_bank");
+    this->overflow_entries = cfg->get_int("overflow_entries");
     this->merge_reqs = cfg->get_int("merge_reqs");
     this->enable_single = cfg->get_int("enable_single");
     this->drain_beats = cfg->get_int("drain_beats");
@@ -965,7 +977,9 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
         }
     }
 
-    this->entries.resize(this->num_entries);
+    this->entries.resize(this->num_entries + this->overflow_entries);
+    for (int i = 0; i < this->overflow_entries; i++)
+        this->overflow_ways.push_back(this->num_entries + i);
     this->bank_ways.resize(this->nb_banks);
     this->bank_alloc.resize(this->nb_banks, 0);
     this->bank_full_miss.resize(this->nb_banks, 0);
@@ -1019,9 +1033,10 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->resp_out_held.resize(this->nb_lanes, nullptr);
     this->ldh_lane_cnt.resize(this->nb_lanes, 0);
     this->ldh_lanes_hist.resize(this->nb_lanes + 1, 0);
-    this->edh_cnt.resize(this->num_entries, 0);
-    this->edh_beats_cnt.resize(this->num_entries, 0);
-    this->edh_lastbeat.resize(this->num_entries, -1);
+    // Sized over the whole table, pool included: these are indexed by entry id.
+    this->edh_cnt.resize(this->entries.size(), 0);
+    this->edh_beats_cnt.resize(this->entries.size(), 0);
+    this->edh_lastbeat.resize(this->entries.size(), -1);
     this->req_spill_state.resize(this->nb_lanes, 0);
     this->req_spill_flit.resize(this->nb_lanes, nullptr);
 
@@ -1563,6 +1578,9 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
                 return vp::IO_REQ_DENIED;
             }
             this->bank_merge_cycle[bank] = this->clock.get_cycles();
+            // A hit on a pool entry: the line was placed there by an earlier bank-full miss,
+            // and peers of that line must merge into it rather than allocate a second copy.
+            if ((int)(hit - this->entries.data()) >= this->num_entries) this->stat_overflow_merge++;
             // Merge: consume the request, no NoC traffic.
             this->trace.msg(vp::Trace::LEVEL_TRACE,
                 "MSHR_MERGE lane=%d addr=0x%lx entry=%d subs=%d\n",
@@ -1771,9 +1789,9 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
         }
 
         // Miss: allocate (<=1 allocation per bank per cycle, RR over lanes).
-        Entry *e = this->alloc_entry(bank);
-        if (e != nullptr)
-        {
+        // The body is shared with the bankless overflow pool below: a pool entry starts
+        // exactly like a way of the hashed bank, including its hold window and tag.
+        auto start_entry = [&](Entry *e) {
             e->valid = true;
             e->state = ST_WAIT_RESP;
             e->birth_cycle = this->clock.get_cycles();
@@ -1844,7 +1862,10 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
                 this->forward_fetch(e);
             }
             return vp::IO_REQ_GRANTED;
-        }
+        };
+
+        Entry *e = this->alloc_entry(bank);
+        if (e != nullptr) return start_entry(e);
 
         // Bank full. The RTL's shipping policy (cfg_bankfull_bp=1) STALLS the
         // mergeable miss instead of bypassing, so the late peer can merge into
@@ -1885,6 +1906,27 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
                 c.release_cycle = -1;
                 bank_full = false;
                 break;
+            }
+        }
+        // Last resort before backpressure: the bankless overflow pool. A bank whose ways are
+        // all held can otherwise block the very request its residents are waiting for -- four
+        // bursts hashing to one bank, the peer that completes them stalled behind a single
+        // load that hashes there too, and only the hold timeout breaks the circular wait.
+        // A pool entry is a real entry (hold window, cache, both classes); it just belongs to
+        // no bank, so any bank may borrow it. Round-robin, one allocation per cycle.
+        if (bank_full && this->overflow_entries > 0 && this->overflow_alloc_cycle != this->clock.get_cycles())
+        {
+            for (int i = 0; i < this->overflow_entries; i++)
+            {
+                int idx = this->overflow_ways[(this->overflow_rr + i) % this->overflow_entries];
+                if (this->entries[idx].valid) continue;
+                this->overflow_rr = (this->overflow_rr + i + 1) % this->overflow_entries;
+                this->overflow_alloc_cycle = this->clock.get_cycles();
+                this->stat_overflow_alloc++;
+                this->trace.msg(vp::Trace::LEVEL_TRACE,
+                    "MSHR_OVERFLOW_ALLOC lane=%d addr=0x%lx bank=%d entry=%d\n",
+                    lane, (unsigned long)addr, bank, idx);
+                return start_entry(&this->entries[idx]);
             }
         }
         if (bank_full && this->bankfull_bp)
@@ -1963,13 +2005,15 @@ vp::IoReqStatus GroupMshr::passthrough(L1NocFlit *flit, int lane)
 GroupMshr::Entry *GroupMshr::find_hit(int bank, uint64_t base_addr, int burst_len,
     int tgt_group)
 {
-    for (int idx : this->bank_ways[bank])
-    {
+    // The overflow pool is searched with the bank's own ways: a line placed there when the bank
+    // was full must still be found, or its cohort splits across two entries and both time out.
+    // Two loops over the existing vectors, never a joined copy: this runs on every request.
+    auto probe = [&](int idx) -> Entry * {
         Entry &e = this->entries[idx];
         if (!e.valid || e.base_addr != base_addr || e.burst_len != burst_len ||
             e.tgt_group != tgt_group)
         {
-            continue;
+            return nullptr;
         }
         if (e.state == ST_WAIT_RESP && e.beats_arrived == 0)
         {
@@ -1983,6 +2027,15 @@ GroupMshr::Entry *GroupMshr::find_hit(int bank, uint64_t base_addr, int burst_le
         {
             return &e;
         }
+        return nullptr;
+    };
+    for (int idx : this->bank_ways[bank])
+    {
+        if (Entry *hit = probe(idx)) return hit;
+    }
+    for (int idx : this->overflow_ways)
+    {
+        if (Entry *hit = probe(idx)) return hit;
     }
     return nullptr;
 }
@@ -2064,7 +2117,7 @@ void GroupMshr::replay_holds()
 {
     // Replay walker: issue held fetches once the hold window expired or the
     // subscriber target was reached, round-robin over entries.
-    int n = this->num_entries;
+    int n = (int)this->entries.size();   // pool entries hold and replay like any other
     int64_t now = this->clock.get_cycles();
     for (int k = 0; k < n; k++)
     {
@@ -2435,7 +2488,7 @@ void GroupMshr::hb_handler(vp::Block *__this, vp::ClockEvent *)
             (unsigned long)_this->stat_lt_n);
     }
     fprintf(hb_f, "\n");
-    for (int i = 0; i < _this->num_entries; i++)
+    for (int i = 0; i < (int)_this->entries.size(); i++)
     {
         Entry &e = _this->entries[i];
         if (!e.valid) continue;
@@ -2837,9 +2890,9 @@ void GroupMshr::drain_cycle()
 
     // MSHR entries, round-robin: per entry up to drain_beats deliveries per
     // cycle (ParityDrain), each beat on its parity lane.
-    for (int k = 0; k < this->num_entries; k++)
+    for (int k = 0; k < (int)this->entries.size(); k++)
     {
-        int i = (this->drain_rr + k) % this->num_entries;
+        int i = (this->drain_rr + k) % (int)this->entries.size();
         Entry &e = this->entries[i];
         if (!e.valid || e.state != ST_DRAIN_RESP)
         {
@@ -2998,7 +3051,7 @@ void GroupMshr::drain_cycle()
         {
             this->edh_visits++;
         }
-        this->drain_rr = (i + 1) % this->num_entries;
+        this->drain_rr = (i + 1) % (int)this->entries.size();
     }
     (void)cycles;
 }
@@ -3291,6 +3344,7 @@ void GroupMshr::telemetry_snapshot()
         std::vector<int> state, klass;
         std::vector<int64_t> csr;
         uint64_t alloc = 0, merged = 0, cache_hits = 0;
+        uint64_t ovf_alloc = 0, ovf_merge = 0;
     };
     static std::map<const void *,Snapshot> last;
     Snapshot &old=last[this];
@@ -3302,6 +3356,9 @@ void GroupMshr::telemetry_snapshot()
         // Explicit availability: zero events after registration means zero activity.
         teranoc_telemetry::emit(*this,this->clock.get_cycles(),16,25,this->num_entries,0);
         teranoc_telemetry::emit(*this,this->clock.get_cycles(),16,27,this->num_entries,this->ways_per_bank);
+        // Overflow pool: size and the first entry id, so a reader can tell pool records
+        // (ids num_entries..) apart from banked ways without knowing the build's config.
+        teranoc_telemetry::emit(*this,this->clock.get_cycles(),16,28,this->overflow_entries,this->num_entries);
     }
     for (int i=0;i<(int)this->entries.size();++i) {
         const Entry &e=this->entries[i];
@@ -3324,6 +3381,16 @@ void GroupMshr::telemetry_snapshot()
         old.alloc = this->stat_alloc;
         old.merged = this->stat_merged;
         old.cache_hits = this->stat_cache_hits;
+    }
+    // Pool use is the escape hatch's own rate: allocations taken because the hashed bank had
+    // no free way, and merges that found their line there. Occupancy comes from the per-entry
+    // records at ids >= num_entries, so it needs no counter here.
+    if (old.ovf_alloc != this->stat_overflow_alloc || old.ovf_merge != this->stat_overflow_merge)
+    {
+        teranoc_telemetry::emit(*this, this->clock.get_cycles(), 28,
+            this->stat_overflow_alloc - old.ovf_alloc, this->stat_overflow_merge - old.ovf_merge, 0);
+        old.ovf_alloc = this->stat_overflow_alloc;
+        old.ovf_merge = this->stat_overflow_merge;
     }
     int64_t csr[]={this->cfg_enable,this->hold_subs_single,this->hold_subs_burst,
         this->hold_window_single,this->hold_window_burst,this->bank_shift_single,
