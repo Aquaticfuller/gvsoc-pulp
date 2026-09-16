@@ -149,6 +149,20 @@ vp::IoReqStatus L2AddressScrambler::input_req(vp::Block *__this, vp::IoReq *req)
     auto *_this = static_cast<L2AddressScrambler *>(__this);
     int channel = req->get_is_write() ? 1 : 0;
     uint64_t original_address = req->get_addr();
+    // The address fold is affine only within one interleave granule. RTL's
+    // wrapper bypasses its splitter when nominal burst length <= Interleave;
+    // an unaligned burst can still cross that boundary. Reject it explicitly
+    // instead of reading unrelated data from the next physical bank row.
+    if (!_this->bypass && _this->low_field_bits && _this->high_field_bits &&
+        original_address >= _this->base_addr &&
+        original_address < _this->base_addr + _this->size)
+    {
+        uint64_t granule = uint64_t{1} << _this->lsb_constant_bits;
+        if (req->get_size() > granule - (original_address & (granule - 1)))
+            _this->trace.fatal("L2 burst crosses an address-fold granule: addr=0x%lx "
+                "size=%lu granule=%lu; align operands or split the DMA descriptor\n",
+                original_address, req->get_size(), granule);
+    }
     uint64_t scrambled_address = _this->scramble(original_address);
     bool mutated = scrambled_address != original_address;
 
