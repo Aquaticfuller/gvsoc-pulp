@@ -2091,6 +2091,10 @@ void GroupMshr::replay_holds()
             if ((int)e.subs.size() < target)
             {
                 this->stat_mshr_timeout++;   // RTL's mshr_timeout counter
+                // One probe event per expiry: entry, class (0 single, 1 burst), subscribers
+                // present at expiry. The RTL probe reports this same transition as
+                // timeout_single/timeout_burst, classified the same way.
+                teranoc_telemetry::emit(*this, now, 27, i, cls, (int64_t)e.subs.size());
                 this->auto_stall_miss(cls);
             }
         }
@@ -3155,6 +3159,11 @@ void GroupMshr::serve_timeouts(int64_t cycles)
             {
                 // serve_timeout expiry below the release target = stall-miss.
                 this->stat_resp_hold_timeout++;
+                // Class 2: a RESP_HOLD entry aged out by serve_timeout. A different event from
+                // the issue-side hold window above, kept separate so a field of a given name
+                // means the same thing here and in the RTL probe (resp_hold_timeout).
+                teranoc_telemetry::emit(*this, cycles, 27,
+                    (int)(&e - this->entries.data()), 2, (int64_t)e.subs.size());
                 this->auto_stall_miss(0);
                 {
                     int n = (int)e.subs.size();
@@ -3292,6 +3301,7 @@ void GroupMshr::telemetry_snapshot()
         teranoc_telemetry::emit(*this,this->clock.get_cycles(),16,5,this->num_entries,this->ways_per_bank);
         // Explicit availability: zero events after registration means zero activity.
         teranoc_telemetry::emit(*this,this->clock.get_cycles(),16,25,this->num_entries,0);
+        teranoc_telemetry::emit(*this,this->clock.get_cycles(),16,27,this->num_entries,this->ways_per_bank);
     }
     for (int i=0;i<(int)this->entries.size();++i) {
         const Entry &e=this->entries[i];
