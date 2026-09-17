@@ -24,13 +24,13 @@ from gvsoc.signature import IoV2SingleReq
 class GroupBarrier(gvsoc.systree.Component):
     """Held-response group barrier on the group's local interconnect (LIC).
     Sits between each tile's intra-group output and the LIC input: diverts
-    barrier-window requests (within-tile word in [base_word, +num_barriers))
+    requests in the separate group control aperture
     and forwards everything else. Arrive-loads are held until the struct's
     arrival count reaches its target, then broadcast-released in one cycle."""
 
     def __init__(self, parent: gvsoc.systree.Component, name: str,
             nb_tiles_per_group: int, num_barriers: int = 16, base_word: int = 240,
-            word_shift: int = 14, mshr_present: bool = False):
+            word_shift: int = 14, mshr_present: bool = False, control_base: int = 0x20000000):
         super().__init__(parent, name)
 
         self.add_sources(['pulp/teranoc_spatz/group_barrier.cpp'])
@@ -39,6 +39,7 @@ class GroupBarrier(gvsoc.systree.Component):
             'num_barriers': num_barriers,
             'base_word': base_word,
             'word_shift': word_shift,
+            'control_base': control_base,
             'mshr_present': int(mshr_present),
         })
 

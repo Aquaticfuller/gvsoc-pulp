@@ -41,6 +41,8 @@ class L1_subsystem(gvsoc.systree.Component):
             nb_soc_ports: 'int | None' = None, size: int = 0, nb_banks_per_tile: int = 0,
             bandwidth: int = 0, axi_data_width: int = 64, outgoing_request_latency: int = 1,
             incoming_response_latency: int = 0,
+            control_enable: bool = False, control_base: int = 0x20000000,
+            control_word: int = 240, control_count: int = 16,
             burst_enable: bool = False, burst_local_issue: int = 1,
             burst_remote_issue: int = 3, burst_interleave: bool = True):
         super().__init__(parent, name)
@@ -103,7 +105,10 @@ class L1_subsystem(gvsoc.systree.Component):
         for i in range(nb_local_ports):
             shim = TeranocL1Shim(self, f'shim{i}', l1_size=total_banks * l1_bank_size,
                 tile_shift=tile_shift, nb_tiles=nb_tiles_total,
-                tile_id=global_tile_id, has_soc=i < nb_soc_ports)
+                tile_id=global_tile_id, has_soc=i < nb_soc_ports,
+                control_enable=control_enable, control_base=control_base,
+                control_word=control_word, control_count=control_count,
+                nb_tiles_per_group=nb_tiles_per_group)
             self.itf_bind(f'local_in_{i}', shim.i_INPUT(),
                 signature=IoV2SingleReq(), composite_bind=True)
             if burst_enable:

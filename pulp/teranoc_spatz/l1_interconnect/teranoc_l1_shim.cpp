@@ -85,6 +85,9 @@ private:
     bool denied_response[OUT_NB] = {false, false, false};
 
     uint64_t l1_size;
+    uint64_t control_start, control_size, control_base;
+    bool control_enable;
+    int nb_tiles_per_group;
     int tile_shift;
     uint64_t tile_mask;
     uint64_t tile_id;
@@ -100,6 +103,11 @@ TeranocL1Shim::TeranocL1Shim(vp::ComponentConf &config)
     this->tile_mask = this->get_js_config()->get_int("nb_tiles") - 1;
     this->tile_id = this->get_js_config()->get_int("tile_id");
     this->has_soc = this->get_js_config()->get_child_bool("has_soc");
+    this->control_enable = this->get_js_config()->get_child_bool("control_enable");
+    this->control_start = this->get_js_config()->get_int("control_start");
+    this->control_size = this->get_js_config()->get_int("control_size");
+    this->control_base = this->get_js_config()->get_int("control_base");
+    this->nb_tiles_per_group = this->get_js_config()->get_int("nb_tiles_per_group");
 
     this->new_slave_port("input", &this->input_itf);
 
@@ -153,6 +161,16 @@ void TeranocL1Shim::probe_emit(vp::IoReq *req, const Probe &probe, int64_t respo
 
 int TeranocL1Shim::select(uint64_t address) const
 {
+    // RTL 96ebdc81: own-group controls take the external path even when the
+    // target is the requesting tile. Other-group controls take the SoC path.
+    // The full address survives IOv2 routing, serving as RTL's group_ctrl bit.
+    if (this->control_enable && this->control_base != 0 &&
+        address >= this->control_start && address - this->control_start < this->control_size)
+    {
+        auto target_tile = (address >> this->tile_shift) & this->tile_mask;
+        return target_tile / this->nb_tiles_per_group == this->tile_id / this->nb_tiles_per_group
+            ? OUT_REMOTE : OUT_SOC;
+    }
     if (address >= this->l1_size)
     {
         return OUT_SOC;

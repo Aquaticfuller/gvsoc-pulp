@@ -176,6 +176,7 @@ class GroupBarrierConfig:
     enable:       bool = False
     num_barriers: int  = 16   # NumGroupBarriers (= NumCoresPerGroup)
     base_word:    int  = 240  # GroupBarrierWord (within-tile word window base)
+    control_base: int = 0x20000000  # Separate aperture; zero explicitly selects legacy ELFs
 
 
 @dataclass(frozen=True)
@@ -746,6 +747,7 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
         enable=bool(int(os.environ.get('TERANOC_GBAR_ENABLE', 1))),
         num_barriers=16,
         base_word=int(os.environ.get('TERANOC_GBAR_BASE_WORD', 240)),
+        control_base=int(os.environ.get('TERANOC_GROUP_CONTROL_BASE', '0x20000000'), 0),
     ),
 )
 

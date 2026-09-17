@@ -83,6 +83,7 @@ private:
     // ---------------- config
     int nb_tiles;
     int num_barriers;
+    uint64_t control_base;
     int base_word;
     // Barrier-window word field shift: 2 + log2(l1_bank_width) +
     // log2(nb_banks_per_tile) + log2(nb_tiles_per_group) + log2(nb_groups)
@@ -194,6 +195,7 @@ GroupBarrier::GroupBarrier(vp::ComponentConf &config) : vp::Component(config)
     js::Config *cfg = this->get_js_config();
     this->nb_tiles = cfg->get_int("nb_tiles_per_group");
     this->num_barriers = cfg->get_int("num_barriers");
+    this->control_base = cfg->get_int("control_base");
     this->base_word = cfg->get_int("base_word");
     this->word_shift = cfg->get_int("word_shift");
     this->mshr_present = cfg->get_int("mshr_present") != 0;
@@ -234,6 +236,10 @@ vp::IoReqStatus GroupBarrier::in_req(vp::Block *__this, vp::IoReq *req, int tile
     auto *flit = static_cast<L1NocFlit *>(req);
 
     uint64_t addr = flit->get_addr();
+    const uint64_t start = _this->control_base + ((uint64_t)_this->base_word << _this->word_shift);
+    const uint64_t size = (uint64_t)_this->num_barriers << _this->word_shift;
+    if (addr < start || addr - start >= size)
+        return _this->passthrough(flit, tile);
     uint32_t word = (uint32_t)((addr >> _this->word_shift) & 0xFF);
     if (word < (uint32_t)_this->base_word ||
         word >= (uint32_t)(_this->base_word + _this->num_barriers))
