@@ -28,6 +28,15 @@
 from dataclasses import dataclass, replace
 import os
 
+# The standalone FP16 GEMM is the tuned reference for group-MSHR timer policy.
+# Keep the production GVSoC profile on the same values; these are policy
+# constants, not shape-derived guesses.  The explicit legacy profile below
+# remains available only when TERANOC_RTL_LEGACY_CONFIG=1 is requested.
+TUNED_FP16_MSHR_HOLD_WINDOW_SINGLE = 8191
+TUNED_FP16_MSHR_HOLD_WINDOW_BURST = 8191
+TUNED_FP16_MSHR_SERVE_TIMEOUT = 8191
+TUNED_FP16_MSHR_CACHE_TIMEOUT = 0
+
 
 @dataclass(frozen=True)
 class SnitchCoreConfig:
@@ -727,9 +736,15 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
         merge_reqs=int(os.environ.get('TERANOC_MSHR_MERGE_REQS', 4 if _LEGACY_RTL_CONFIG else 16)),
         hold_subs_single=int(os.environ.get('TERANOC_MSHR_HOLD_SUBS_SINGLE', 4)),
         hold_subs_burst=int(os.environ.get('TERANOC_MSHR_HOLD_SUBS_BURST', 4)),
-        hold_window_single=int(os.environ.get('TERANOC_MSHR_HOLD_WINDOW_SINGLE', 0 if _LEGACY_RTL_CONFIG else 8191)),
-        hold_window_burst=int(os.environ.get('TERANOC_MSHR_HOLD_WINDOW_BURST', 2047 if _LEGACY_RTL_CONFIG else 8191)),
-        serve_timeout=int(os.environ.get('TERANOC_MSHR_SERVE_TIMEOUT', 2047 if _LEGACY_RTL_CONFIG else 8191)),
+        hold_window_single=int(os.environ.get(
+            'TERANOC_MSHR_HOLD_WINDOW_SINGLE',
+            0 if _LEGACY_RTL_CONFIG else TUNED_FP16_MSHR_HOLD_WINDOW_SINGLE)),
+        hold_window_burst=int(os.environ.get(
+            'TERANOC_MSHR_HOLD_WINDOW_BURST',
+            2047 if _LEGACY_RTL_CONFIG else TUNED_FP16_MSHR_HOLD_WINDOW_BURST)),
+        serve_timeout=int(os.environ.get(
+            'TERANOC_MSHR_SERVE_TIMEOUT',
+            2047 if _LEGACY_RTL_CONFIG else TUNED_FP16_MSHR_SERVE_TIMEOUT)),
         hold_prescale_w=int(os.environ.get('TERANOC_MSHR_HOLD_PRESCALE_W', 4 if _LEGACY_RTL_CONFIG else 6)),
         resp_wait_subs_single=int(os.environ.get('TERANOC_MSHR_RESP_WAIT_SUBS_SINGLE', 1)),
         bank_shift_single=int(os.environ.get('TERANOC_MSHR_BANK_SHIFT_SINGLE', 9)),
@@ -738,7 +753,8 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
         bypass_track_ways=int(os.environ.get('TERANOC_MSHR_BYPASS_WAYS', 4 if _LEGACY_RTL_CONFIG else 16)),
         bankfull_bp=int(os.environ.get('TERANOC_MSHR_BANKFULL_BP', 1)),
         cache_reuse_target=int(os.environ.get('TERANOC_MSHR_CACHE_REUSE_TARGET', 0)),
-        cache_timeout=int(os.environ.get('TERANOC_MSHR_CACHE_TIMEOUT', 0)),
+        cache_timeout=int(os.environ.get(
+            'TERANOC_MSHR_CACHE_TIMEOUT', TUNED_FP16_MSHR_CACHE_TIMEOUT)),
         cache_reclaimable=int(os.environ.get('TERANOC_MSHR_CACHE_RECLAIMABLE', 0)),
     ),
     # HW group barrier (mempool_group_barrier.sv). EnableGroupBarrier defaults
