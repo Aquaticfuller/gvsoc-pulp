@@ -210,7 +210,8 @@ private:
     // in which case every retirement lands in ONE window and time evolution is
     // invisible. TERANOC_MSHR_WIN_PERIOD makes it resolvable.
     int win_period = 8192;
-    void reset(bool active) override { if (active) { if(teranoc_telemetry::sink()) telemetry_snapshot(); this->hb_event.enqueue(65536); this->win_event.enqueue(this->win_period); } }
+    void reset(bool active) override { if (active) { if(teranoc_telemetry::sink()) telemetry_snapshot(); this->hb_event.enqueue(65536); this->win_event.enqueue(this->win_period);
+        if (this->stats_period > 0) this->stats_event.enqueue(this->stats_period); } }
 
     // ---------------- door (request path)
     vp::IoReqStatus handle_request(L1NocFlit *flit, int lane);
@@ -435,6 +436,9 @@ private:
     uint64_t stat_merged_single = 0, stat_merged_burst = 0;
     uint64_t stat_ret_single_1 = 0, stat_ret_single_2p = 0;
     uint64_t stat_ret_burst_1 = 0, stat_ret_burst_2p = 0;
+    // Which core's burst retired without ever finding its merge partner.
+    // Indexed by the OWNER's tile (the sub that allocated the entry).
+    std::vector<uint64_t> unpaired_tile, paired_tile;
     uint64_t stat_alloc_single = 0, stat_alloc_burst = 0;
     uint64_t stat_bypass_single = 0, stat_bypass_burst = 0;
     uint64_t stat_deny_stall = 0, stat_deny_meta = 0, stat_deny_slot = 0;
@@ -505,7 +509,7 @@ private:
     std::vector<int64_t> bank_merge_cycle;
     bool one_merge_per_bank = false;
     bool single_fetch_hold = false;
-    bool distributed_rob_tags = false;
+    bool distributed_rob_tags = true;
     std::vector<int64_t> bank_alloc_cycle;      // last cycle THIS group allocated, per bank
     std::vector<const void *> bank_alloc_owner; // self-check only; always `this`
     uint64_t stat_mshr_timeout = 0;   // hold windows expired below the sub target
@@ -625,6 +629,11 @@ private:
     vp::IoMaster *resp_out_itfs = nullptr;
     vp::ClockEvent fsm_event{this, &GroupMshr::door_handler};
     vp::ClockEvent hb_event{this, &GroupMshr::hb_handler};
+    // Live stats snapshot (TERANOC_MSHR_STATS_PERIOD, cycles; 0 = off).
+    static void stats_handler(vp::Block *__this, vp::ClockEvent *event);
+    void dump_stats(FILE *f);
+    vp::ClockEvent stats_event{this, &GroupMshr::stats_handler};
+    int stats_period = 0;
     vp::ClockEvent win_event{this, &GroupMshr::win_handler};
     vp::ClockEvent cfg_resp_event{this, &GroupMshr::cfg_resp_handler};
     std::deque<L1NocFlit *> cfg_resp_queue;
@@ -637,12 +646,11 @@ private:
 
 // ---------------------------------------------------------------------------
 
-GroupMshr::~GroupMshr()
+// The whole stats block, factored out of the destructor so it can also be written
+// WHILE THE RUN IS GOING (stats_handler below). Same text either way, so a live
+// snapshot and the teardown dump are directly comparable.
+void GroupMshr::dump_stats(FILE *f)
 {
-    this->ldh_flush();   // the final cycle's counts are still in flight
-    this->edh_flush();
-    FILE *f = fopen("mshr_stats.log", "a");
-    if (f)
     {
         unsigned long rs = this->stat_reqs_single, rb = this->stat_reqs_burst;
         unsigned long ms = this->stat_merged_single, mb = this->stat_merged_burst;
@@ -660,6 +668,11 @@ GroupMshr::~GroupMshr()
             this->get_path().c_str(),
             (unsigned long)this->stat_ret_single_1, (unsigned long)this->stat_ret_single_2p,
             (unsigned long)this->stat_ret_burst_1, (unsigned long)this->stat_ret_burst_2p);
+        fprintf(f, "  %s unpaired_by_tile:", this->get_path().c_str());
+        for (int t = 0; t < this->nb_tiles_per_group; t++)
+            fprintf(f, " %d:%lu/%lu", t, (unsigned long)this->unpaired_tile[t],
+                (unsigned long)(this->unpaired_tile[t] + this->paired_tile[t]));
+        fprintf(f, "\n");
         fprintf(f, "  %s burst_subs:", this->get_path().c_str());
         for (int k = 1; k <= 8; k++) fprintf(f, " %d:%lu", k, (unsigned long)this->stat_ret_burst_subs[k]);
         fprintf(f, " | single_subs:");
@@ -906,8 +919,41 @@ GroupMshr::~GroupMshr()
                 (unsigned long)this->stat_auto_stall[0], (unsigned long)this->stat_auto_stall[1],
                 (int)this->dyn_bypass[0], (int)this->dyn_bypass[1]);
         }
+    }
+}
+
+GroupMshr::~GroupMshr()
+{
+    this->ldh_flush();   // the final cycle's counts are still in flight
+    this->edh_flush();
+    FILE *f = fopen("mshr_stats.log", "a");
+    if (f) { this->dump_stats(f); fclose(f); }
+}
+
+// Periodic live snapshot. Opt-in via TERANOC_MSHR_STATS_PERIOD=<cycles>; the file
+// is TRUNCATED once per period and then appended to by each group, so it always
+// holds exactly one machine-wide snapshot and never grows without bound -- unlike
+// TERANOC_MSHR_WIN_PATH, which appends per period and reached 19 GB in one run.
+void GroupMshr::stats_handler(vp::Block *__this, vp::ClockEvent *)
+{
+    auto *_this = static_cast<GroupMshr *>(__this);
+    static const char *path = getenv("TERANOC_MSHR_STATS_LIVE");
+    static int64_t last_trunc = -1;
+    const int64_t now = _this->clock.get_cycles();
+    const char *p = path ? path : "mshr_stats_live.log";
+    // First instance to fire at this cycle truncates; the rest append to it.
+    FILE *f = fopen(p, (now != last_trunc) ? "w" : "a");
+    if (f)
+    {
+        if (now != last_trunc)
+        {
+            last_trunc = now;
+            fprintf(f, "=== live MSHR snapshot at cycle %ld ===\n", (long)now);
+        }
+        _this->dump_stats(f);
         fclose(f);
     }
+    _this->stats_event.enqueue(_this->stats_period);
 }
 
 GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
@@ -949,6 +995,11 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     {
         const char *wpp = getenv("TERANOC_MSHR_WIN_PERIOD");
         if (wpp) { int v = atoi(wpp); if (v > 0) this->win_period = v; }
+        // Live stats snapshot period in cycles; 0/unset = teardown only (the old
+        // behaviour). Writing the full block costs a few hundred us of host time,
+        // so keep the period large -- 100k cycles is plenty to watch a run.
+        const char *spp = getenv("TERANOC_MSHR_STATS_PERIOD");
+        if (spp) { int v = atoi(spp); if (v > 0) this->stats_period = v; }
     }
     this->spill = cfg->get_int("spill");
     this->spill_req_in = cfg->get_int("spill_req_in");
@@ -989,6 +1040,8 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->bank_ways.resize(this->nb_banks);
     this->bank_alloc.resize(this->nb_banks, 0);
     this->bank_full_miss.resize(this->nb_banks, 0);
+    this->unpaired_tile.resize(this->nb_tiles_per_group, 0);
+    this->paired_tile.resize(this->nb_tiles_per_group, 0);
     this->arr_tile_sum.resize(this->nb_tiles_per_group, 0);
     this->arr_tile_n.resize(this->nb_tiles_per_group, 0);
     this->bank_alloc_cycle.resize(this->nb_banks, -1);
@@ -1010,9 +1063,13 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->request_dispatch.resize(this->nb_lanes, nullptr);
     this->request_presented_cycle.resize(this->nb_lanes, -1);
     this->single_fetch_hold = enabled("TERANOC_MSHR_SINGLE_FETCH_HOLD");
-    const char *relaxed_tags = getenv("TERANOC_MSHR_DISTRIBUTED_TAGS");
-    this->distributed_rob_tags = enabled("TERANOC_VLSU_DISTRIBUTED_ROB") &&
-        relaxed_tags != nullptr && atoi(relaxed_tags) != 0;
+    // The RTL removed its cross-entry metadata overlap guard in 09c396a4
+    // (docs/mshr_metadata_guard_removal.md): banked and pool response tags now
+    // select the entry by tag, so a resident owner's metadata no longer has to
+    // exclude another request from the same core. Default to the RTL's behaviour.
+    // TERANOC_MSHR_METADATA_GUARD=1 restores the pre-09c396a4 guard for A/B.
+    const char *meta_guard = getenv("TERANOC_MSHR_METADATA_GUARD");
+    this->distributed_rob_tags = !(meta_guard && atoi(meta_guard) != 0);
     this->spent_ring.resize(this->nb_banks);
     {
         // Straggler release (see spent_ring). Depth = ways per bank: only the
@@ -1739,11 +1796,11 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
         //    corrupted the NI's burst accounting and deadlocked the tail, so
         //    those verdicts are VOID. Re-measured on the leak-fixed control
         //    (build65: gemm512 4x4 = 44,532, bit-identical to the anchor).
-        // Current RTL response tags advance in lane rows, but its overlap
-        // comparator still uses the word burst_len (not ceil(len/lanes)).
-        // Preserve the conservative guard by default. Relaxing it assumes
-        // disjoint physical reservations and is an explicit experiment, not
-        // an exact implementation of the RTL's modular range comparison.
+        // Pre-09c396a4 RTL guard, off by default now that the RTL has deleted
+        // it. It compared WORD burst_len rather than per-lane rows, so it stalled
+        // requests whose live ID ranges were disjoint: a core could hold only one
+        // resident burst, and wherever share_burst >= 2 parks entries for the hold
+        // window that blocked the core's entire burst stream.
         if (is_burst && !this->distributed_rob_tags)
         {
             for (Entry &o : this->entries)
@@ -1838,6 +1895,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             }
             this->stat_alloc++;
             this->bank_alloc[bank]++;
+            teranoc_telemetry::emit(*this, this->clock.get_cycles(), 34, bank);
             if (is_burst) this->stat_alloc_burst++; else this->stat_alloc_single++;
             this->trace.msg(vp::Trace::LEVEL_TRACE,
                 "MSHR_ALLOC lane=%d addr=0x%lx entry=%d len=%d\n",
@@ -1949,6 +2007,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
         if (bank_full && this->bankfull_bp)
         {
             this->bank_full_miss[bank]++;
+            teranoc_telemetry::emit(*this, this->clock.get_cycles(), 35, bank);
             this->stat_deny_bankfull++;
             this->lane_retry_owed[lane] = true;
             this->fsm_event.enqueue(1);
@@ -1957,6 +2016,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
         if (bank_full)
         {
             this->bank_full_miss[bank]++;
+            teranoc_telemetry::emit(*this, this->clock.get_cycles(), 35, bank);
             flit->mshr_tag = 0;
             this->stat_bypass++;
             if (is_burst) this->stat_bypass_burst++; else this->stat_bypass_single++;
@@ -3092,6 +3152,12 @@ void GroupMshr::retire_if_done(Entry *e)
         {
             this->stat_ret_burst_subs[sc]++;
             if (sc > 1) this->stat_ret_burst_2p++; else this->stat_ret_burst_1++;
+            if (!e->subs.empty())
+            {
+                int ot = e->subs[0].tile;
+                if (ot >= 0 && ot < this->nb_tiles_per_group)
+                    (sc > 1 ? this->paired_tile : this->unpaired_tile)[ot]++;
+            }
         }
         else
         {
@@ -3370,6 +3436,7 @@ void GroupMshr::telemetry_snapshot()
         old.klass.resize(this->entries.size(),-1);
         old.csr.resize(12,-1);
         teranoc_telemetry::emit(*this,this->clock.get_cycles(),16,5,this->num_entries,this->ways_per_bank);
+    teranoc_telemetry::emit(*this,this->clock.get_cycles(),16,34,this->nb_banks,this->ways_per_bank);
         // Explicit availability: zero events after registration means zero activity.
         teranoc_telemetry::emit(*this,this->clock.get_cycles(),16,25,this->num_entries,0);
         teranoc_telemetry::emit(*this,this->clock.get_cycles(),16,27,this->num_entries,this->ways_per_bank);
