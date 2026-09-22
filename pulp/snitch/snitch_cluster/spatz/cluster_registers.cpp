@@ -89,6 +89,10 @@ private:
     // xbar / core cell / remote xbar). One-time stderr tripwire if a partition CSR write arrives
     // with the config path unbound (the stale-gvsoc_config.json symptom).
     void push_config(uint32_t csr, uint32_t value);
+    // L1D flush/invalidate fan-out: `insn` as in CFG_L1D_INSN (0 private, 1 shared, 2 all,
+    // 3 invalidate-all); `tile_sel` one bit per tile, only honoured for insn 0 (the RTL forces all
+    // tiles for the others). Sets flush_busy_until_ from the slowest participating cell.
+    void l1d_issue_insn(uint32_t insn, uint64_t tile_sel);
 
     vp::Trace     trace;
     bool          cachepool_mode = false;
@@ -187,6 +191,16 @@ private:
     // (the legacy map predates partial barriers).
     uint64_t cachepool_mask0_off = 0;
     uint64_t cachepool_mask1_off = 0;
+    // L1D config block of the two newer maps (cachepool_peripheral.sv), or 0 for the legacy map,
+    // which keeps its older 0x28..0x4c block. Register order from the base:
+    //   +00 CFG_L1D_INSN  +04/+08 CFG_L1D_TILE_SEL_0/1  (+0c/+10 the barrier mask, handled apart)
+    //   +14 L1D_SPM_COMMIT  +18 L1D_INSN_COMMIT  +1c L1D_FLUSH_STATUS  +20 L1D_PRIVATE  +24 L1D_ADDR
+    //   +28 XBAR_OFFSET  +2c XBAR_OFFSET_COMMIT
+    // Without this the partition, boundary and xbar-offset writes of current binaries were
+    // swallowed as scratch, so every run kept the build-time geometry (all-shared) whatever
+    // l1d_part() asked for.
+    uint64_t l1d_base = 0;
+    uint32_t l1d_reg[12] = {0};
 
     static inline uint64_t core_mask(int nb_cores) {
         return nb_cores >= 64 ? ~0ULL : ((1ULL << nb_cores) - 1);
@@ -211,6 +225,7 @@ ClusterRegisters::ClusterRegisters(vp::ComponentConf &config)
         this->cachepool_eoc_off     = 0x1c;
         this->cachepool_mask0_off   = 0x30;
         this->cachepool_mask1_off   = 0x34;
+        this->l1d_base              = 0x24;
     }
     else if (map == "rlc_next")
     {
@@ -219,7 +234,12 @@ ClusterRegisters::ClusterRegisters(vp::ComponentConf &config)
         this->cachepool_eoc_off     = 0x14;
         this->cachepool_mask0_off   = 0x28;
         this->cachepool_mask1_off   = 0x2c;
+        this->l1d_base              = 0x1c;
     }
+    // Reset values (cachepool_peripheral.sv): private_start 0xA000_0000, 0 private banks,
+    // xbar offset 14. The model's build-time geometry stays in force until a commit.
+    this->l1d_reg[0x24 / 4] = 0xA0000000u;
+    this->l1d_reg[0x28 / 4] = 14u;
 
     auto nt = this->get_js_config()->get("nb_tiles");
     this->nb_tiles = (nt != NULL && nt->get_int() > 0) ? nt->get_int() : 1;
@@ -386,6 +406,28 @@ vp::IoReqStatus ClusterRegisters::req(vp::Block *__this, vp::IoReq *req)
     return vp::IO_REQ_OK;
 }
 
+void ClusterRegisters::l1d_issue_insn(uint32_t insn, uint64_t tile_sel)
+{
+    if (this->nb_flush <= 0) return;
+    const int banks_per_tile = this->nb_tiles > 0 ? this->nb_flush / this->nb_tiles : this->nb_flush;
+    int64_t max_lat = 0;
+    for (int i = 0; i < this->nb_flush; i++)
+    {
+        const int tile = banks_per_tile > 0 ? i / banks_per_tile : 0;   // flush ports are (group, tile, bank)-ordered
+        if (insn == 0 && tile < 64 && !((tile_sel >> tile) & 1)) continue;
+        this->flush_req_.init();
+        this->flush_req_.set_addr(insn);       // the cells read the insn code from the address
+        this->flush_req_.set_size(4);
+        this->flush_req_.set_is_write(false);
+        if (this->flush_out_itf[i].req(&this->flush_req_) == vp::IO_REQ_OK)
+        {
+            const int64_t lat = (int64_t)this->flush_req_.get_full_latency();
+            if (lat > max_lat) max_lat = lat;
+        }
+    }
+    this->flush_busy_until_ = this->clock.get_cycles() + max_lat;
+}
+
 void ClusterRegisters::push_config(uint32_t csr, uint32_t value)
 {
     if (!this->config_out_itf_.is_bound()) {
@@ -472,6 +514,42 @@ bool ClusterRegisters::cachepool_access(uint64_t offset, int size, uint8_t *data
         else if (data != nullptr)
         {
             uint32_t v = (uint32_t)(high ? (this->cluster_tile_mask >> 32) : this->cluster_tile_mask);
+            memset(data, 0, size);
+            memcpy(data, &v, size < 4 ? (size_t)size : 4);
+        }
+        return true;
+    }
+    if (this->l1d_base != 0 && offset >= this->l1d_base && offset < this->l1d_base + 0x30)
+    {
+        const uint32_t r = (uint32_t)(offset - this->l1d_base) / 4;
+        if (is_write)
+        {
+            uint32_t v = 0;
+            if (data != nullptr) memcpy(&v, data, size < 4 ? (size_t)size : 4);
+            this->l1d_reg[r] = v;
+            if (r == 0x18 / 4 && v != 0)          // L1D_INSN_COMMIT
+            {
+                // RTL: latch L1D_PRIVATE and L1D_ADDR, then issue CFG_L1D_INSN (every commit issues
+                // it; l1d_part() relies on that for its flush). Geometry first, so the flush walks
+                // the banks under the new partition, as the older-block path already does.
+                this->push_config(0 /*L1D_PRIVATE*/, this->l1d_reg[0x20 / 4] & 0xf);
+                this->push_config(1 /*L1D_ADDR*/,    this->l1d_reg[0x24 / 4]);
+                const uint64_t sel = ((uint64_t)this->l1d_reg[0x08 / 4] << 32) | this->l1d_reg[0x04 / 4];
+                this->l1d_issue_insn(this->l1d_reg[0x00 / 4] & 3, sel);
+                this->l1d_reg[r] = 0;             // the commit bit self-clears
+            }
+            else if (r == 0x2c / 4 && v != 0)     // XBAR_OFFSET_COMMIT
+            {
+                this->push_config(2 /*XBAR_OFFSET*/, this->l1d_reg[0x28 / 4] & 0x1f);
+                this->l1d_reg[r] = 0;
+            }
+            // L1D_SPM_COMMIT (+14): SPM carve-out is not modelled; the value is kept as scratch.
+        }
+        else if (data != nullptr)
+        {
+            const uint32_t v = (r == 0x1c / 4)   // L1D_FLUSH_STATUS: busy until the slowest cell ends
+                ? (this->clock.get_cycles() < this->flush_busy_until_ ? 1u : 0u)
+                : this->l1d_reg[r];
             memset(data, 0, size);
             memcpy(data, &v, size < 4 ? (size_t)size : 4);
         }
