@@ -82,7 +82,7 @@ def attach(component, vlen, nb_lanes, use_spatz=False, spatz_nb_ports=None, lane
 
     component.add_property('vu/nb_lanes', nb_lanes)
     component.add_property('vu/lsu_width', lane_width)
-    # Cache-line size, consumed only by the SPATZ_VLSU_LINE_SPLIT guard in spatz_vlsu.cpp, which
+    # Cache-line size, consumed only by the line-crossing clamp in spatz_vlsu.cpp, which
     # stops a unit-stride access from being coalesced ACROSS a line boundary. Unit-stride requests
     # are sized at the lane width regardless of element size, so a byte-element vse8.v on an
     # unaligned base becomes 4-byte chunks that can straddle a line the instruction never crossed --

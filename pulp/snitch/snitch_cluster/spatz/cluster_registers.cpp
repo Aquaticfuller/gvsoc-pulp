@@ -103,19 +103,16 @@ private:
     //   HW_BARRIER_PARTICIPATION_MASK_0/1  -       0x28 / 0x2c    0x30 / 0x34
     //   L1D block                      0x28..0x4c   (shifted)      (shifted)
     //
-    //   legacy       cachepool_fpu_512 -- everything in software/build/CachePoolTests
-    //   rlc_next     the RTL working tree, i.e. the frozen ELF sets under reports/handover/
+    //   legacy       old cachepool_fpu_512-era binaries (before the 2026-08 regmap change)
+    //   rlc_next     current RTL main: software/build/CachePoolTests as built today (4g and 16g
+    //                alike) and every frozen ELF set under reports/handover/
     //   multi_scalar dev/multi-scalar, where the two lock registers pushed everything down by 8
     //
     // Getting this wrong is silent, not loud: the barrier read lands on scratch and never blocks,
     // and the EOC write goes nowhere so the run simply never terminates.
     //
-    // NOT MODELLED, and it matters for the two newer maps: HW_BARRIER_PARTICIPATION_MASK. The
-    // barrier here is a plain counter to nb_cores that discards the value software writes (see
-    // hw_barrier_req), so snrt_barrier_set_tile_mask() lands in scratch and a partial barrier over a
-    // subset does not release when that subset arrives -- it waits for every core. Conservative
-    // rather than wrong for throughput, but it cannot answer a question about partial-barrier
-    // semantics, and a run of a kernel that depends on early release is not measuring that kernel.
+    // The participation mask IS modelled on the two newer maps: hw_barrier_req() implements the
+    // two-level masked barrier (cachepool_tile_barrier.sv + cachepool_cluster_barrier.sv).
     uint64_t      cachepool_barrier_off = 0x10;
     uint64_t      cachepool_boot_off    = 0x20;
     uint64_t      cachepool_eoc_off     = 0x24;
