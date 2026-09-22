@@ -176,6 +176,7 @@ void NetworkQueue::enqueue_router_req(vp::IoReq *req, bool is_address, bool wide
         }
 
         this->queue.push(router_req);
+        this->ni.pr_inj[wide ? 1 : 0]++;
 
         burst_base += size;
         burst_data += size;
@@ -424,11 +425,14 @@ vp::IoReqStatus NetworkInterface::handle_req(vp::IoReq *req)
     if (*queue || this->nb_pending_bursts[is_wide] >= this->ni_outstanding_reqs)
     {
         denied_queue->push(req);
+        this->pr_bursts_denied++;
         return vp::IO_REQ_DENIED;
     }
     else
     {
         this->nb_pending_bursts[is_wide]++;
+        this->pr_bursts_in++;
+        this->pr_pend[is_wide ? 1 : 0].add(this->clock.get_cycles(), 1);
         *queue = req;
         if (!req->get_is_write() || !*(int *)req->arg_get_last(NetworkInterface::REQ_WIDE))
         {
@@ -463,6 +467,7 @@ bool NetworkInterface::handle_request(FloonocNode *node, vp::IoReq *req, int fro
                         this->get_path().c_str(), (long)this->clock.get_cycles(), burst, (int)wide,
                         this->nb_pending_bursts[wide] - 1);
             this->nb_pending_bursts[wide]--;
+            this->pr_pend[wide ? 1 : 0].add(this->clock.get_cycles(), -1);
 
             burst->get_resp_port()->resp(burst);
         }
@@ -481,6 +486,7 @@ bool NetworkInterface::handle_request(FloonocNode *node, vp::IoReq *req, int fro
                             this->get_path().c_str(), (long)this->clock.get_cycles(), burst, (int)wide,
                             this->nb_pending_bursts[wide] - 1);
                 this->nb_pending_bursts[wide]--;
+                this->pr_pend[wide ? 1 : 0].add(this->clock.get_cycles(), -1);
                 burst->get_resp_port()->resp(burst);
             }
         }
@@ -497,6 +503,7 @@ bool NetworkInterface::handle_request(FloonocNode *node, vp::IoReq *req, int fro
             req, req->get_addr(), req->get_size(), req->get_int(FlooNoc::REQ_IS_ADDRESS), this->x,
             this->y, origin_ni->get_x(), origin_ni->get_y());
 
+        this->pr_ej[*(bool *)req->arg_get(FlooNoc::REQ_WIDE) ? 1 : 0]++;
         if ((req->get_is_write() && !req->get_int(FlooNoc::REQ_IS_ADDRESS)) || !req->get_is_write())
         {
             bool is_stalled = false;
@@ -599,7 +606,7 @@ void NetworkInterface::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
     {
         _this->trace.msg(vp::Trace::LEVEL_TRACE, "Unstalling denied request (req: %p)\n", _this->wide_denied_read_req.front());
         vp::IoReq *req = _this->wide_denied_read_req.front();
-        _this->nb_pending_bursts[1]++;
+        _this->nb_pending_bursts[1]++; _this->pr_bursts_in++; _this->pr_pend[1].add(_this->clock.get_cycles(), 1);
         _this->wide_read_pending_burst = req;
         _this->wide_denied_read_req.pop();
         if (!req->get_is_write())
@@ -618,7 +625,7 @@ void NetworkInterface::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
     {
         _this->trace.msg(vp::Trace::LEVEL_TRACE, "Unstalling denied request (req: %p)\n", _this->wide_denied_write_req.front());
         vp::IoReq *req = _this->wide_denied_write_req.front();
-        _this->nb_pending_bursts[1]++;
+        _this->nb_pending_bursts[1]++; _this->pr_bursts_in++; _this->pr_pend[1].add(_this->clock.get_cycles(), 1);
         _this->wide_write_pending_burst = req;
         _this->wide_denied_write_req.pop();
         if (!req->get_is_write())
@@ -638,7 +645,7 @@ void NetworkInterface::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
     {
         _this->trace.msg(vp::Trace::LEVEL_TRACE, "Unstalling denied request (req: %p)\n", _this->narrow_denied_read_req.front());
         vp::IoReq *req = _this->narrow_denied_read_req.front();
-        _this->nb_pending_bursts[0]++;
+        _this->nb_pending_bursts[0]++; _this->pr_bursts_in++; _this->pr_pend[0].add(_this->clock.get_cycles(), 1);
         _this->narrow_read_pending_burst = req;
         _this->narrow_denied_read_req.pop();
         _this->req_queue.handle_req(req);
@@ -650,7 +657,7 @@ void NetworkInterface::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
     {
         _this->trace.msg(vp::Trace::LEVEL_TRACE, "Unstalling denied request (req: %p)\n", _this->narrow_denied_write_req.front());
         vp::IoReq *req = _this->narrow_denied_write_req.front();
-        _this->nb_pending_bursts[0]++;
+        _this->nb_pending_bursts[0]++; _this->pr_bursts_in++; _this->pr_pend[0].add(_this->clock.get_cycles(), 1);
         _this->narrow_write_pending_burst = req;
         _this->narrow_denied_write_req.pop();
         _this->req_queue.handle_req(req);

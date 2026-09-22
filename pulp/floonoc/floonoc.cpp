@@ -239,6 +239,29 @@ void FlooNoc::reset(bool active)
 {
 }
 
+// perf-probe (prompt/perf_probe_design.md §4.6). Names carry the plane and the grid position so
+// the analysis can rebuild the mesh: "<plane>_<x>_<y>" for routers, "ni_<x>_<y>" for interfaces.
+void FlooNoc::start()
+{
+    if (probe::get(this) == nullptr) return;
+    for (int y = 0; y < this->dim_y; y++)
+    {
+        for (int x = 0; x < this->dim_x; x++)
+        {
+            int i = y * this->dim_x + x;
+            std::string pos = std::to_string(x) + "_" + std::to_string(y);
+            if (i < (int)this->req_routers.size() && this->req_routers[i])
+                probe::attach(this, this->req_routers[i], "req_" + pos);
+            if (i < (int)this->rsp_routers.size() && this->rsp_routers[i])
+                probe::attach(this, this->rsp_routers[i], "rsp_" + pos);
+            if (i < (int)this->wide_routers.size() && this->wide_routers[i])
+                probe::attach(this, this->wide_routers[i], "wide_" + pos);
+            if (i < (int)this->network_interfaces.size() && this->network_interfaces[i])
+                probe::attach(this, this->network_interfaces[i], "ni_" + pos);
+        }
+    }
+}
+
 
 
 Entry *FlooNoc::get_entry(uint64_t base, uint64_t size)

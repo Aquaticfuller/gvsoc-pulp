@@ -57,6 +57,40 @@ Router::Router(FlooNoc *noc, std::string name, int x, int y, int queue_size)
     }
 }
 
+void Router::probe_columns(std::vector<probe::Column> &c) const
+{
+    static const char *dir[5] = {"E", "W", "N", "S", "L"};
+    static std::string names[20];
+    static bool init = false;
+    if (!init)
+    {
+        for (int i = 0; i < 5; i++)
+        {
+            names[i]      = std::string("in_") + dir[i];
+            names[5 + i]  = std::string("out_") + dir[i];
+            names[10 + i] = std::string("stall_") + dir[i];
+            names[15 + i] = std::string("occ_") + dir[i];
+        }
+        init = true;
+    }
+    c.clear();
+    for (int i = 0; i < 20; i++) c.push_back({names[i].c_str(), probe::COUNTER});
+}
+
+void Router::probe_sample(int64_t now, std::vector<uint64_t> &v)
+{
+    v.resize(20);
+    for (int i = 0; i < 5; i++)
+    {
+        v[i] = pr_in[i];
+        v[5 + i] = pr_out[i];
+        // An open stall interval is charged up to `now`.
+        v[10 + i] = pr_stall[i] + (pr_stall_iv[i].open() && now > pr_stall_iv[i].start
+                                       ? (uint64_t)(now - pr_stall_iv[i].start) : 0);
+        v[15 + i] = pr_occ[i].read(now);
+    }
+}
+
 Router::~Router()
 {
     for (int i = 0; i < 5; i++)
@@ -87,6 +121,8 @@ bool Router::handle_request(FloonocNode *node, vp::IoReq *req, int from_x, int f
     // And push it to the queue. The queue will automatically trigger the FSM if needed
     RouterQueue *queue = this->input_queues[queue_index];
     queue->queue.push_back(req, 1); // The queue has an intrinsic delay of 1. With this additional delay, we model the fact that a real router takes 2 cycles to forward a request
+    this->pr_in[queue_index]++;
+    this->pr_occ[queue_index].add(this->clock.get_cycles(), 1);
 
     // We let the source enqueue one more request than what is possible to model the fact
     // the request is stalled. This will then stall the source which will not send any request there
@@ -170,6 +206,8 @@ void Router::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
             // Since we now know, that the request will be propagated, remove it from the queue
             queue->queue.pop();
+            _this->pr_out[out_queue_id]++;
+            _this->pr_occ[in_queue_index].add(_this->clock.get_cycles(), -1);
 
             if (queue->queue.size() == _this->queue_size) // Remember we let the source enqueue one more request than what is possible.
             {
@@ -191,6 +229,7 @@ void Router::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
             {
                 _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Stalling queue (position: (%d, %d), queue: %d)\n", _this->x, _this->y, out_queue_id);
                 _this->stalled_queues[out_queue_id] = true;
+                _this->pr_stall_set(out_queue_id, true);
             }
             _this->current_queue = in_queue_index + 1; // Always start looking from the queue after the one that has been processed last
             if (_this->current_queue == 5)
@@ -265,6 +304,7 @@ void Router::unstall_queue(int from_x, int from_y)
     int queue = this->get_req_queue(from_x, from_y);
     this->trace.msg(vp::Trace::LEVEL_TRACE, "Unstalling queue (position: (%d, %d), queue: %d)\n", from_x, from_y, queue);
     this->stalled_queues[queue] = false;
+    this->pr_stall_set(queue, false);
     // And check in next cycle if another request can be sent
     this->fsm_event.enqueue();
 }
@@ -274,6 +314,7 @@ void Router::stall_queue(int from_x, int from_y)
     int queue = this->get_req_queue(from_x, from_y);
     this->trace.msg(vp::Trace::LEVEL_TRACE, "Stalling queue (position: (%d, %d), queue: %d)\n", from_x, from_y, queue);
     this->stalled_queues[queue] = true;
+    this->pr_stall_set(queue, true);
 }
 
 void Router::get_pos_from_queue(int queue, int &pos_x, int &pos_y)

@@ -26,6 +26,7 @@
 #include <vp/vp.hpp>
 #include <vp/signal.hpp>
 #include "floonoc.hpp"
+#include "probe/perf_probe.hpp"
 
 class FlooNoc;
 
@@ -43,13 +44,29 @@ public:
  * Router are the nodes of the noc which are moving internal requests from the network interface
  * to the target.
  */
-class Router : public FloonocNode
+class Router : public FloonocNode, public probe::Source
 {
 public:
     Router(FlooNoc *noc, std::string name, int x, int y, int queue_size);
     ~Router();
 
     void reset(bool active);
+
+    // perf-probe source (prompt/perf_probe_design.md §4.6): per input direction flits accepted,
+    // per output direction flits forwarded, cycles the output was stalled by back-pressure, and
+    // Σ(input-queue length · cycles). Direction order: 0 right(E) 1 left(W) 2 up(N) 3 down(S) 4 local.
+    const char *probe_kind() const override { return "noc_router"; }
+    void probe_columns(std::vector<probe::Column> &c) const override;
+    void probe_sample(int64_t now, std::vector<uint64_t> &v) override;
+    uint64_t pr_in[5] = {0}, pr_out[5] = {0}, pr_stall[5] = {0};
+    probe::Occupancy pr_occ[5];
+    probe::Interval pr_stall_iv[5];
+    inline void pr_stall_set(int q, bool stalled)
+    {
+        int64_t now = this->clock.get_cycles();
+        if (stalled) { if (!pr_stall_iv[q].open()) pr_stall_iv[q].begin(now); }
+        else pr_stall[q] += pr_stall_iv[q].end(now);
+    }
 
     // This gets called by other routers or a network interface to move a request to this router
     bool handle_request(FloonocNode *node, vp::IoReq *req, int from_x, int from_y) override;

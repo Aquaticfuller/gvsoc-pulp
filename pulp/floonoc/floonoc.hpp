@@ -93,6 +93,8 @@ public:
     ~FlooNoc();
 
     void reset(bool active);
+    // perf-probe: attach one source per router (per plane) and per network interface.
+    void start() override;
 
 
     // Return the memory-mapped entry corresponding to the specified mapping. Can be used to get

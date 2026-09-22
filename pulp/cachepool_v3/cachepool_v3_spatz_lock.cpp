@@ -93,13 +93,30 @@
 #define REASON_BUSY      1
 #define REASON_PENDING   2
 
-class SpatzLock : public vp::Component
+#include "probe/perf_probe.hpp"
+
+class SpatzLock : public vp::Component, public probe::Source
 {
 public:
     SpatzLock(vp::ComponentConf &config);
 
     void reset(bool active) override;
     void stop() override;
+    void start() override { probe::attach(this, this); }
+
+    // perf-probe source (prompt/perf_probe_design.md §4.7).
+    const char *probe_kind() const override { return "spatz_lock"; }
+    void probe_columns(std::vector<probe::Column> &c) const override
+    {
+        c = {{"ops", probe::COUNTER}, {"handover", probe::COUNTER}, {"denied", probe::COUNTER},
+             {"lsu_gate_block", probe::COUNTER}, {"locked_occ", probe::COUNTER},
+             {"state", probe::GAUGE}, {"owner", probe::GAUGE}};
+    }
+    void probe_sample(int64_t now, std::vector<uint64_t> &v) override
+    {
+        v = {n_lock_ops, n_handover, n_want_denied, n_lsu_gate_block, locked_occ.read(now),
+             (uint64_t)this->state, (uint64_t)(this->owner < 0 ? 0 : this->owner)};
+    }
 
 private:
     typedef enum
@@ -179,6 +196,9 @@ private:
     // Invariant: with free_mode_exclusive (or Locked), at most ONE hart may have vector work in
     // flight at a time -- there is one physical Spatz. Anything above 1 is a modelling escape.
     int max_concurrent_inflight;
+    // perf-probe: Σ(cycles the lock is held by one hart) -- level 1 while state == LOCKED.
+    probe::Occupancy locked_occ;
+    inline void probe_state_note() { this->locked_occ.set(this->clock.get_cycles(), this->state == STATE_LOCKED ? 1 : 0); }
 };
 
 SpatzLock::SpatzLock(vp::ComponentConf &config)
@@ -225,7 +245,7 @@ void SpatzLock::reset(bool active)
 {
     if (!active)
     {
-        this->state = STATE_FREE;
+        this->state = STATE_FREE; this->probe_state_note();
         this->owner = 0;
         this->pending_owner = 0;
         this->free_holder = -1;
@@ -428,13 +448,13 @@ void SpatzLock::update()
     if (this->state == STATE_ACQ_WAIT && this->drained())
     {
         this->owner = this->pending_owner;
-        this->state = STATE_LOCKED;
+        this->state = STATE_LOCKED; this->probe_state_note();
         this->trace.msg(vp::Trace::LEVEL_DEBUG, "AcqWait drained, owner=%d\n", this->owner);
     }
     else if (this->state == STATE_REL_WAIT && this->drained())
     {
         this->owner = 0;
-        this->state = STATE_FREE;
+        this->state = STATE_FREE; this->probe_state_note();
         this->free_holder = -1;
         this->trace.msg(vp::Trace::LEVEL_DEBUG, "RelWait drained, back to Free\n");
     }
@@ -455,14 +475,14 @@ uint32_t SpatzLock::lock_op(int host, bool is_acquire)
             {
                 if (this->drained())
                 {
-                    this->state = STATE_LOCKED;
+                    this->state = STATE_LOCKED; this->probe_state_note();
                     this->owner = host;
                     outcome = OUTCOME_SUCCESS;
                 }
                 else
                 {
                     this->pending_owner = host;
-                    this->state = STATE_ACQ_WAIT;
+                    this->state = STATE_ACQ_WAIT; this->probe_state_note();
                     outcome = OUTCOME_SUCCESS_WAIT;
                 }
             }
@@ -485,7 +505,7 @@ uint32_t SpatzLock::lock_op(int host, bool is_acquire)
             {
                 if (this->drained())
                 {
-                    this->state = STATE_FREE;
+                    this->state = STATE_FREE; this->probe_state_note();
                     this->owner = 0;
                     this->free_holder = -1;
                     outcome = OUTCOME_SUCCESS;
@@ -493,7 +513,7 @@ uint32_t SpatzLock::lock_op(int host, bool is_acquire)
                 else
                 {
                     this->pending_owner = host;
-                    this->state = STATE_REL_WAIT;
+                    this->state = STATE_REL_WAIT; this->probe_state_note();
                     outcome = OUTCOME_SUCCESS_WAIT;
                 }
             }

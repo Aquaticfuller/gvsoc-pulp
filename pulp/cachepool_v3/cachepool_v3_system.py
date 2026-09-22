@@ -63,6 +63,14 @@ _MEM_LATENCY       = int(os.environ.get('CACHEPOOL_V3_MEM_LATENCY', '50'))
 # each channel with its own DRAMSys instance.
 _DRAMSYS           = int(os.environ.get('CACHEPOOL_V3_DRAMSYS', '0')) != 0
 _DRAM_TYPE         = os.environ.get('CACHEPOOL_V3_DRAM_TYPE', 'hbm2-example.json')
+# Time-sliced performance probes (prompt/perf_probe_design.md). OFF by default: with no collector
+# in the tree every probe::Source's attach() is a no-op. ON, one collector samples every source
+# each PERF_PROBE_SLICE cycles into PERF_PROBE_DIR/, and the software probe port is mapped at
+# PERF_PROBE_BASE so the kernel can add its own events (perf_probe_events.h).
+_PROBE             = int(os.environ.get('CACHEPOOL_V3_PROBE', '0')) != 0
+_PROBE_SLICE       = int(os.environ.get('PERF_PROBE_SLICE', '1000'))
+_PROBE_DIR         = os.environ.get('PERF_PROBE_DIR', 'perf_probe')
+_PROBE_KINDS       = os.environ.get('PERF_PROBE_KINDS', '')
 
 _NB_GROUPS   = _NB_X_GROUPS * _NB_Y_GROUPS
 _NB_TILES    = _NB_GROUPS * _TILES_PER_GROUP
@@ -355,6 +363,14 @@ class CachepoolV3SoC(st.Component):
         self.bind(soc_ico, 'rom',        rom,        'input')
         self.bind(soc_ico, 'peripheral', peripheral, 'input')
         self.bind(soc_ico, 'uart',       uart,       'input')
+        if _PROBE:
+            from probe.perf_probe_collector import (PerfProbeCollector, PERF_PROBE_BASE,
+                                                    PERF_PROBE_WINDOW_SIZE)
+            probe_collector = PerfProbeCollector(self, 'perf_probe', slice_cycles=_PROBE_SLICE,
+                                                 out_dir=_PROBE_DIR, kinds=_PROBE_KINDS)
+            soc_ico.add_mapping('probe', base=PERF_PROBE_BASE, remove_offset=PERF_PROBE_BASE,
+                                size=PERF_PROBE_WINDOW_SIZE, latency=1)
+            self.bind(soc_ico, 'probe', probe_collector, 'input')
 
         # ---------------- per-group egress routing ----------------
         # Wide (refill/evict) and narrow (ROM/peripheral/UART) each get their own router per group,

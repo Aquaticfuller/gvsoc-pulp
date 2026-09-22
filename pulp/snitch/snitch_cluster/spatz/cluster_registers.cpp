@@ -22,12 +22,13 @@
 #include <vp/itf/wire.hpp>
 #include <pulp/snitch/snitch_cluster/spatz/cluster_periph_regfields.h>
 #include <pulp/snitch/snitch_cluster/spatz/cluster_periph_gvsoc.h>
+#include "probe/perf_probe.hpp"
 
 
 using namespace std::placeholders;
 
 
-class ClusterRegisters : public vp::Component
+class ClusterRegisters : public vp::Component, public probe::Source
 {
 
 public:
@@ -35,6 +36,38 @@ public:
     ClusterRegisters(vp::ComponentConf &config);
 
     void reset(bool active);
+    void start() override;
+
+    // perf-probe (prompt/perf_probe_design.md §4.7). The component itself is the cluster-level
+    // "barrier" source; one BarrierHart adapter per core is attached under it as "hart_<i>".
+    const char *probe_kind() const override { return "barrier"; }
+    void probe_columns(std::vector<probe::Column> &c) const override
+    {
+        c = {{"rounds", probe::COUNTER}, {"wait_cycles", probe::COUNTER}, {"waiting", probe::GAUGE}};
+    }
+    void probe_sample(int64_t now, std::vector<uint64_t> &v) override
+    {
+        v = {pr_cluster_rounds, pr_cluster_wait, (uint64_t)pr_nb_waiting};
+    }
+    struct BarrierHart : public probe::Source
+    {
+        uint64_t rounds = 0, wait_cycles = 0;
+        int64_t arrive = -1;
+        const char *probe_kind() const override { return "barrier"; }
+        void probe_columns(std::vector<probe::Column> &c) const override
+        {
+            c = {{"rounds", probe::COUNTER}, {"wait_cycles", probe::COUNTER}, {"waiting", probe::GAUGE}};
+        }
+        void probe_sample(int64_t now, std::vector<uint64_t> &v) override
+        {
+            // An open wait is charged up to `now` so a long park shows in the slices it spans.
+            uint64_t open = arrive >= 0 && now > arrive ? (uint64_t)(now - arrive) : 0;
+            v = {rounds, wait_cycles + open, (uint64_t)(arrive >= 0 ? 1 : 0)};
+        }
+    };
+    std::vector<BarrierHart> pr_harts;
+    uint64_t pr_cluster_rounds = 0, pr_cluster_wait = 0;
+    int pr_nb_waiting = 0;
 
 
 private:
@@ -659,6 +692,18 @@ void ClusterRegisters::barrier_release_check(int completing_core, uint64_t relea
     }
 }
 
+void ClusterRegisters::start()
+{
+    this->pr_harts.resize(this->nb_cores);
+    if (probe::attach(this, this))
+    {
+        for (int i = 0; i < this->nb_cores; i++)
+        {
+            probe::attach(this, &this->pr_harts[i], "hart_" + std::to_string(i));
+        }
+    }
+}
+
 void ClusterRegisters::reset(bool active)
 {
     this->new_reg("barrier_status", &this->barrier_status, 0, true);
@@ -748,6 +793,11 @@ void ClusterRegisters::hw_barrier_req(uint64_t reg_offset, int size, uint8_t *va
         }
         this->tile_arrived[t] |= 1ULL << lane;
         this->barrier_status.set(this->barrier_status.get() + 1);   // debug visibility only
+        if (id < (int)this->pr_harts.size() && this->pr_harts[id].arrive < 0)
+        {
+            this->pr_harts[id].arrive = this->clock.get_cycles();
+            this->pr_nb_waiting++;
+        }
 
         // local_barrier = (is_barrier & core_mask_q) == core_mask_q
         if ((this->tile_arrived[t] & this->tile_mask[t]) != this->tile_mask[t])
@@ -785,6 +835,14 @@ void ClusterRegisters::hw_barrier_req(uint64_t reg_offset, int size, uint8_t *va
 
             this->barrier_status.set(0);
             this->tile_at_barrier = 0;
+            this->pr_cluster_rounds++;
+            // The completing core never parked: close its own (zero-length) wait here.
+            if (id < (int)this->pr_harts.size() && this->pr_harts[id].arrive >= 0)
+            {
+                this->pr_harts[id].rounds++;
+                this->pr_harts[id].arrive = -1;
+                this->pr_nb_waiting--;
+            }
 
             // Release exactly the cores in Global -- those whose OWN tile barrier has fired.
             // `barrier_done_o` is a single unmasked broadcast and every tile's per-port FSM takes it
@@ -816,6 +874,15 @@ void ClusterRegisters::hw_barrier_req(uint64_t reg_offset, int size, uint8_t *va
                     this->waiting_reqs[core]->get_resp_port()->resp(this->waiting_reqs[core]);
                     this->waiting_reqs[core] = nullptr;
                     if (core < 64) { this->waiting_cores &= ~(1ULL << core); released |= 1ULL << core; }
+                    if (core < (int)this->pr_harts.size() && this->pr_harts[core].arrive >= 0)
+                    {
+                        const uint64_t w = (uint64_t)(this->clock.get_cycles() - this->pr_harts[core].arrive);
+                        this->pr_harts[core].wait_cycles += w;
+                        this->pr_harts[core].rounds++;
+                        this->pr_harts[core].arrive = -1;
+                        this->pr_cluster_wait += w;
+                        this->pr_nb_waiting--;
+                    }
                 }
             }
 

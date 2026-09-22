@@ -25,6 +25,7 @@
 #include <vp/vp.hpp>
 #include <list>
 #include "floonoc.hpp"
+#include "probe/perf_probe.hpp"
 
 class FlooNoc;
 class NetworkInterface;
@@ -66,9 +67,29 @@ private:
  * The network interface is then in charge of splitting the bursts into request which fit
  * the noc width and pass them to the closest router, so that they routed to the destination
  */
-class NetworkInterface : public FloonocNode
+class NetworkInterface : public FloonocNode, public probe::Source
 {
     friend class NetworkQueue;
+
+public:
+    // perf-probe source (prompt/perf_probe_design.md §4.6): flits injected into / ejected from the
+    // mesh at this node, bursts admitted (and refused) at the initiator side, and Σ(pending
+    // bursts · cycles) on each plane.
+    const char *probe_kind() const override { return "noc_ni"; }
+    void probe_columns(std::vector<probe::Column> &c) const override
+    {
+        c = {{"inj_narrow", probe::COUNTER}, {"inj_wide", probe::COUNTER},
+             {"ej_narrow", probe::COUNTER}, {"ej_wide", probe::COUNTER},
+             {"bursts_in", probe::COUNTER}, {"bursts_denied", probe::COUNTER},
+             {"pend_occ_narrow", probe::COUNTER}, {"pend_occ_wide", probe::COUNTER}};
+    }
+    void probe_sample(int64_t now, std::vector<uint64_t> &v) override
+    {
+        v = {pr_inj[0], pr_inj[1], pr_ej[0], pr_ej[1], pr_bursts_in, pr_bursts_denied,
+             pr_pend[0].read(now), pr_pend[1].read(now)};
+    }
+    uint64_t pr_inj[2] = {0}, pr_ej[2] = {0}, pr_bursts_in = 0, pr_bursts_denied = 0;
+    probe::Occupancy pr_pend[2];
 
 public:
     static constexpr int NW_REQ   = 0;
