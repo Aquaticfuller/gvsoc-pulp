@@ -14,11 +14,13 @@ class L1_noc(FlooNoc2dMeshNarrow):
 
     def __init__(self, parent: gvsoc.systree.Component, name, width: int,
             nb_x_groups: int, nb_y_groups: int, router_input_queue_size: int = 2,
-            router_output_queue_size: int = 2, max_burst_size: int = 0):
+            router_output_queue_size: int = 2, max_burst_size: int = 0,
+            local_extra_fifo_depth: int = 0):
         super().__init__(parent, name, width, dim_x=nb_x_groups, dim_y=nb_y_groups,
             router_input_queue_size=router_input_queue_size,
             router_output_queue_size=router_output_queue_size,
-            max_burst_size=max_burst_size)
+            max_burst_size=max_burst_size,
+            local_extra_fifo_depth=local_extra_fifo_depth)
 
 
 # Some external experiments used CamelCase while the canonical v1 class is

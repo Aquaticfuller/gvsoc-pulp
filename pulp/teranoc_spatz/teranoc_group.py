@@ -92,9 +92,9 @@ class TeranocGroup(st.Component):
                 route_l1_source_tile=True, request_only=True,
                 header_flit=arch.vlsu_burst.enable))
 
-        # Source-side group coalescing MSHR (teranoc_spatz): on the NoC-bound
-        # remote lanes between the tiles and the request remapper, and between
-        # the cluster response planes and the response routers.
+        # Source-side group coalescing MSHR (teranoc_spatz): on NoC-bound
+        # request lanes and on returning response lanes. The optional response
+        # order places the local crossbar before the MSHR, as in RTL.
         group_mshr = None
         if arch.group_mshr.enable:
             group_mshr = GroupMshr(self, 'group_mshr',
@@ -276,10 +276,16 @@ class TeranocGroup(st.Component):
             for j in range(0, arch.nb_inter_group_ports_per_tile):
                 l1_noc_req_routers[j].o_OUTPUT(i, self.tile_list[i].i_L1_NOC_REQ_SLV(j))
 
-        # L1 noc response router -> Tile l1 noc response master
+        # L1 noc response router -> MSHR -> tile in the RTL response order.
+        # The calibrated legacy order remains selectable for default profiles.
         for i in range(0, arch.nb_tiles_per_group):
             for j in range(0, arch.nb_inter_group_ports_per_tile):
-                l1_noc_resp_routers[j].o_OUTPUT(i, self.tile_list[i].i_L1_NOC_RESP_MST(j))
+                lane = i * arch.nb_inter_group_ports_per_tile + j
+                if group_mshr is not None and arch.group_mshr_resp_after_xbar:
+                    l1_noc_resp_routers[j].o_OUTPUT(i, group_mshr.i_RESP_IN(lane))
+                    group_mshr.o_RESP_OUT(lane, self.tile_list[i].i_L1_NOC_RESP_MST(j))
+                else:
+                    l1_noc_resp_routers[j].o_OUTPUT(i, self.tile_list[i].i_L1_NOC_RESP_MST(j))
 
         # AXI Interconnect
         # Tile axi port -> axi interconnect
@@ -326,9 +332,14 @@ class TeranocGroup(st.Component):
             for port in range(0, arch.nb_inter_group_ports_per_tile):
                 lane = i * arch.nb_inter_group_ports_per_tile + port
                 if group_mshr is not None:
-                    self.itf_bind(f'l1_noc_resp_mst_{lane}', group_mshr.i_RESP_IN(lane),
-                        signature=IoV2SingleReq(), composite_bind=True)
-                    group_mshr.o_RESP_OUT(lane, l1_noc_resp_routers[port].i_INPUT(i))
+                    if arch.group_mshr_resp_after_xbar:
+                        self.itf_bind(f'l1_noc_resp_mst_{lane}',
+                            l1_noc_resp_routers[port].i_INPUT(i),
+                            signature=IoV2SingleReq(), composite_bind=True)
+                    else:
+                        self.itf_bind(f'l1_noc_resp_mst_{lane}', group_mshr.i_RESP_IN(lane),
+                            signature=IoV2SingleReq(), composite_bind=True)
+                        group_mshr.o_RESP_OUT(lane, l1_noc_resp_routers[port].i_INPUT(i))
                 else:
                     self.itf_bind(f'l1_noc_resp_mst_{lane}',
                         l1_noc_resp_routers[port].i_INPUT(i),

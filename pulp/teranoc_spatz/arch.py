@@ -238,10 +238,12 @@ class TeranocConfig:
     axi_wide_routing:          str = 'shortest'
     l2_placement:             str = 'hops'
     dma_posted_writes:        bool = False
-    # FlooNoC router configuration. Request and response planes use the same
-    # hardware router parameters but remain separate networks.
+    # FlooNoC router configuration. Response outputs may have a separate
+    # depth and an extra fall-through FIFO on the local ejection link.
     l1_noc_router_input_fifo_depth:  int = 2
     l1_noc_router_output_fifo_depth: int = 2
+    l1_noc_resp_router_output_fifo_depth: 'int | None' = None
+    l1_noc_resp_local_extra_fifo_depth: int = 0
     l1_noc_topology:                 str = 'mesh'
     l1_noc_routing:                  str = 'xy'
     # Directional tile-boundary registers in mempool_tile.sv.
@@ -254,6 +256,7 @@ class TeranocConfig:
     # until the model components consume them (Phases 2-4).
     vlsu_burst:   'VlsuBurstConfig'  = VlsuBurstConfig()
     group_mshr:   'GroupMshrConfig'  = GroupMshrConfig()
+    group_mshr_resp_after_xbar: bool = False
     group_barrier: 'GroupBarrierConfig' = GroupBarrierConfig()
 
     def __post_init__(self):
@@ -298,6 +301,9 @@ class TeranocConfig:
         assert self.l2_placement in ('hops', 'linkload')
         assert self.l2_placement != 'linkload' or self.axi_wide_routing == 'yx'
         assert self.l1_noc_router_output_fifo_depth > 0
+        assert (self.l1_noc_resp_router_output_fifo_depth is None or
+                self.l1_noc_resp_router_output_fifo_depth >= 2)
+        assert self.l1_noc_resp_local_extra_fifo_depth >= 0
         assert self.l1_noc_topology == 'mesh', \
             "teranoc_spatz currently models only the RTL 2D mesh"
         assert self.l1_noc_routing == 'xy', \
@@ -792,6 +798,14 @@ CONFIGS = {
     'minpool_spatz4_fpu':   MINPOOL_SPATZ4_FPU,
     'mempool_spatz4_fpu':   MEMPOOL_SPATZ4_FPU,
     'terapool_spatz4_fpu':  TERAPOOL_SPATZ4_FPU,
+    'terapool_spatz4_fpu_resp_xbar': replace(TERAPOOL_SPATZ4_FPU,
+        group_mshr_resp_after_xbar=True),
+    # Optional RTL 9ee08804 response-ejection experiment: response router
+    # output depth 2, plus a fall-through six-entry local output FIFO.
+    'terapool_spatz4_fpu_resp_fifo6': replace(TERAPOOL_SPATZ4_FPU,
+        l1_noc_resp_router_output_fifo_depth=2,
+        l1_noc_resp_local_extra_fifo_depth=6,
+        group_mshr_resp_after_xbar=True),
     # Feature-off variants for one-knob-apart comparison (each is its own
     # compiled platform tree — component presence is structural, so runtime
     # env switches can't do this; see runner_gvrun2's tree SHA check).
@@ -813,6 +827,18 @@ CONFIGS = {
         nb_x_groups=8, nb_y_groups=8,
         nb_l2_banks=32, l2_axi_interleave=None,
         axi_wide_routing='yx', l2_placement='linkload'),
+    'terapool_spatz4_fpu_8x8_resp_xbar': replace(TERAPOOL_SPATZ4_FPU,
+        nb_x_groups=8, nb_y_groups=8,
+        nb_l2_banks=32, l2_axi_interleave=None,
+        axi_wide_routing='yx', l2_placement='linkload',
+        group_mshr_resp_after_xbar=True),
+    'terapool_spatz4_fpu_8x8_resp_fifo6': replace(TERAPOOL_SPATZ4_FPU,
+        nb_x_groups=8, nb_y_groups=8,
+        nb_l2_banks=32, l2_axi_interleave=None,
+        axi_wide_routing='yx', l2_placement='linkload',
+        l1_noc_resp_router_output_fifo_depth=2,
+        l1_noc_resp_local_extra_fifo_depth=6,
+        group_mshr_resp_after_xbar=True),
     'terapool_spatz4_fpu_8x8_nomshr': replace(TERAPOOL_SPATZ4_FPU,
         nb_x_groups=8, nb_y_groups=8,
         nb_l2_banks=32, l2_axi_interleave=None,

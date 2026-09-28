@@ -55,11 +55,15 @@ class TeranocCluster(st.Component):
                     if arch.vlsu_burst.fabric_enable else 0)))
 
         self.l1_resp_noc_list = []
+        resp_out_depth = (arch.l1_noc_resp_router_output_fifo_depth
+            if arch.l1_noc_resp_router_output_fifo_depth is not None
+            else arch.l1_noc_router_output_fifo_depth)
         for i in range(0, arch.nb_inter_group_ports_per_group):
             self.l1_resp_noc_list.append(L1_noc(self, f'l1_resp_noc_{i}', width=arch.l1_bank_width,
                 nb_x_groups=arch.nb_x_groups, nb_y_groups=arch.nb_y_groups,
                 router_input_queue_size=(arch.l1_noc_router_input_fifo_depth),
-                router_output_queue_size=(arch.l1_noc_router_output_fifo_depth)))
+                router_output_queue_size=resp_out_depth,
+                local_extra_fifo_depth=arch.l1_noc_resp_local_extra_fifo_depth))
 
         l2_addr_scrambler_list = []
         axi_burst_splitter_list = []

@@ -61,12 +61,30 @@ class TeranocL1NocNetworkInterface(gvsoc.systree.Component):
         self.itf_bind('router_output', itf, signature='floonoc_link')
 
 
+class TeranocL1NocLocalFifo(gvsoc.systree.Component):
+    """Optional fall-through FIFO on a response router's local output."""
+
+    def __init__(self, parent: gvsoc.systree.Component, name: str, depth: int):
+        if depth <= 0:
+            raise ValueError('local response FIFO depth must be positive')
+        super().__init__(parent, name)
+        self.add_sources(['pulp/teranoc_spatz/l1_interconnect/floonoc_local_fifo.cpp'])
+        self.add_property('depth', depth)
+
+    def i_INPUT(self) -> gvsoc.systree.SlaveItf:
+        return gvsoc.systree.SlaveItf(self, 'input', signature='floonoc_link')
+
+    def o_OUTPUT(self, itf: gvsoc.systree.SlaveItf):
+        self.itf_bind('output', itf, signature='floonoc_link')
+
+
 class FlooNoc2dMeshNarrow(gvsoc.systree.Component):
     """One homogeneous TeraNoC L1 plane built from private TeraNoC routers."""
 
     def __init__(self, parent: gvsoc.systree.Component, name, narrow_width: int,
             dim_x: int, dim_y: int, router_input_queue_size: int = 2,
-            router_output_queue_size: int = 2, max_burst_size: int = 0):
+            router_output_queue_size: int = 2, max_burst_size: int = 0,
+            local_extra_fifo_depth: int = 0):
         super().__init__(parent, name)
 
         routers = {}
@@ -80,7 +98,13 @@ class FlooNoc2dMeshNarrow(gvsoc.systree.Component):
                 routers[(x, y)] = router
 
                 ni.o_LINK(router.i_INPUT(DIR_LOCAL))
-                router.o_OUTPUT(DIR_LOCAL, ni.i_LINK())
+                if local_extra_fifo_depth:
+                    fifo = TeranocL1NocLocalFifo(self, f'local_fifo_{x}_{y}',
+                        depth=local_extra_fifo_depth)
+                    router.o_OUTPUT(DIR_LOCAL, fifo.i_INPUT())
+                    fifo.o_OUTPUT(ni.i_LINK())
+                else:
+                    router.o_OUTPUT(DIR_LOCAL, ni.i_LINK())
                 self.itf_bind(f'in_{x}_{y}', ni.i_INPUT(),
                     signature=IoV2SingleReq(), composite_bind=True)
                 ni.o_OUTPUT(gvsoc.systree.SlaveItf(self, f'out_{x}_{y}', signature=IoV2SingleReq()))
