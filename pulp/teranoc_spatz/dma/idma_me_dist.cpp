@@ -5,6 +5,7 @@
  */
 
 #include "idma_me_dist.hpp"
+#include "idma_transfer_spill.hpp"
 
 IDmaMeDist::IDmaMeDist(vp::Component *idma, std::string name, IdmaTransferProducer *fe,
     std::vector<IdmaTransferConsumer *> be, int be_region_size)
@@ -131,6 +132,9 @@ void IDmaMeDist::ack_transfer(IdmaTransfer *transfer) {
   }
 
   state->remaining_completions--;
+  if (state->remaining_completions == 0 && teranoc_dma_clocked()) {
+    state->completion_ready = this->clock.get_cycles() + 1;
+  }
   this->trace.msg(vp::Trace::LEVEL_TRACE,
       "Output completion (transfer: %p, output: %d, remaining: %d)\n",
       state->transfer, output, (int)state->remaining_completions);
@@ -150,6 +154,8 @@ void IDmaMeDist::set_be(std::vector<IdmaTransferConsumer *> be) {
 
 void IDmaMeDist::reset(bool active) {
   if (active) {
+    this->completion_event.cancel();
+    this->last_retire_cycle = -1;
     for (IdmaTransfer *slice : this->pending_slices) {
       if (slice != nullptr) {
         delete slice;
@@ -226,14 +232,27 @@ void IDmaMeDist::retire_completed() {
     if (!state->fork_complete || state->remaining_completions != 0) {
       break;
     }
+    // Each RTL output has a non-fall-through completion FIFO; the join
+    // consumes at most one row per edge, even when several workers finish.
+    if (teranoc_dma_clocked() &&
+        (state->completion_ready > this->clock.get_cycles() ||
+         this->last_retire_cycle == this->clock.get_cycles())) {
+      if (!this->completion_event.is_enqueued()) this->completion_event.enqueue(1);
+      break;
+    }
 
     IdmaTransfer *transfer = state->transfer;
+    this->last_retire_cycle = this->clock.get_cycles();
     this->transfer_queue.pop_front();
     this->trace.msg(vp::Trace::LEVEL_TRACE,
         "Retiring distributed transfer (transfer: %p)\n", transfer);
     this->fe->ack_transfer(transfer);
     this->fe->update();
   }
+}
+
+void IDmaMeDist::completion_handler(vp::Block *block, vp::ClockEvent *) {
+  static_cast<IDmaMeDist *>(block)->retire_completed();
 }
 
 unsigned int IDmaMeDist::clog2(int value) {

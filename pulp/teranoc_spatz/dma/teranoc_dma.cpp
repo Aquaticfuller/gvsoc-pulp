@@ -5,7 +5,10 @@
  */
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
+#include <unordered_map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -18,6 +21,7 @@
 
 #include "idma_me_dist.hpp"
 #include "idma_me_split.hpp"
+#include "idma_transfer_spill.hpp"
 
 #define MMIO_SRC 0x00
 #define MMIO_DST 0x04
@@ -41,14 +45,28 @@ public:
   TeranocDmaFrontend(vp::Component *idma, IdmaTransferConsumer *splitter)
       : vp::Block(idma, "mempool_dma_ctrl"),
         issue_event(this, &TeranocDmaFrontend::issue_handler),
+        completion_event(this, &TeranocDmaFrontend::completion_handler),
         splitter(splitter) {
     this->traces.new_trace("trace", &this->trace, vp::DEBUG);
     idma->new_slave_port("input", &this->input_itf, this);
+    if (const char *path = std::getenv("TERANOC_DMA_STATS_PATH")) {
+      this->stats = std::fopen(path, "w");
+      if (this->stats == nullptr) {
+        this->trace.fatal("Cannot open DMA statistics file: %s\n", path);
+      }
+      std::fprintf(this->stats, "id,src,dst,bytes,launch_cycle,complete_cycle,cycles\n");
+    }
+  }
+
+  ~TeranocDmaFrontend() override {
+    if (this->stats != nullptr) std::fclose(this->stats);
   }
 
   void reset(bool active) override {
     if (active) {
       this->issue_event.cancel();
+      this->completion_event.cancel();
+      this->completions.clear();
       while (!this->pending.empty()) {
         delete this->pending.front();
         this->pending.pop_front();
@@ -60,12 +78,33 @@ public:
       this->issued = 0;
       this->completed = 0;
       this->retry_owed = false;
+      this->measurements.clear();
     }
   }
 
   void update() override { this->schedule_issue(); }
 
   void ack_transfer(IdmaTransfer *transfer) override {
+    if (teranoc_dma_clocked()) {
+      this->completions.push_back({transfer, this->clock.get_cycles() + 1});
+      if (!this->completion_event.is_enqueued()) this->completion_event.enqueue(1);
+    } else {
+      this->complete(transfer);
+    }
+  }
+
+  void complete(IdmaTransfer *transfer) {
+    auto it = this->measurements.find(transfer);
+    if (it != this->measurements.end()) {
+      const auto &m = it->second;
+      const auto now = this->clock.get_cycles();
+      std::fprintf(this->stats, "%u,0x%llx,0x%llx,%llu,%lld,%lld,%lld\n",
+          m.id, (unsigned long long)m.src, (unsigned long long)m.dst,
+          (unsigned long long)m.size, (long long)m.start, (long long)now,
+          (long long)(now - m.start));
+      std::fflush(this->stats);
+      this->measurements.erase(it);
+    }
     this->completed++;
     delete transfer;
   }
@@ -161,6 +200,10 @@ private:
     transfer->nb_bursts = 0;
     transfer->bursts_sent = false;
     transfer->parent = nullptr;
+    if (this->stats != nullptr) {
+      this->measurements.emplace(transfer, Measurement{id, transfer->src, transfer->dst,
+          transfer->size, this->clock.get_cycles()});
+    }
 
     this->trace.msg(vp::Trace::LEVEL_INFO, "Launching transfer (id: %d, src: 0x%lx, dst: 0x%lx, "
         "size: 0x%lx)\n", id, transfer->src, transfer->dst, transfer->size);
@@ -198,9 +241,22 @@ private:
     static_cast<TeranocDmaFrontend *>(__this)->issue();
   }
 
+  static void completion_handler(vp::Block *block, vp::ClockEvent *) {
+    auto *self = static_cast<TeranocDmaFrontend *>(block);
+    if (!self->completions.empty() &&
+        self->completions.front().second <= self->clock.get_cycles()) {
+      auto *transfer = self->completions.front().first;
+      self->completions.pop_front();
+      self->complete(transfer);
+    }
+    if (!self->completions.empty()) self->completion_event.enqueue(1);
+  }
+
   vp::Trace trace;
   vp::IoSlave input_itf{&TeranocDmaFrontend::req};
   vp::ClockEvent issue_event;
+  vp::ClockEvent completion_event;
+  std::deque<std::pair<IdmaTransfer *, int64_t>> completions;
   IdmaTransferConsumer *splitter;
   std::deque<IdmaTransfer *> pending;
   uint64_t reg_src = 0;
@@ -210,6 +266,13 @@ private:
   uint32_t issued = 0;
   uint32_t completed = 0;
   bool retry_owed = false;
+  struct Measurement {
+    uint32_t id;
+    uint64_t src, dst, size;
+    int64_t start;
+  };
+  std::FILE *stats = nullptr;
+  std::unordered_map<IdmaTransfer *, Measurement> measurements;
 };
 
 /*
@@ -245,6 +308,7 @@ private:
   IDmaMeSplit me_split;
   IDmaMeDist me_cluster_dist;
   std::vector<std::unique_ptr<IDmaMeDist>> me_group_dist;
+  std::vector<std::unique_ptr<IDmaTransferSpill>> wrapper_spills, group_spills;
   // deque keeps worker addresses stable after each emplacement.
   std::deque<Worker> workers;
   vp::Trace trace;
@@ -270,12 +334,30 @@ TeranocDma::TeranocDma(vp::ComponentConf &config)
 
   std::vector<IdmaTransferConsumer *> group_itfs;
   for (int group = 0; group < nb_groups; group++) {
+    IdmaTransferProducer *group_upstream = &this->me_cluster_dist;
+    if (teranoc_dma_clocked()) {
+      // terapool_cluster_floonoc_wrapper and mempool_group each contain a
+      // request spill_register plus a registered return metadata channel.
+      auto wrapper = std::make_unique<IDmaTransferSpill>(this,
+          "wrapper_spill_" + std::to_string(group), &this->me_cluster_dist, nullptr);
+      auto group_spill = std::make_unique<IDmaTransferSpill>(this,
+          "group_spill_" + std::to_string(group), wrapper.get(), nullptr);
+      wrapper->set_downstream(group_spill.get());
+      group_upstream = group_spill.get();
+      this->wrapper_spills.push_back(std::move(wrapper));
+      this->group_spills.push_back(std::move(group_spill));
+    }
     auto dist = std::make_unique<IDmaMeDist>(
-        this, "me_group_dist_" + std::to_string(group), &this->me_cluster_dist,
+        this, "me_group_dist_" + std::to_string(group), group_upstream,
         std::vector<IdmaTransferConsumer *>(), worker_region);
     IDmaMeDist *dist_ptr = dist.get();
     this->me_group_dist.push_back(std::move(dist));
-    group_itfs.push_back(dist_ptr);
+    if (teranoc_dma_clocked()) {
+      this->group_spills.back()->set_downstream(dist_ptr);
+      group_itfs.push_back(this->wrapper_spills.back().get());
+    } else {
+      group_itfs.push_back(dist_ptr);
+    }
 
     std::vector<IdmaTransferConsumer *> worker_itfs;
     for (int dma = 0; dma < nb_dmas_per_group; dma++) {

@@ -22,7 +22,7 @@ class TeranocL1TcdmBankInterco(gvsoc.systree.Component):
 
     def __init__(self, parent, name, *, nb_narrow_inputs: int, nb_banks: int, nb_superbanks: int,
             narrow_width: int, wide_width: int, total_banks: int, start_bank_id: int,
-            spm_bank_id_remap: bool = False):
+            spm_bank_id_remap: bool = False, posted_writes: bool = False):
         super().__init__(parent, name)
 
         assert nb_narrow_inputs > 0
@@ -40,7 +40,8 @@ class TeranocL1TcdmBankInterco(gvsoc.systree.Component):
         self.add_properties({'nb_narrow_inputs': nb_narrow_inputs, 'nb_banks': nb_banks,
             'nb_superbanks': nb_superbanks, 'narrow_width': narrow_width, 'wide_width': wide_width,
             'total_banks': total_banks, 'start_bank_id': start_bank_id,
-            'spm_bank_id_remap': spm_bank_id_remap,})
+            'spm_bank_id_remap': spm_bank_id_remap,
+            'posted_writes': int(posted_writes)})
 
     def i_NARROW(self, input_id: int) -> gvsoc.systree.SlaveItf:
         return gvsoc.systree.SlaveItf(self, f'narrow_{input_id}', signature=IoV2SingleReq())

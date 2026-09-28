@@ -128,9 +128,10 @@ class GroupMshrConfig:
     # Knob names/values mirror config/terapool_spatz4_fpu.mk. enable=False =
     # passthrough (teranoc_v2 behavior).
     enable:              bool = False
-    num_entries:         int  = 64   # group_mshr_num (banks = num/ways)
+    split:               bool = False  # eight row/column slices in current RTL
+    num_entries:         int  = 64   # aggregate: 8 entries in each of 8 slices
     ways_per_bank:       int  = 4    # group_mshr_ways_per_bank
-    overflow_entries:    int  = 1    # group_mshr_overflow_entries: bankless entries taken only
+    overflow_entries:    int  = 1    # aggregate split profile uses 8 (one per slice)
                                      # when the hashed bank has no free way, so a bank full of
                                      # held entries cannot block the very request they wait for.
                                      # Ids follow the table (num_entries..); 0 = pre-2026-09-16.
@@ -234,6 +235,9 @@ class TeranocConfig:
     # explicitly only to override -- e.g. a config whose nb_l2_banks != nb_groups,
     # for which granule == group width would spread a worker across banks.
     l2_axi_interleave:        'int | None' = None
+    axi_wide_routing:          str = 'shortest'
+    l2_placement:             str = 'hops'
+    dma_posted_writes:        bool = False
     # FlooNoC router configuration. Request and response planes use the same
     # hardware router parameters but remain separate networks.
     l1_noc_router_input_fifo_depth:  int = 2
@@ -290,6 +294,9 @@ class TeranocConfig:
             object.__setattr__(self, 'l2_axi_interleave', granule // self.axi_data_width)
 
         assert self.l1_noc_router_input_fifo_depth > 0
+        assert self.axi_wide_routing in ('shortest', 'yx')
+        assert self.l2_placement in ('hops', 'linkload')
+        assert self.l2_placement != 'linkload' or self.axi_wide_routing == 'yx'
         assert self.l1_noc_router_output_fifo_depth > 0
         assert self.l1_noc_topology == 'mesh', \
             "teranoc_spatz currently models only the RTL 2D mesh"
@@ -692,14 +699,15 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
     nb_x_groups              = 4,
     nb_y_groups              = 4,
     bank_factor              = 4,
-    l1_bank_bytes            = 1024,
+    l1_bank_bytes            = 4096,
     l1_bank_width            = 4,
     nb_intra_group_ports_per_tile = 1,
     nb_inter_group_ports_per_tile = 2,
     axi_data_width           = 64,
     nb_axi_masters_per_group = 1,
-    l2_size                  = 0x1000000,
+    l2_size                  = 0x20000000,
     nb_l2_banks              = 16,
+    dma_posted_writes        = True,
     # September RTL remaps requests and responses (mode 3). The older
     # August profile remapped responses only; keep it explicitly selectable.
     l1_noc_remap_mode        = int(os.environ.get('TERANOC_L1_REMAP_MODE', 2 if _LEGACY_RTL_CONFIG else 3)),
@@ -714,26 +722,32 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
     vlsu_burst = VlsuBurstConfig(
         enable=bool(int(os.environ.get('TERANOC_VLSU_BURST_ENABLE', 1))),
         max_burst_words=16,
-        # spatz_vlsu_rob_depth. The B x KS decode campaign's image (build_tgt4x4)
-        # pins ROB0=128, so this must be settable to compare against it; the base
-        # config/terapool_spatz4_fpu.mk default is 64.
-        rob_depth=int(os.environ.get('TERANOC_VLSU_ROB_DEPTH', 64)),
+        # Current RTL has 32 entries per lane. The C++ distributed-ROB mode
+        # applies that per-lane depth; keep the reported property consistent.
+        # Explicit overrides remain available for historical campaign images.
+        rob_depth=int(os.environ.get('TERANOC_VLSU_ROB_DEPTH',
+                                     64 if _LEGACY_RTL_CONFIG else 32)),
         sub_word=bool(int(os.environ.get('TERANOC_VLSU_BURST_EW16', 1))),
         block_alloc=True, dual_load=2, recv_ports=2),
-    # MSHR defaults match the reviewed September 9 config: windows8191,
-    # prescale6, merge16, bypass16. TERANOC_RTL_LEGACY_CONFIG=1 retains
-    # the older reset/timer/remap profile. Newer GEMM
+    # MSHR defaults match the September 28 split config: eight 8+1 slices,
+    # four subscribers each, windows8191, prescale6, bypass16.
+    # TERANOC_RTL_LEGACY_CONFIG=1 retains the older reset/timer/remap profile. Newer GEMM
     # ELFs instead program all runtime knobs per shape through the MSHR CSRs
     # (mshr_cfg.h) from their own make variables, so these only matter for
     # ELFs built before the CSR flow. Override via TERANOC_MSHR_* env vars;
     # scripts_local/run_shape.sh derives them from gemm_autotune.py.
     # TERANOC_MSHR_ENABLE=0 removes the component entirely (== naive
-    # teranoc_v2 wiring); TERANOC_MSHR_CFG_ENABLE_RESET=0 makes an
-    # instantiated MSHR start bypassed until a CSR write enables it (the
-    # RTL's MshrCfgRuntime=1 reset state).
+    # teranoc_v2 wiring). An instantiated MSHR now starts BYPASSED until a CSR
+    # write enables it, which is the RTL's MshrCfgRuntime=1 reset state;
+    # TERANOC_MSHR_CFG_ENABLE_RESET=1 restores the old model behaviour for
+    # binaries that never write the CSRs.
     group_mshr = GroupMshrConfig(
         enable=bool(int(os.environ.get('TERANOC_MSHR_ENABLE', 1))),
-        merge_reqs=int(os.environ.get('TERANOC_MSHR_MERGE_REQS', 4 if _LEGACY_RTL_CONFIG else 16)),
+        split=bool(int(os.environ.get('TERANOC_MSHR_SPLIT', 0 if _LEGACY_RTL_CONFIG else 1))),
+        merge_reqs=int(os.environ.get('TERANOC_MSHR_MERGE_REQS', 4)),
+        # Eight aggregate overflow entries represent one per split slice.
+        overflow_entries=int(os.environ.get('TERANOC_MSHR_OVERFLOW_ENTRIES',
+                                           1 if _LEGACY_RTL_CONFIG else 8)),
         hold_subs_single=int(os.environ.get('TERANOC_MSHR_HOLD_SUBS_SINGLE', 4)),
         hold_subs_burst=int(os.environ.get('TERANOC_MSHR_HOLD_SUBS_BURST', 4)),
         hold_window_single=int(os.environ.get(
@@ -792,22 +806,32 @@ CONFIGS = {
         group_mshr=replace(TERAPOOL_SPATZ4_FPU.group_mshr, enable=False),
         group_barrier=replace(TERAPOOL_SPATZ4_FPU.group_barrier, enable=False)),
     # 8x8 / 64-group / 1024-core mesh (RTL config/terapool_spatz4_fpu_8x8.mk):
-    # 32 L2 channels of 1 MB, so consecutive y-adjacent groups share a channel
+    # 32 L2 channels of 16 MiB, so consecutive y-adjacent groups share a channel
     # (the interleave law derives 32 via 16*64/32). The endpoint placement is
     # generated (pulp.floonoc_v2.perimeter_map), as on the RTL side.
     'terapool_spatz4_fpu_8x8': replace(TERAPOOL_SPATZ4_FPU,
         nb_x_groups=8, nb_y_groups=8,
-        nb_l2_banks=32, l2_size=0x2000000, l2_axi_interleave=None),
+        nb_l2_banks=32, l2_axi_interleave=None,
+        axi_wide_routing='yx', l2_placement='linkload'),
     'terapool_spatz4_fpu_8x8_nomshr': replace(TERAPOOL_SPATZ4_FPU,
         nb_x_groups=8, nb_y_groups=8,
-        nb_l2_banks=32, l2_size=0x2000000, l2_axi_interleave=None,
+        nb_l2_banks=32, l2_axi_interleave=None,
+        axi_wide_routing='yx', l2_placement='linkload',
         group_mshr=replace(TERAPOOL_SPATZ4_FPU.group_mshr, enable=False)),
     'terapool_spatz4_fpu_8x8_naive': replace(TERAPOOL_SPATZ4_FPU,
         nb_x_groups=8, nb_y_groups=8,
-        nb_l2_banks=32, l2_size=0x2000000, l2_axi_interleave=None,
+        nb_l2_banks=32, l2_axi_interleave=None,
+        axi_wide_routing='yx', l2_placement='linkload',
         vlsu_burst=VlsuBurstConfig(enable=False, fabric_enable=False),
         group_mshr=replace(TERAPOOL_SPATZ4_FPU.group_mshr, enable=False),
         group_barrier=replace(TERAPOOL_SPATZ4_FPU.group_barrier, enable=False)),
+    # Historical aliases retained for launch scripts that selected the explicit
+    # 512 MiB profile before it became the hardware default.
+    'terapool_spatz4_fpu_l2_512m': replace(TERAPOOL_SPATZ4_FPU, l2_size=0x20000000),
+    'terapool_spatz4_fpu_8x8_l2_512m': replace(TERAPOOL_SPATZ4_FPU,
+        nb_x_groups=8, nb_y_groups=8,
+        nb_l2_banks=32, l2_size=0x20000000, l2_axi_interleave=None,
+        axi_wide_routing='yx', l2_placement='linkload'),
 }
 
 DEFAULT_CONFIG = 'terapool'

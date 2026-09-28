@@ -100,6 +100,7 @@ class TeranocGroup(st.Component):
             group_mshr = GroupMshr(self, 'group_mshr',
                 num_banks_per_tile=arch.nb_banks_per_tile,
                 nb_lanes=(arch.nb_tiles_per_group * arch.nb_inter_group_ports_per_tile),
+                split=arch.group_mshr.split,
                 nb_tiles_per_group=arch.nb_tiles_per_group,
                 nb_inter_group_ports_per_tile=arch.nb_inter_group_ports_per_tile,
                 num_entries=arch.group_mshr.num_entries,
@@ -130,7 +131,18 @@ class TeranocGroup(st.Component):
                 # 0 = shipping RTL (C2). Timing-sensitivity at the margins —
                 # see group_mshr.py; the testset pins per-test values.
                 spill_req_in=int(os.environ.get('TERANOC_MSHR_SPILL_REQ_IN', 0)),
-                cfg_enable_reset=int(os.environ.get('TERANOC_MSHR_CFG_ENABLE_RESET', 1)),
+                # DEFAULT 0 = the RTL's reset state. With MshrCfgRuntime=1
+                # (group_mshr_cfg_runtime in config/terapool_spatz4_fpu.mk) the
+                # RTL's enable register comes out of reset CLEAR: the MSHR is
+                # bypassed until software writes the enable CSR. Modelling it the
+                # other way round meant everything before an ELF's
+                # mshr_cfg_apply_group() -- DMA fills, I-cache warm-up -- ran
+                # against the ELABORATED config instead of the programmed one, and
+                # could leave lines in the response cache before the measured
+                # region even started. Set 1 for an ELF that never writes the CSRs
+                # and expects the elaborated/env configuration to be live from
+                # reset (the pre-2026-08-15 binaries; the testset pins those).
+                cfg_enable_reset=int(os.environ.get('TERANOC_MSHR_CFG_ENABLE_RESET', 0)),
                 # Adaptive per-class bypass (experimental): stall-streak
                 # counter engages a dynamic bypass; any merge clears it.
                 auto_bypass=int(os.environ.get('TERANOC_MSHR_AUTO_BYPASS', 0)),

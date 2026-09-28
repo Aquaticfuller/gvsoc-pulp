@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <vp/vp.hpp>
 #include "floonoc_v2.hpp"
 #include "floonoc_router_v2.hpp"
@@ -56,6 +57,7 @@ RouterV2::RouterV2(vp::ComponentConf &config)
     this->dim_x = get_js_config()->get_int("dim_x");
     this->dim_y = get_js_config()->get_int("dim_y");
     this->queue_size = get_js_config()->get_int("router_input_queue_size");
+    this->routing_y_first = get_js_config()->get_int("routing_y_first") != 0;
 
     for (int i = 0; i < DIR_NB; i++)
     {
@@ -226,6 +228,39 @@ void RouterV2::get_next_router_pos(int dest_x, int dest_y, int &next_x, int &nex
         {
             next_x = this->x;
             next_y = this->y;
+            return;
+        }
+
+        // The current 8x8 RTL AXI tables use strict YX routing. This applies
+        // only to the wide mesh; request and response routers retain the
+        // previous shortest-path rule.
+        if (this->routing_y_first)
+        {
+            // The outer coordinates are NI leaves, not a ring of routers.
+            // Reach the destination's interior row first, then its column,
+            // and only then take the last edge link to a perimeter NI.
+            int router_y = std::max(1, std::min(dest_y, this->dim_y - 2));
+            int router_x = std::max(1, std::min(dest_x, this->dim_x - 2));
+            if (router_y != this->y)
+            {
+                next_x = this->x;
+                next_y = router_y < this->y ? this->y - 1 : this->y + 1;
+            }
+            else if (router_x != this->x)
+            {
+                next_x = router_x < this->x ? this->x - 1 : this->x + 1;
+                next_y = this->y;
+            }
+            else if (dest_y != this->y)
+            {
+                next_x = this->x;
+                next_y = dest_y;
+            }
+            else
+            {
+                next_x = dest_x;
+                next_y = this->y;
+            }
             return;
         }
 

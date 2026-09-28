@@ -11,6 +11,43 @@
 
 namespace
 {
+#if defined(CONFIG_GVSOC_ISS_USE_SPATZ) && defined(CONFIG_GVSOC_ISS_VLSU_V2)
+// MemPool borrows these bare-metal opcodes for accelerator synchronization
+// (snitch.sv FENCE/FENCE_I/SFENCE_VMA). Generic RISC-V fence handlers only
+// see the scalar LSU and can release a group barrier while vector loads remain.
+iss_reg_t mempool_fence(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
+{
+    if (iss->arch.vu.nb_pending_vaccess || iss->lsu.get_nb_pending_accesses())
+    {
+        iss->exec.insn_stall();
+        return pc;
+    }
+    return pc + insn->size;
+}
+
+iss_reg_t mempool_fence_i(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
+{
+    if (iss->lsu.get_nb_pending_accesses())
+    {
+        iss->exec.insn_stall();
+        return pc;
+    }
+    return pc + insn->size;
+}
+
+iss_reg_t mempool_sfence_vma(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
+{
+    // Scalar memory requests are submitted synchronously by this ISS before
+    // the next instruction executes. Vector operations have a separate queue.
+    if (iss->arch.vu.mem_requests_pending())
+    {
+        iss->exec.insn_stall();
+        return pc;
+    }
+    return pc + insn->size;
+}
+#endif
+
 bool starts_with(const char *label, const char *prefix)
 {
     return std::strncmp(label, prefix, std::strlen(prefix)) == 0;
@@ -125,6 +162,18 @@ SnitchMempool::SnitchMempool(Iss &iss)
 
 void SnitchMempool::start()
 {
+#if defined(CONFIG_GVSOC_ISS_USE_SPATZ) && defined(CONFIG_GVSOC_ISS_VLSU_V2)
+    for (auto binding : {std::make_pair("fence", &mempool_fence),
+                         std::make_pair("fence_i", &mempool_fence_i),
+                         std::make_pair("sfence_vma", &mempool_sfence_vma)})
+    {
+        if (iss_decoder_item_t *item = this->iss.decode.get_insn(binding.first))
+        {
+            item->u.insn.handler = binding.second;
+            item->u.insn.fast_handler = binding.second;
+        }
+    }
+#endif
     // The generated decoder tables are shared by all cores using this ISA.
     // Mark scalar FP instructions with a class id and a non-zero latency
     // marker; SnitchMempoolEvents selects the fixed scalar or Spatz RTL

@@ -68,6 +68,7 @@ private:
     int dim_x;
     int dim_y;
     int queue_size;
+    bool routing_y_first;
     vp::Queue *input_queues[DIR_NB];
     std::array<FloonocLinkSlave, DIR_NB> input_ports;
     std::array<FloonocLinkMaster, DIR_NB> output_ports;

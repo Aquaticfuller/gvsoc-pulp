@@ -162,9 +162,72 @@ def improve(placement, served, num_y):
     return placement
 
 
+def dor_links(src, dst, y_first=False):
+    """Directed router links on a dimension-ordered channel-to-group path."""
+    (x, y), (gx, gy) = src, dst
+    links = []
+    for dim in (("y", "x") if y_first else ("x", "y")):
+        if dim == "x":
+            while x != gx:
+                nx = x + (1 if gx > x else -1)
+                links.append(((x, y), (nx, y)))
+                x = nx
+        else:
+            while y != gy:
+                ny = y + (1 if gy > y else -1)
+                links.append(((x, y), (x, ny)))
+                y = ny
+    return links
+
+
+def linkload_cost(placement, served, num_y, y_first=False):
+    """Worst link load, squared load, and hop count for lockstep DMA streams."""
+    load = {}
+    hops = 0
+    for channel, groups in served.items():
+        point = placement[channel][0]
+        for gid in groups:
+            for link in dor_links(point, group_coord(gid, num_y), y_first):
+                load[link] = load.get(link, 0) + 1
+                hops += 1
+    return (max(load.values(), default=0), sum(v * v for v in load.values()), hops)
+
+
+def improve_linkload(placement, served, num_y, y_first=False, restarts=16, seed=0):
+    """Port the RTL's deterministic pair-swap search over the same perimeter points."""
+    import random
+    rng = random.Random(seed)
+    channels = sorted(placement)
+
+    def descend(candidate):
+        best = linkload_cost(candidate, served, num_y, y_first)
+        changed = True
+        while changed:
+            changed = False
+            for i, a in enumerate(channels):
+                for b in channels[i + 1:]:
+                    candidate[a], candidate[b] = candidate[b], candidate[a]
+                    cost = linkload_cost(candidate, served, num_y, y_first)
+                    if cost < best:
+                        best, changed = cost, True
+                    else:
+                        candidate[a], candidate[b] = candidate[b], candidate[a]
+        return best, candidate
+
+    best_cost, best_placement = descend(dict(placement))
+    points = [placement[channel] for channel in channels]
+    for _ in range(restarts):
+        rng.shuffle(points)
+        cost, candidate = descend(dict(zip(channels, points)))
+        if cost < best_cost:
+            best_cost, best_placement = cost, candidate
+    return best_placement
+
+
 def periph_channel(placement, periph_at=((0, 0), SOUTH)):
     """The L2 channel sharing the periph router's perimeter point (5 at 4x4,
-    13 at 8x8). None when no channel lands there (e.g. 2x2) — the caller then
+    0 at 8x8 with link-load placement). None when no channel lands there
+    (e.g. 2x2) — the caller then
     keeps the degenerate no-shared-channel demux behaviour."""
     return next((g for g, v in placement.items() if v == periph_at), None)
 

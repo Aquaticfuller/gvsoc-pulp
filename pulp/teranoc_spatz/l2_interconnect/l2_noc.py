@@ -30,8 +30,9 @@ class L2_noc(FlooNocV2ClusterGridNarrowWide):
 
     def __init__(self, parent: gvsoc.systree.Component, name, width: int,
             nb_x_groups: int, nb_y_groups: int, ni_outstanding_reqs: int = 32,
-            router_input_queue_size: int = 2):
+            router_input_queue_size: int = 2, wide_routing: str = 'shortest'):
         super(L2_noc, self).__init__(parent, name, wide_width=width, narrow_width=8,
             nb_x_clusters=nb_x_groups, nb_y_clusters=nb_y_groups,
             router_input_queue_size=router_input_queue_size,
-            ni_outstanding_reqs=ni_outstanding_reqs, max_burst_size=4096,)
+            ni_outstanding_reqs=ni_outstanding_reqs, max_burst_size=4096,
+            wide_routing=wide_routing)

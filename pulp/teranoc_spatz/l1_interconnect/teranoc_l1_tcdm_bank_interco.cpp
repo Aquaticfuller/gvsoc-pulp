@@ -63,6 +63,8 @@ class TeranocL1TcdmBankInterco : public vp::Component {
         uint64_t request_size;
         uint64_t active_offset;
         bool partial;
+        bool posted = false;
+        int64_t ack_ready_cycle = 0;
         vp::IoRespStatus status = vp::IO_RESP_OK;
         std::vector<bool> pending_banks;
     };
@@ -152,6 +154,7 @@ class TeranocL1TcdmBankInterco : public vp::Component {
     int total_bank_bits;
     int local_bank_bits;
     bool spm_bank_id_remap;
+    bool posted_writes;
 };
 
 int TeranocL1TcdmBankInterco::ceil_log2(unsigned int value) {
@@ -177,6 +180,7 @@ TeranocL1TcdmBankInterco::TeranocL1TcdmBankInterco(vp::ComponentConf &config)
     this->total_banks = this->get_js_config()->get_int("total_banks");
     this->start_bank_id = this->get_js_config()->get_int("start_bank_id");
     this->spm_bank_id_remap = this->get_js_config()->get_child_bool("spm_bank_id_remap");
+    this->posted_writes = this->get_js_config()->get_int("posted_writes") != 0;
 
     vp_assert_always(this->nb_narrow_inputs > 0 && this->nb_banks > 0 && this->nb_superbanks > 0,
         &this->trace, "invalid L1 TCDM interconnect dimensions\n");
@@ -368,6 +372,7 @@ bool TeranocL1TcdmBankInterco::wide_response_ready(int superbank, int64_t cycle)
         return false;
     }
     WideTransaction *transaction = this->wide_fifos[superbank].front().get();
+    if (transaction->posted) return cycle >= transaction->ack_ready_cycle;
     int first = superbank * this->banks_per_superbank;
     for (int offset = 0; offset < this->banks_per_superbank; offset++) {
         const auto &responses = this->banks[first + offset].responses;
@@ -502,6 +507,14 @@ void TeranocL1TcdmBankInterco::capture_wide(vp::IoReq *req, int superbank, bool 
     transaction->request_addr = req->get_addr();
     transaction->request_size = req->get_size();
     transaction->partial = partial;
+    // RTL posts a DMA write only with no older bank-routed wide response.
+    // The wide fork itself produces its acknowledgement after all bank grants.
+    if (this->posted_writes && req->get_is_write()) {
+        bool older_bank_response = false;
+        for (const auto &fifo : this->wide_fifos)
+            for (const auto &older : fifo) older_bank_response |= !older->posted;
+        transaction->posted = !older_bank_response;
+    }
     transaction->active_offset = partial ? req->get_addr() & ((uint64_t)this->wide_width - 1) : 0;
     transaction->pending_banks.assign(this->banks_per_superbank, true);
     this->prepare_async_response(req);
@@ -606,16 +619,20 @@ vp::IoRespStatus TeranocL1TcdmBankInterco::access_wide_lane(int bank,
 void TeranocL1TcdmBankInterco::accept_wide_lane(int bank, WideTransaction *transaction) {
     int64_t cycle = this->clock.get_cycles();
     BankState &state = this->banks[bank];
-    vp_assert_always(this->bank_can_accept(bank, cycle), &this->trace,
+    vp_assert_always(transaction->posted ?
+        (state.last_accept_cycle != cycle && cycle >= state.amo_block_until) :
+        this->bank_can_accept(bank, cycle), &this->trace,
         "bank %d accepted a wide lane while unavailable\n", bank);
-    vp_assert_always(state.responses.size() < 2, &this->trace,
-        "L1 bank %d response FIFO overflow\n", bank);
+    if (!transaction->posted)
+        vp_assert_always(state.responses.size() < 2, &this->trace,
+            "L1 bank %d response FIFO overflow\n", bank);
 
     vp::IoRespStatus status = this->access_wide_lane(bank, transaction);
     if (status == vp::IO_RESP_INVALID) {
         transaction->status = status;
     }
-    state.responses.push_back({transaction->req, -1, transaction, cycle + 1});
+    if (!transaction->posted)
+        state.responses.push_back({transaction->req, -1, transaction, cycle + 1});
     state.last_accept_cycle = cycle;
 
     this->trace.msg(vp::Trace::LEVEL_TRACE, "BANK_ACCEPT bank=%d kind=wide input=wide addr=0x%lx "
@@ -624,6 +641,8 @@ void TeranocL1TcdmBankInterco::accept_wide_lane(int bank, WideTransaction *trans
 
 void TeranocL1TcdmBankInterco::complete_wide_fork() {
     int superbank = this->active_wide->superbank;
+    if (this->active_wide->posted)
+        this->active_wide->ack_ready_cycle = this->clock.get_cycles() + 1;
     this->trace.msg(vp::Trace::LEVEL_TRACE, "WIDE_FORK_DONE sb=%d rot=%d addr=0x%lx\n", superbank,
         this->active_wide->rotation, this->active_wide->request_addr);
     this->wide_fifos[superbank].push_back(std::move(this->active_wide));
@@ -719,7 +738,7 @@ void TeranocL1TcdmBankInterco::pop_wide_response(int superbank) {
     bool was_full = this->wide_fifos[superbank].size() == 2;
     WideTransaction *transaction = this->wide_fifos[superbank].front().get();
     int first = superbank * this->banks_per_superbank;
-    for (int offset = 0; offset < this->banks_per_superbank; offset++) {
+    for (int offset = 0; offset < this->banks_per_superbank && !transaction->posted; offset++) {
         int bank = first + offset;
         BankResponse response = this->banks[bank].responses.front();
         vp_assert_always(response.wide == transaction, &this->trace,
@@ -788,6 +807,9 @@ bool TeranocL1TcdmBankInterco::has_work_requiring_tick(int64_t cycle) const {
             return true;
         }
     }
+    for (const auto &fifo : this->wide_fifos)
+        if (!fifo.empty() && fifo.front()->posted &&
+            this->wide_response_arb.locked_winner() == -1) return true;
     for (int bank = 0; bank < this->nb_banks; bank++) {
         if (!this->banks[bank].responses.empty()) {
             const BankResponse &response = this->banks[bank].responses.front();
@@ -842,8 +864,11 @@ void TeranocL1TcdmBankInterco::fsm_handler(vp::Block *__this, vp::ClockEvent *) 
         int first = transaction->superbank * _this->banks_per_superbank;
         for (int offset = 0; offset < _this->banks_per_superbank; offset++) {
             int bank = first + offset;
-            if (transaction->pending_banks[offset] && !blocked_at_start[bank] &&
-                _this->bank_can_accept(bank, cycle)) {
+            bool bank_available = transaction->posted ?
+                (_this->banks[bank].last_accept_cycle != cycle &&
+                 cycle >= _this->banks[bank].amo_block_until) :
+                (!blocked_at_start[bank] && _this->bank_can_accept(bank, cycle));
+            if (transaction->pending_banks[offset] && bank_available) {
                 _this->accept_wide_lane(bank, transaction);
                 transaction->pending_banks[offset] = false;
             }

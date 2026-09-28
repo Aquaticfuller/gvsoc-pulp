@@ -47,8 +47,9 @@ private:
     int remap_batch_size;
     int nb_groups;
     bool shuffle;
-    int remap_pos = 0;
-    int64_t remap_timestamp = 0;
+    std::vector<int> remap_pos;
+    std::vector<int64_t> remap_timestamp;
+    std::vector<bool> remap_had_valid;
 };
 
 L1NocRouterRemapper::L1NocRouterRemapper(vp::ComponentConf &config)
@@ -66,6 +67,9 @@ L1NocRouterRemapper::L1NocRouterRemapper(vp::ComponentConf &config)
         "L1 remapper group size %d must be a power of two\n", this->remap_batch_size);
     this->nb_groups = this->remap_batch_size > 0
         ? this->nb_ports / this->remap_batch_size : this->nb_ports;
+    this->remap_pos.resize(this->nb_groups, 0);
+    this->remap_timestamp.resize(this->nb_groups, 0);
+    this->remap_had_valid.resize(this->nb_groups, false);
 
     this->inputs.reserve(this->nb_ports);
     this->outputs.reserve(this->nb_ports);
@@ -92,8 +96,10 @@ void L1NocRouterRemapper::reset(bool active)
     if (active)
     {
         this->retry_event.cancel();
-        this->remap_pos = 0;
-        this->remap_timestamp = this->clock.get_cycles();
+        std::fill(this->remap_pos.begin(), this->remap_pos.end(), 0);
+        std::fill(this->remap_timestamp.begin(), this->remap_timestamp.end(),
+                  this->clock.get_cycles());
+        std::fill(this->remap_had_valid.begin(), this->remap_had_valid.end(), false);
         std::fill(this->pending_inputs.begin(), this->pending_inputs.end(), false);
         std::fill(this->blocked_outputs.begin(), this->blocked_outputs.end(), false);
         std::fill(this->retrying_inputs.begin(), this->retrying_inputs.end(), false);
@@ -109,17 +115,24 @@ int L1NocRouterRemapper::get_mapped_port(int input)
         return input;
     }
 
-    this->remap_pos =
-        (this->remap_pos + this->clock.get_cycles() - this->remap_timestamp)
-        % this->remap_batch_size;
-    this->remap_timestamp = this->clock.get_cycles();
+    // RTL b414c874 rotates each interleaved group once after a cycle with
+    // any valid input, including a stalled one. An idle group keeps its phase.
+    int group = input % this->nb_groups;
+    int64_t now = this->clock.get_cycles();
+    if (this->remap_timestamp[group] != now)
+    {
+        if (this->remap_had_valid[group])
+            this->remap_pos[group] = (this->remap_pos[group] + 1) % this->remap_batch_size;
+        this->remap_had_valid[group] = false;
+        this->remap_timestamp[group] = now;
+    }
 
     static const bool legacy_output = []() {
         const char *value = std::getenv("TERANOC_L1_REMAP_LEGACY_OUTPUT");
         return value != nullptr && std::atoi(value) != 0;
     }();
     int output = teranoc::remap_port(input, this->nb_ports,
-        this->remap_batch_size, this->shuffle, this->remap_pos, legacy_output);
+        this->remap_batch_size, this->shuffle, this->remap_pos[group], legacy_output);
     if (output < 0 || output >= this->nb_ports)
     {
         this->trace.fatal("L1 remapper mapped input %d to invalid output %d\n", input, output);
@@ -162,6 +175,7 @@ vp::IoReqStatus L1NocRouterRemapper::input_req(vp::Block *__this, vp::IoReq *req
 {
     auto *_this = static_cast<L1NocRouterRemapper *>(__this);
     int output = _this->get_mapped_port(input);
+    _this->remap_had_valid[input % _this->nb_groups] = true;
     if (_this->blocked_outputs[output])
     {
         _this->pending_inputs[input] = true;

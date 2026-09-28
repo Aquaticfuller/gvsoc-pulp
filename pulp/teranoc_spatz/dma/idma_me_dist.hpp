@@ -45,6 +45,7 @@ private:
     IdmaTransfer *transfer;
     size_t remaining_completions;
     bool fork_complete;
+    int64_t completion_ready = 0;
   };
 
   static unsigned int clog2(int value);
@@ -52,6 +53,9 @@ private:
       uint64_t dst, uint64_t size);
   void pump_fork();
   void retire_completed();
+  static void completion_handler(vp::Block *block, vp::ClockEvent *);
+  vp::ClockEvent completion_event{this, &IDmaMeDist::completion_handler};
+  int64_t last_retire_cycle = -1;
 
   IdmaTransferProducer *fe;
   std::vector<IdmaTransferConsumer *> be;

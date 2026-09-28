@@ -74,7 +74,8 @@ class TeranocTile(st.Component):
             burst_enable=arch.vlsu_burst.fabric_enable,
             burst_local_issue=arch.group_mshr.burst_expander_local_issue,
             burst_remote_issue=arch.group_mshr.burst_expander_remote_issue,
-            burst_interleave=arch.group_mshr.burst_expander_interleave)
+            burst_interleave=arch.group_mshr.burst_expander_interleave,
+            dma_posted_writes=arch.dma_posted_writes)
 
         # Optional in-tile RedMule + HWPE interleaver.
         if has_redmule:

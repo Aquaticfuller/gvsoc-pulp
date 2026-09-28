@@ -29,6 +29,7 @@ class GroupMshr(gvsoc.systree.Component):
 
     def __init__(self, parent: gvsoc.systree.Component, name: str,
             nb_lanes: int, nb_tiles_per_group: int, nb_inter_group_ports_per_tile: int,
+            split: bool = False,
             num_entries: int = 64, ways_per_bank: int = 4, overflow_entries: int = 1,
             merge_reqs: int = 4,
             enable_single: bool = True, drain_beats: int = 2,
@@ -55,6 +56,7 @@ class GroupMshr(gvsoc.systree.Component):
         self.add_sources(['pulp/teranoc_spatz/group_mshr.cpp'])
         self.add_properties({
             'nb_lanes': nb_lanes,
+            'split': int(split),
             'num_banks_per_tile': num_banks_per_tile,
             'nb_tiles_per_group': nb_tiles_per_group,
             'nb_inter_group_ports_per_tile': nb_inter_group_ports_per_tile,

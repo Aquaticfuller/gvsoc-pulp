@@ -116,7 +116,8 @@ class TeranocSystem(st.Component):
 
         # L2 NoC
         l2_noc = L2_noc(self, 'l2_noc', width=axi_data_width, nb_x_groups=arch.nb_x_groups,
-            nb_y_groups=arch.nb_y_groups, ni_outstanding_reqs=32, router_input_queue_size=2)
+            nb_y_groups=arch.nb_y_groups, ni_outstanding_reqs=32, router_input_queue_size=2,
+            wide_routing=arch.axi_wide_routing)
 
         # L2 Memory
         l2_mem = L2_subsystem(self, 'l2_mem', nb_banks=arch.nb_l2_banks,
@@ -197,9 +198,13 @@ class TeranocSystem(st.Component):
         # at import) and generalises to any legal power-of-two mesh
         # (docs/scaleup/mesh_plan.md §3.6/§12-14). One L2 channel may share the
         # periph router point (NI (1,0)) with the host/peripherals — channel 5
-        # at 4x4, 13 at 8x8 — falling out of the placement, never hardcoded.
+        # at 4x4, 0 at 8x8 with link-load placement — derived, never hardcoded.
         placement, _served = perimeter_map.assign(arch.nb_x_groups, arch.nb_y_groups,
                                                   arch.nb_l2_banks)
+        if arch.l2_placement == 'linkload':
+            placement = perimeter_map.improve_linkload(
+                placement, _served, arch.nb_y_groups,
+                y_first=arch.axi_wide_routing == 'yx')
         ni_xy = perimeter_map.placement_as_ni(placement, arch.nb_x_groups,
                                               arch.nb_y_groups)
         periph_ch = perimeter_map.periph_channel(placement)

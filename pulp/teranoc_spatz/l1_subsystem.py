@@ -44,7 +44,8 @@ class L1_subsystem(gvsoc.systree.Component):
             control_enable: bool = False, control_base: int = 0x20000000,
             control_word: int = 240, control_count: int = 16,
             burst_enable: bool = False, burst_local_issue: int = 1,
-            burst_remote_issue: int = 3, burst_interleave: bool = True):
+            burst_remote_issue: int = 3, burst_interleave: bool = True,
+            dma_posted_writes: bool = False):
         super().__init__(parent, name)
 
         assert nb_intra_group_ports >= 1
@@ -83,7 +84,8 @@ class L1_subsystem(gvsoc.systree.Component):
             nb_narrow_inputs=nb_narrow_inputs, nb_banks=nb_banks_per_tile,
             nb_superbanks=nb_banks_per_tile // banks_per_superbank, narrow_width=bandwidth,
             wide_width=axi_data_width, total_banks=total_banks,
-            start_bank_id=global_tile_id * nb_banks_per_tile)
+            start_bank_id=global_tile_id * nb_banks_per_tile,
+            posted_writes=dma_posted_writes)
 
         # RTL i_remote_req_interco + i_remote_resp_interco. Lane choice per
         # requester is mempool_tile_remote_req_router.sv, so it lives in the

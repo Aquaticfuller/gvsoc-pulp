@@ -55,7 +55,7 @@ class FloonocRouterV2(gvsoc.systree.Component):
     """
 
     def __init__(self, parent: gvsoc.systree.Component, name, x: int, y: int,
-            dim_x: int, dim_y: int, queue_size: int):
+            dim_x: int, dim_y: int, queue_size: int, routing: str='shortest'):
         super().__init__(parent, name)
 
         self.add_sources(['pulp/floonoc_v2/floonoc_router_v2.cpp'])
@@ -65,6 +65,7 @@ class FloonocRouterV2(gvsoc.systree.Component):
         self.add_property('dim_x', dim_x)
         self.add_property('dim_y', dim_y)
         self.add_property('router_input_queue_size', queue_size)
+        self.add_property('routing_y_first', int(routing == 'yx'))
 
     def i_INPUT(self, dir: int) -> gvsoc.systree.SlaveItf:
         return gvsoc.systree.SlaveItf(self, f'input_{_DIR_NAMES[dir]}', signature='floonoc_link')
@@ -165,7 +166,8 @@ class FlooNocV2MeshFabric:
 
     def __init__(self, container: gvsoc.systree.Component, narrow_width: int, wide_width: int,
             dim_x: int, dim_y: int, ni_outstanding_reqs: int=8, router_input_queue_size: int=2,
-            mappings: dict=None, max_burst_size: int=4096):
+            mappings: dict=None, max_burst_size: int=4096,
+            wide_routing: str='shortest'):
         self.container = container
         self.narrow_width = narrow_width
         self.wide_width = wide_width
@@ -174,6 +176,9 @@ class FlooNocV2MeshFabric:
         self.ni_outstanding_reqs = ni_outstanding_reqs
         self.router_input_queue_size = router_input_queue_size
         self.max_burst_size = max_burst_size
+        if wide_routing not in ('shortest', 'yx'):
+            raise ValueError(f'unsupported wide routing: {wide_routing}')
+        self.wide_routing = wide_routing
 
         # Memory map, name -> {base, size, x, y, remove_offset}. Distributed to
         # every NI in finalize(), so entries can keep being added after
@@ -218,7 +223,8 @@ class FlooNocV2MeshFabric:
             self._routers[(x, y)] = [
                 FloonocRouterV2(self.container, f'{_NW_ROUTER_PREFIXES[nw]}{x}_{y}', x=x, y=y,
                     dim_x=self.dim_x, dim_y=self.dim_y,
-                    queue_size=self.router_input_queue_size)
+                    queue_size=self.router_input_queue_size,
+                    routing=self.wide_routing if nw == NW_WIDE else 'shortest')
                 for nw in range(len(_NW_NAMES))
             ]
             return
@@ -227,7 +233,8 @@ class FlooNocV2MeshFabric:
         routers = [
             FloonocRouterV2(tile_comp, f'{_NW_NAMES[nw]}_router', x=x, y=y,
                 dim_x=self.dim_x, dim_y=self.dim_y,
-                queue_size=self.router_input_queue_size)
+                queue_size=self.router_input_queue_size,
+                routing=self.wide_routing if nw == NW_WIDE else 'shortest')
             for nw in range(len(_NW_NAMES))
         ]
         self._routers[(x, y)] = routers
@@ -433,7 +440,7 @@ class FlooNocV22dMeshNarrowWide(gvsoc.systree.Component):
     """
     def __init__(self, parent: gvsoc.systree.Component, name, narrow_width: int, wide_width:int,
             dim_x: int, dim_y:int, ni_outstanding_reqs: int=8, router_input_queue_size: int=2,
-            max_burst_size: int=4096):
+            max_burst_size: int=4096, wide_routing: str='shortest'):
         super().__init__(parent, name)
 
         self.add_property('mappings', {})
@@ -452,6 +459,7 @@ class FlooNocV22dMeshNarrowWide(gvsoc.systree.Component):
             wide_width=wide_width, dim_x=dim_x, dim_y=dim_y,
             ni_outstanding_reqs=ni_outstanding_reqs,
             router_input_queue_size=router_input_queue_size,
+            wide_routing=wide_routing,
             mappings=self.get_property('mappings'), max_burst_size=max_burst_size)
 
     def __add_mapping(self, name: str, base: int, size: int, x: int, y: int, remove_offset:int =0):
@@ -534,11 +542,13 @@ class FlooNocV2ClusterGridNarrowWide(FlooNocV22dMeshNarrowWide):
     """
     def __init__(self, parent: gvsoc.systree.Component, name, wide_width: int, narrow_width:int, nb_x_clusters: int,
             nb_y_clusters, router_input_queue_size=2, ni_outstanding_reqs: int=2,
-            tiles: bool=False, max_burst_size: int=4096):
+            tiles: bool=False, max_burst_size: int=4096,
+            wide_routing: str='shortest'):
         super().__init__(parent, name, wide_width=wide_width, narrow_width=narrow_width,
             dim_x=nb_x_clusters+2, dim_y=nb_y_clusters+2,
             router_input_queue_size=router_input_queue_size,
-            ni_outstanding_reqs=ni_outstanding_reqs, max_burst_size=max_burst_size)
+            ni_outstanding_reqs=ni_outstanding_reqs, max_burst_size=max_burst_size,
+            wide_routing=wide_routing)
 
         def tile_name(x, y):
             return f'tile_{x}_{y}' if tiles else None

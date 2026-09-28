@@ -211,6 +211,7 @@ void TeranocL1BurstExpander::in_resp_retry(vp::Block *__this, vp::IoRetryChannel
         vp::IoReq *sub = _this->held_beats.front();
         if (!_this->try_emit_beat(sub))
         {
+            _this->resp_blocked = true;
             return;
         }
         _this->held_beats.pop_front();
@@ -366,7 +367,10 @@ void TeranocL1BurstExpander::issue_handler(vp::Block *__this, vp::ClockEvent *)
 // ---------------------------------------------------------------------------
 void TeranocL1BurstExpander::emit_beat(vp::IoReq *sub)
 {
-    if (!this->try_emit_beat(sub))
+    // A denied response owns the binding until that same beat is accepted.
+    // Bank completions can keep arriving (including from another context),
+    // but must queue behind it instead of replacing the receiver's retry owner.
+    if (!this->held_beats.empty() || this->resp_blocked || !this->try_emit_beat(sub))
     {
         // Hold the sub-request. The downstream resp_retry is the fast path
         // back; the self-paced event is the backstop that makes the drain

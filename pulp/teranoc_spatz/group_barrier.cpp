@@ -64,6 +64,10 @@ class GroupBarrier : public vp::Component
 public:
     GroupBarrier(vp::ComponentConf &config);
     ~GroupBarrier() override;
+    void dump_stats(FILE *f);
+    static void stats_handler(vp::Block *__this, vp::ClockEvent *event);
+    vp::ClockEvent stats_event{this, &GroupBarrier::stats_handler};
+    int stats_period = 0;
 
 private:
     static vp::IoReqStatus in_req(vp::Block *__this, vp::IoReq *req, int tile);
@@ -166,12 +170,11 @@ private:
     vp::ClockEvent rel_event{this, &GroupBarrier::rel_handler};
 };
 
-GroupBarrier::~GroupBarrier()
+// Factored out of the destructor so the same block can be written mid-run; see
+// GroupMshr::stats_handler. TERANOC_MSHR_STATS_PERIOD drives both.
+void GroupBarrier::dump_stats(FILE *f)
 {
-    if (this->stat_releases > 1)
     {
-        FILE *f = fopen("gbar_stats.log", "a");
-        if (f)
         {
             fprintf(f, "[GBAR] %s rel_tail: deferred=%lu (cores queued behind a tile-mate)\n",
                 this->get_path().c_str(), (unsigned long)this->stat_rel_tail);
@@ -184,9 +187,41 @@ GroupBarrier::~GroupBarrier()
                 this->get_path().c_str(), (unsigned long)this->stat_releases,
                 this->stat_rel_interval_n ? (double)this->stat_rel_interval_sum / this->stat_rel_interval_n : 0.0,
                 (long)this->rel_first_cycle, (long)this->rel_last_cycle);
-            fclose(f);
         }
     }
+}
+
+GroupBarrier::~GroupBarrier()
+{
+    if (this->stat_releases > 1)
+    {
+        FILE *f = fopen("gbar_stats.log", "a");
+        if (f) { this->dump_stats(f); fclose(f); }
+    }
+}
+
+// Periodic live snapshot, same contract as GroupMshr::stats_handler: the file is
+// truncated once per period and appended to by each instance, so it always holds
+// one machine-wide snapshot and cannot grow without bound.
+void GroupBarrier::stats_handler(vp::Block *__this, vp::ClockEvent *)
+{
+    auto *_this = static_cast<GroupBarrier *>(__this);
+    static const char *path = getenv("TERANOC_GBAR_STATS_LIVE");
+    static int64_t last_trunc = -1;
+    const int64_t now = _this->clock.get_cycles();
+    const char *p = path ? path : "gbar_stats_live.log";
+    FILE *f = fopen(p, (now != last_trunc) ? "w" : "a");
+    if (f)
+    {
+        if (now != last_trunc)
+        {
+            last_trunc = now;
+            fprintf(f, "=== live group-barrier snapshot at cycle %ld ===\n", (long)now);
+        }
+        _this->dump_stats(f);
+        fclose(f);
+    }
+    _this->stats_event.enqueue(_this->stats_period);
 }
 
 GroupBarrier::GroupBarrier(vp::ComponentConf &config) : vp::Component(config)
@@ -199,6 +234,10 @@ GroupBarrier::GroupBarrier(vp::ComponentConf &config) : vp::Component(config)
     this->base_word = cfg->get_int("base_word");
     this->word_shift = cfg->get_int("word_shift");
     this->mshr_present = cfg->get_int("mshr_present") != 0;
+    // Live stats snapshot: same knob as the MSHR's, so one env var drives both.
+    const char *spp = getenv("TERANOC_MSHR_STATS_PERIOD");
+    if (spp) { int v = atoi(spp); if (v > 0) this->stats_period = v; }
+    if (this->stats_period > 0) this->stats_event.enqueue(this->stats_period);
 
     this->target.assign(this->num_barriers, 0);
     this->mask.assign(this->num_barriers, 0);

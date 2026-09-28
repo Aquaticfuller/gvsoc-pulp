@@ -120,6 +120,7 @@ private:
         uint64_t base_addr = 0;   // burst base byte address
         int burst_len = 0;        // words (1 or max_burst_words)
         int tgt_group = 0;
+        int slice = 0;          // row 0..3 or column 4..7 in split mode
         bool issued = false;      // fetch sent downstream
         bool fetch_blocked = false;
         int64_t release_cycle = -1;  // hold-window / serve-timeout deadline
@@ -134,6 +135,7 @@ private:
         uint32_t resp_words[16] = {0};
         uint16_t arrived_mask = 0;
         uint16_t arrive_pending = 0;  // captured, not yet visible (resp_in spill)
+        int64_t resp_ready_cycle[16] = {0}; // split slice lane register
         int64_t issue_cycle = 0;      // earliest fetch issue (req_out spill)
         int64_t birth_cycle = 0;      // lifetime instrumentation
         int64_t issued_cycle = -1;    // fetch actually issued
@@ -173,6 +175,7 @@ private:
     // FPU, so the rate profile shows ramp/plateau/tail.
     static void win_handler(vp::Block *__this, vp::ClockEvent *event);
     uint64_t win_prev_merged = 0, win_prev_alloc = 0, win_prev_drained = 0;
+    uint64_t probe_prev_reqs = 0;
     uint64_t win_prev_timeout = 0, win_prev_bypass = 0;
     uint64_t win_prev_deny_stall = 0, win_prev_deny_meta = 0, win_prev_deny_slot = 0;
     uint64_t win_prev_lt_hold = 0, win_prev_lt_flight = 0, win_prev_lt_drain = 0;
@@ -218,7 +221,8 @@ private:
     vp::IoReqStatus admit_request(L1NocFlit *flit, int lane);
     void arbitrate_requests();
     vp::IoReqStatus passthrough(L1NocFlit *flit, int lane);
-    int mshr_bank_of(uint64_t addr, bool is_single) const;
+    int mshr_bank_of(uint64_t addr, bool is_single, int slice=0) const;
+    int mshr_slice_of(int tile, bool is_single) const;
     Entry *find_hit(int bank, uint64_t base_addr, int burst_len, int tgt_group);
     Entry *alloc_entry(int bank);
     // Serves a CACHED line must reach before it self-invalidates.
@@ -245,6 +249,8 @@ private:
     int nb_lanes;
     int nb_tiles_per_group;
     int nb_ports_per_tile;
+    bool split;
+    bool steer_single_row = false;
     int num_entries;
     int ways_per_bank;
     int merge_reqs;
@@ -346,8 +352,12 @@ private:
     std::vector<int> overflow_ways;
     int overflow_entries = 0;
     int overflow_rr = 0;
-    int64_t overflow_alloc_cycle = -1;   // <=1 pool allocation per cycle (its own port)
+    int64_t overflow_alloc_cycle = -1;   // legacy pool arbitration
+    std::vector<int64_t> slice_overflow_alloc_cycle;
     uint64_t stat_overflow_alloc = 0, stat_overflow_merge = 0;
+    // Times a bank-full request found the pool busy too -- the case the pool exists
+    // to prevent, and the one that reinstates bank-full backpressure.
+    uint64_t stat_overflow_miss = 0;
     // Per-bank allocation and bank-full histogram. The hash matches the RTL,
     // but a shift that CONCENTRATES entries into few banks pushes traffic onto
     // the bypass path, whose timing differs sharply -- the candidate mechanism
@@ -443,6 +453,7 @@ private:
     uint64_t stat_bypass_single = 0, stat_bypass_burst = 0;
     uint64_t stat_deny_stall = 0, stat_deny_meta = 0, stat_deny_slot = 0;
     uint64_t stat_deny_bankfull = 0;
+    bool first_bankfull_logged = false;
     uint64_t slot_block_self = 0, slot_block_other = 0;
     // --- Subscriber arrival structure -------------------------------------
     // The quantity to compare against the RTL tracer, and deliberately TWO
@@ -735,7 +746,12 @@ void GroupMshr::dump_stats(FILE *f)
             uint64_t tot=0, mx=0; int used=0;
             for (uint64_t v : this->bank_alloc) { tot+=v; if (v>mx) mx=v; if (v) used++; }
             uint64_t ftot=0; for (uint64_t v : this->bank_full_miss) ftot+=v;
-            fprintf(f, "  %s bank_spread: banks=%d used=%d alloc=%lu max_bank=%lu "
+            fprintf(f, "  %s overflow: entries=%d alloc=%lu merge=%lu full=%lu\n",
+            this->get_path().c_str(), this->overflow_entries,
+            (unsigned long)this->stat_overflow_alloc,
+            (unsigned long)this->stat_overflow_merge,
+            (unsigned long)this->stat_overflow_miss);
+        fprintf(f, "  %s bank_spread: banks=%d used=%d alloc=%lu max_bank=%lu "
                 "concentration=%.2f bank_full=%lu (%.1f%% of allocs)\n",
                 this->get_path().c_str(), this->nb_banks, used, (unsigned long)tot,
                 (unsigned long)mx, tot ? (double)mx / ((double)tot/this->nb_banks) : 0.0,
@@ -963,6 +979,7 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->nb_lanes = cfg->get_int("nb_lanes");
     this->nb_tiles_per_group = cfg->get_int("nb_tiles_per_group");
     this->nb_ports_per_tile = cfg->get_int("nb_inter_group_ports_per_tile");
+    this->split = cfg->get_int("split") != 0;
     this->num_entries = cfg->get_int("num_entries");
     this->ways_per_bank = cfg->get_int("ways_per_bank");
     this->overflow_entries = cfg->get_int("overflow_entries");
@@ -992,6 +1009,11 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->num_banks_per_tile = cfg->get_int("num_banks_per_tile");
     if (this->num_banks_per_tile <= 0) this->trace.fatal("Missing tile bank geometry\n");
     this->nb_banks = this->num_entries / this->ways_per_bank;
+    if (this->split && (this->nb_tiles_per_group != 16 || this->num_entries != 64 ||
+                        this->overflow_entries != 8 || this->nb_banks != 16 ||
+                        this->merge_reqs != 4))
+        this->trace.fatal("split MSHR requires 16 tiles, 64+8 aggregate entries, 16 banks and 4 subscribers\n");
+    this->slice_overflow_alloc_cycle.resize(this->split ? 8 : 0, -1);
     {
         const char *wpp = getenv("TERANOC_MSHR_WIN_PERIOD");
         if (wpp) { int v = atoi(wpp); if (v > 0) this->win_period = v; }
@@ -1150,6 +1172,7 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
 #define MSHR_CSR_CACHE_REUSE_TARGET 9
 #define MSHR_CSR_CACHE_TIMEOUT      10
 #define MSHR_CSR_BANKFULL_BP        11
+#define MSHR_CSR_STEER_SINGLE_ROW   12
 #define MSHR_CSR_STATUS             15
 
 #define MSHR_STATUS_BANK_BUSY    (1u << 0)
@@ -1321,6 +1344,11 @@ void GroupMshr::cfg_apply(int idx, bool is_write, uint32_t data, uint32_t *rdata
     case MSHR_CSR_BANKFULL_BP:
         this->bankfull_bp = (data & 1) != 0;
         break;
+    case MSHR_CSR_STEER_SINGLE_ROW:
+        if (!this->split || data > 1) this->cfg_status |= MSHR_STATUS_RANGE;
+        else if (this->mshr_busy()) this->cfg_status |= MSHR_STATUS_BANK_BUSY;
+        else this->steer_single_row = data != 0;
+        break;
     case MSHR_CSR_STATUS:
         this->cfg_status = 0;
         break;
@@ -1382,9 +1410,24 @@ void GroupMshr::cfg_resp_handler(vp::Block *__this, vp::ClockEvent *)
 //   word = addr >> 2 = [row | group | tile | bank]
 //   single: bank = word[bank_shift_single +: 4]
 //   burst : { word[bank_shift_burst +: 4-bank_burst_bits], word[4 +: bank_burst_bits] }
-int GroupMshr::mshr_bank_of(uint64_t addr, bool is_single) const
+int GroupMshr::mshr_slice_of(int tile, bool is_single) const
+{
+    if (!this->split) return 0;
+    bool row = is_single ? this->steer_single_row : !this->steer_single_row;
+    return row ? tile / 4 : 4 + tile % 4;
+}
+
+int GroupMshr::mshr_bank_of(uint64_t addr, bool is_single, int slice) const
 {
     uint32_t word = (uint32_t)(addr >> 2);
+    if (this->split)
+    {
+        // Each RTL slice owns two banks. A one-bit burst bank hash folds to
+        // word bit 4 when bank_burst_bits=1 (SliceBank1 in the RTL).
+        int shift = is_single ? this->bank_shift_single :
+            (this->bank_burst_bits ? 4 : this->bank_shift_burst);
+        return slice * 2 + ((word >> shift) & 1);
+    }
     if (is_single)
     {
         return (int)((word >> this->bank_shift_single) & (uint32_t)(this->nb_banks - 1));
@@ -1500,20 +1543,20 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
     int tile = lane / this->nb_ports_per_tile;
     int port = lane % this->nb_ports_per_tile;
 
-    // Stores/AMOs never take an entry: pass through with mshr_tag = 0, but a
-    // single-word store write-updates a matching CACHED entry, and any AMO
-    // globally invalidates the response cache.
+    // Stores/AMOs bypass with mshr_tag = 0. RTL CacheStoreUpdate and
+    // CacheAmoInval are both disabled in the current configuration. Retain
+    // explicit opt-ins for experiments using the older model conveniences.
     if (opc != vp::READ)
     {
         std::vector<int> amo_cached_matches;
         if (opc == vp::WRITE && burst_len == 1 &&
-            (!getenv("TERANOC_MSHR_CACHE_STORE_UPDATE") || atoi(getenv("TERANOC_MSHR_CACHE_STORE_UPDATE"))))
+            (getenv("TERANOC_MSHR_CACHE_STORE_UPDATE") && atoi(getenv("TERANOC_MSHR_CACHE_STORE_UPDATE"))))
         {
             this->store_update(addr, flit->burst ? flit->burst->get_data() : nullptr, size);
         }
         if (opc >= vp::SWAP)
         {
-            bool invalidate = !getenv("TERANOC_MSHR_CACHE_AMO_INVAL") ||
+            bool invalidate = getenv("TERANOC_MSHR_CACHE_AMO_INVAL") &&
                 atoi(getenv("TERANOC_MSHR_CACHE_AMO_INVAL"));
             int cached=0;
             for (const Entry &e : this->entries) cached += e.valid && e.state==ST_CACHED;
@@ -1593,7 +1636,8 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
 
     int tgt_group = (int)((addr >> 10) & (uint32_t)(this->nb_groups - 1));
     bool clamped_single = !is_burst;   // type bit for the bank hash
-    int bank = this->mshr_bank_of(addr, clamped_single);
+    int slice = this->mshr_slice_of(tile, clamped_single);
+    int bank = this->mshr_bank_of(addr, clamped_single, slice);
     // MERGE KEY. The RTL keys on tcdm_addr_t, a WORD address, so it "merges only
     // exact 32-bit words" (mempool_group_mshr.sv:489) and the two halves of an
     // fp16 flh pair are ONE key. This model carries BYTE addresses, so the key
@@ -1610,6 +1654,40 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
     // Burst keys retain the exact word-aligned start, including the bank offset.
     // Registered and allocation-forwarding matches also compare length and group.
     uint64_t base_addr = addr & ~(uint64_t)3;
+    static FILE *watch = nullptr;
+    static bool watch_checked = false;
+    static uint64_t watch_addr = UINT64_MAX;
+    static const char *watch_group = nullptr;
+    if (!watch_checked)
+    {
+        watch_checked = true;
+        const char *path = getenv("TERANOC_MSHR_WATCH_PATH");
+        const char *value = getenv("TERANOC_MSHR_WATCH_ADDR");
+        watch_group = getenv("TERANOC_MSHR_WATCH_GROUP");
+        if (path && value)
+        {
+            watch = fopen(path, "w");
+            watch_addr = strtoull(value, nullptr, 0);
+        }
+    }
+    if (watch && base_addr == watch_addr &&
+        (!watch_group || this->get_path().find(watch_group) != std::string::npos))
+    {
+        fprintf(watch, "REQ cycle=%ld group=%s tile=%d port=%d lane=%d addr=0x%lx slice=%d bank=%d cfg=%d mergeable=%d hit=",
+            (long)this->clock.get_cycles(), this->get_path().c_str(), tile, port, lane,
+            (unsigned long)addr, slice, bank, (int)this->cfg_enable, (int)mergeable);
+        bool any = false;
+        for (const Entry &e : this->entries)
+            if (e.valid && e.base_addr == base_addr && e.slice == slice)
+            {
+                any = true;
+                fprintf(watch, "%ld:%d:%zu:%d,", (long)(&e - this->entries.data()),
+                    e.state, e.subs.size(), e.served_cnt);
+            }
+        if (!any) fputc('-', watch);
+        fputc('\n', watch);
+        fflush(watch);
+    }
 
     this->stat_reqs++;
     if (is_burst) this->stat_reqs_burst++; else if (is_load) this->stat_reqs_single++;
@@ -1748,11 +1826,11 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
         // cycle rather than allocate:
         // 1. StallOnResp: a same-address entry is draining/receiving. Next
         //    cycle it is CACHED (singles then merge — no duplicate fetch) or
-        //    retired (fresh alloc). Skipped when the entry's sub list is full
-        //    (then a second entry is legitimate, per the RTL assert note).
+        //    retired (fresh alloc). Include the slice overflow entry because
+        //    RTL req_addr_hit_drain combines bank and pool draining hits.
         if (this->stall_on_resp)
         {
-            for (int idx : this->bank_ways[bank])
+            auto draining_same_word = [&](int idx) -> bool
             {
                 Entry &o = this->entries[idx];
                 // NO sub-count guard. mempool_group_mshr.sv:1049-1056 states it
@@ -1779,9 +1857,18 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
                     if (lane < 64) o.stall_lane_mask |= (1ULL << lane);
                     this->lane_retry_owed[lane] = true;
                     this->fsm_event.enqueue(1);
-                    return vp::IO_REQ_DENIED;
+                    return true;
                 }
-            }
+                return false;
+            };
+            for (int idx : this->bank_ways[bank])
+                if (draining_same_word(idx)) return vp::IO_REQ_DENIED;
+            // The RTL's pool_addr_hit_drain applies the same veto to the
+            // slice overflow entry. Without it a banked duplicate can form
+            // while a pool line drains and strand a partial subscriber cohort.
+            for (int idx : this->overflow_ways)
+                if ((!this->split || idx == this->num_entries + slice) &&
+                    draining_same_word(idx)) return vp::IO_REQ_DENIED;
         }
         // 2. Meta-overlap conflict (full-table): the VLSU meta_id space
         //    (2^3=8) is smaller than a 16-word burst, so a burst's meta range
@@ -1864,6 +1951,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             e->base_addr = base_addr;
             e->burst_len = burst_len;
             e->tgt_group = tgt_group;
+            e->slice = slice;
             e->issued = false;
             e->fetch_blocked = false;
             e->subs.clear();
@@ -1872,6 +1960,7 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
             e->resp_rd = 0;
             e->arrived_mask = 0;
             e->arrive_pending = 0;
+            for (auto &ready : e->resp_ready_cycle) ready = 0;
             e->issue_cycle = this->clock.get_cycles() + this->spill;  // req_out spill
             e->drain_not_before = 0;
             e->beats_arrived = 0;
@@ -1989,7 +2078,19 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
         // hashed bank in bank_alloc[] and to stat_overflow_alloc. A pool-enabled run therefore
         // shows fewer denies than the same run with the pool off, and that difference is
         // explained by the overflow counter, not by a change in the deny policy.
-        if (bank_full && this->overflow_entries > 0 && this->overflow_alloc_cycle != this->clock.get_cycles())
+        if (bank_full && this->split &&
+            this->slice_overflow_alloc_cycle[slice] != this->clock.get_cycles())
+        {
+            int idx = this->num_entries + slice;
+            if (!this->entries[idx].valid)
+            {
+                this->slice_overflow_alloc_cycle[slice] = this->clock.get_cycles();
+                this->stat_overflow_alloc++;
+                return start_entry(&this->entries[idx]);
+            }
+        }
+        if (bank_full && !this->split && this->overflow_entries > 0 &&
+            this->overflow_alloc_cycle != this->clock.get_cycles())
         {
             for (int i = 0; i < this->overflow_entries; i++)
             {
@@ -2004,8 +2105,49 @@ vp::IoReqStatus GroupMshr::handle_request(L1NocFlit *flit, int lane)
                 return start_entry(&this->entries[idx]);
             }
         }
+        // The pool could not absorb this bank-full request: every pool entry was
+        // still valid, or its single allocation port was already used this cycle.
+        // This is the case the pool exists to prevent, so count it separately from
+        // the bank-full denies it falls through to.
+        if (bank_full && this->overflow_entries > 0) this->stat_overflow_miss++;
         if (bank_full && this->bankfull_bp)
         {
+            if (!this->first_bankfull_logged)
+            {
+                this->first_bankfull_logged = true;
+                static FILE *probe = nullptr;
+                const char *path = getenv("TERANOC_MSHR_FIRST_FULL_PATH");
+                if (path && !probe) probe = fopen(path, "a");
+                if (probe)
+                {
+                    fprintf(probe, "FIRST_FULL cycle=%ld group=%s lane=%d addr=0x%lx bank=%d slice=%d cfg=%d reqs=%lu alloc=%lu merged=%lu\n",
+                        (long)this->clock.get_cycles(), this->get_path().c_str(), lane,
+                        (unsigned long)addr, bank, slice, (int)this->cfg_enable,
+                        (unsigned long)this->stat_reqs, (unsigned long)this->stat_alloc,
+                        (unsigned long)this->stat_merged);
+                    for (size_t i = 0; i < this->entries.size(); i++)
+                    {
+                        const Entry &e = this->entries[i];
+                        if (e.valid && e.slice == slice)
+                        {
+                            fprintf(probe, "  entry=%zu state=%d addr=0x%lx bank=%d subs=%zu served=%d age=%ld release=%ld issued=%d blocked=%d tiles=",
+                                i, e.state, (unsigned long)e.base_addr, this->mshr_bank_of(e.base_addr, e.burst_len == 1, e.slice),
+                                e.subs.size(), e.served_cnt, (long)(this->clock.get_cycles() - e.birth_cycle),
+                                (long)e.release_cycle, (int)e.issued, (int)e.fetch_blocked);
+                            for (const Sub &sub : e.subs) fprintf(probe, "%d:%d,", sub.tile, sub.port);
+                            fputc('\n', probe);
+                        }
+                    }
+                    for (int pending_lane = 0; pending_lane < this->nb_lanes; pending_lane++)
+                        if (this->request_pending[pending_lane] &&
+                            this->mshr_slice_of(pending_lane / this->nb_ports_per_tile,
+                                this->request_pending[pending_lane]->get_size() <= 4) == slice)
+                            fprintf(probe, "  pending lane=%d addr=0x%lx blocked_out=%d\n", pending_lane,
+                                (unsigned long)this->request_pending[pending_lane]->get_addr(),
+                                (int)this->req_out_blocked[pending_lane]);
+                    fflush(probe);
+                }
+            }
             this->bank_full_miss[bank]++;
             teranoc_telemetry::emit(*this, this->clock.get_cycles(), 35, bank);
             this->stat_deny_bankfull++;
@@ -2112,6 +2254,7 @@ GroupMshr::Entry *GroupMshr::find_hit(int bank, uint64_t base_addr, int burst_le
     }
     for (int idx : this->overflow_ways)
     {
+        if (this->split && idx != this->num_entries + bank / 2) continue;
         if (Entry *hit = probe(idx)) return hit;
     }
     return nullptr;
@@ -2192,18 +2335,21 @@ void GroupMshr::forward_fetch(Entry *e)
 
 void GroupMshr::replay_holds()
 {
-    // Replay walker: issue held fetches once the hold window expired or the
-    // subscriber target was reached, round-robin over entries.
+    // Each split slice has its own replay walker, so up to eight held fetches
+    // may leave in a cycle. The legacy group has one walker.
     int n = (int)this->entries.size();   // pool entries hold and replay like any other
     int64_t now = this->clock.get_cycles();
+    bool issued_by_slice[8] = {false};
+    int base = this->replay_rr;
     for (int k = 0; k < n; k++)
     {
-        int i = (this->replay_rr + k) % n;
+        int i = (base + k) % n;
         Entry &e = this->entries[i];
         if (!e.valid || e.issued || e.fetch_blocked)
         {
             continue;
         }
+        if (issued_by_slice[e.slice]) continue;
         // Attempt when there is no window (singles issue immediately and land
         // here when their immediate issue found the lane busy) or the window
         // has expired. Un-issued entries always count as fsm work.
@@ -2229,8 +2375,9 @@ void GroupMshr::replay_holds()
             }
         }
         this->forward_fetch(&e);
+        issued_by_slice[e.slice] = true;
         this->replay_rr = (i + 1) % n;
-        break;   // one replay per cycle
+        if (!this->split) break;
     }
 }
 
@@ -2394,6 +2541,7 @@ vp::IoReqStatus GroupMshr::capture_response(L1NocFlit *flit, int lane)
     }
     this->stat_resp_beats_in++;
     e.resp_words[idx] = flit->beat_data;
+    if (this->split) e.resp_ready_cycle[idx] = this->clock.get_cycles() + 2;
     // resp_in spill: with spill on, the beat becomes drain-visible NEXT cycle
     // (arrive_pending moves into arrived_mask on the next clock edge).
     if (this->spill)
@@ -2470,6 +2618,61 @@ vp::IoReqStatus GroupMshr::capture_response(L1NocFlit *flit, int lane)
 void GroupMshr::win_handler(vp::Block *__this, vp::ClockEvent *)
 {
     auto *_this = static_cast<GroupMshr *>(__this);
+    static FILE *probe = nullptr;
+    static bool probe_checked = false;
+    if (!probe_checked)
+    {
+        probe_checked = true;
+        const char *path = getenv("TERANOC_MSHR_PROBE_PATH");
+        if (path) probe = fopen(path, "w");
+        if (probe) fprintf(probe, "cycle,group,cfg,reqs,alloc,merged,bankfull,overflow,timeout,hold_timeout,resp_mshr,resp_bypass,wait,hold,drain,cached,unissued,fetch_blocked\n");
+    }
+    if (probe)
+    {
+        int states[5] = {0};
+        int unissued = 0, fetch_blocked = 0;
+        for (const Entry &e : _this->entries)
+            if (e.valid) {
+                if (e.state >= ST_IDLE && e.state <= ST_CACHED) states[e.state]++;
+                unissued += !e.issued;
+                fetch_blocked += e.fetch_blocked;
+            }
+        fprintf(probe, "%ld,%s,%d,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%d,%d,%d,%d,%d,%d\n",
+            (long)_this->clock.get_cycles(), _this->get_path().c_str(), (int)_this->cfg_enable,
+            (unsigned long)_this->stat_reqs, (unsigned long)_this->stat_alloc,
+            (unsigned long)_this->stat_merged, (unsigned long)_this->stat_deny_bankfull,
+            (unsigned long)_this->stat_overflow_alloc, (unsigned long)_this->stat_mshr_timeout,
+            (unsigned long)_this->stat_resp_hold_timeout, (unsigned long)_this->stat_resp_mshr,
+            (unsigned long)_this->stat_resp_bypass, states[ST_WAIT_RESP], states[ST_RESP_HOLD],
+            states[ST_DRAIN_RESP], states[ST_CACHED], unissued, fetch_blocked);
+        fflush(probe);
+    }
+    static FILE *stuck_probe = nullptr;
+    static bool stuck_checked = false;
+    if (!stuck_checked)
+    {
+        stuck_checked = true;
+        const char *path = getenv("TERANOC_MSHR_STUCK_PATH");
+        if (path) stuck_probe = fopen(path, "w");
+    }
+    if (stuck_probe && _this->stat_reqs == _this->probe_prev_reqs)
+    {
+        for (size_t idx = 0; idx < _this->entries.size(); idx++)
+        {
+            const Entry &e = _this->entries[idx];
+            if (!e.valid || e.issued) continue;
+            fprintf(stuck_probe,
+                "STUCK cycle=%ld group=%s entry=%zu slice=%d state=%d addr=0x%lx subs=%zu age=%ld release=%ld blocked=%d tiles=",
+                (long)_this->clock.get_cycles(), _this->get_path().c_str(), idx,
+                e.slice, e.state, (unsigned long)e.base_addr, e.subs.size(),
+                (long)(_this->clock.get_cycles() - e.birth_cycle),
+                (long)e.release_cycle, (int)e.fetch_blocked);
+            for (const Sub &sub : e.subs) fprintf(stuck_probe, "%d:%d,", sub.tile, sub.port);
+            fputc('\n', stuck_probe);
+        }
+        fflush(stuck_probe);
+    }
+    _this->probe_prev_reqs = _this->stat_reqs;
     static FILE *win_f = nullptr;
     if (!win_f)
     {
@@ -2983,7 +3186,8 @@ void GroupMshr::drain_cycle()
         }
         int delivered = 0;
         while (delivered < this->drain_beats && e.served_mask != 0 &&
-               ((e.arrived_mask >> e.resp_rd) & 1))
+               ((e.arrived_mask >> e.resp_rd) & 1) &&
+               (!this->split || cycles >= e.resp_ready_cycle[e.resp_rd]))
         {
             int beat = e.resp_rd;
             uint32_t word = e.resp_words[beat];
@@ -3021,7 +3225,6 @@ void GroupMshr::drain_cycle()
             {
                 break;
             }
-
             L1NocFlit *flit = new L1NocFlit();
             flit->burst = sub.burst;
             flit->src_tile = sub.tile;
@@ -3252,11 +3455,10 @@ void GroupMshr::store_update(uint64_t addr, const uint8_t *data, uint64_t size)
     // Same word-aligned key as the request path: a half-word store must find the
     // cached word it aliases, or the cache serves stale data to a later load.
     uint64_t key = addr & ~(uint64_t)3;
-    int bank = this->mshr_bank_of(addr, true);
     int tgt_group = (int)((addr >> 10) & (uint32_t)(this->nb_groups - 1));
-    for (int idx : this->bank_ways[bank])
+    // A store can alias a cached single in any row/column slice.
+    for (Entry &e : this->entries)
     {
-        Entry &e = this->entries[idx];
         if (!e.valid || e.state != ST_CACHED || e.base_addr != key ||
             e.tgt_group != tgt_group)
         {
@@ -3304,7 +3506,7 @@ void GroupMshr::serve_timeouts(int64_t cycles)
                 {
                     int n = (int)e.subs.size();
                     this->tmo_subs_hist[n > 16 ? 16 : n]++;
-                    int bank = this->mshr_bank_of(e.base_addr, e.burst_len == 1);
+                    int bank = this->mshr_bank_of(e.base_addr, e.burst_len == 1, e.slice);
                     bool cached = false, other = false;
                     for (int idx : this->bank_ways[bank])
                     {
@@ -3340,7 +3542,7 @@ void GroupMshr::serve_timeouts(int64_t cycles)
             if (e.served_cnt < this->cache_target(e))
             {
                 this->stat_cache_aged++;
-                this->spent_note(this->mshr_bank_of(e.base_addr, e.burst_len == 1),
+                this->spent_note(this->mshr_bank_of(e.base_addr, e.burst_len == 1, e.slice),
                                  e.base_addr, e.tgt_group);
                 this->stat_cache_served_sum += (uint64_t)e.served_cnt;
                 e.valid = false;
@@ -3361,7 +3563,7 @@ void GroupMshr::serve_timeouts(int64_t cycles)
         if (e.valid && e.state == ST_CACHED && e.served_cnt >= this->cache_target(e))
         {
             this->stat_cache_selfinval++;
-            this->spent_note(this->mshr_bank_of(e.base_addr, e.burst_len == 1),
+            this->spent_note(this->mshr_bank_of(e.base_addr, e.burst_len == 1, e.slice),
                              e.base_addr, e.tgt_group);
             this->stat_cache_served_sum += (uint64_t)e.served_cnt;
             e.valid = false;
