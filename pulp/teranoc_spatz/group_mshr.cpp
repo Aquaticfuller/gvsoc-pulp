@@ -250,6 +250,7 @@ private:
     int nb_tiles_per_group;
     int nb_ports_per_tile;
     bool split;
+    bool resp_per_tile;  // RTL fa097164: local crossbar output t enters tile t's response face
     bool steer_single_row = false;
     int num_entries;
     int ways_per_bank;
@@ -381,6 +382,8 @@ private:
     uint64_t stat_cache_served_sum = 0;
     uint64_t stat_fetch_issued = 0;   // fetches accepted by the NoC
     uint64_t stat_resp_beats_in = 0;  // response beats captured for our entries
+    struct RespFaceCount { uint64_t bypass = 0, row = 0, column = 0; };
+    std::vector<RespFaceCount> resp_face_count; // one counter set per tile response port
     std::vector<L1NocFlit *> lane_pending;    // parked flit per lane (door input)
     std::vector<bool> lane_retry_owed;
     std::vector<bool> req_out_blocked;
@@ -944,6 +947,23 @@ GroupMshr::~GroupMshr()
     this->edh_flush();
     FILE *f = fopen("mshr_stats.log", "a");
     if (f) { this->dump_stats(f); fclose(f); }
+    const char *face_path = getenv("TERANOC_MSHR_RESP_FACE_PATH");
+    if (face_path && this->resp_per_tile)
+    {
+        FILE *face = fopen(face_path, "a");
+        if (face)
+        {
+            for (int lane = 0; lane < this->nb_lanes; lane++)
+            {
+                const auto &count = this->resp_face_count[lane];
+                fprintf(face, "%s tile=%d port=%d bypass=%lu row=%lu column=%lu\n",
+                    this->get_path().c_str(), lane / this->nb_ports_per_tile,
+                    lane % this->nb_ports_per_tile, (unsigned long)count.bypass,
+                    (unsigned long)count.row, (unsigned long)count.column);
+            }
+            fclose(face);
+        }
+    }
 }
 
 // Periodic live snapshot. Opt-in via TERANOC_MSHR_STATS_PERIOD=<cycles>; the file
@@ -980,6 +1000,7 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->nb_tiles_per_group = cfg->get_int("nb_tiles_per_group");
     this->nb_ports_per_tile = cfg->get_int("nb_inter_group_ports_per_tile");
     this->split = cfg->get_int("split") != 0;
+    this->resp_per_tile = cfg->get_int("resp_per_tile") != 0;
     this->num_entries = cfg->get_int("num_entries");
     this->ways_per_bank = cfg->get_int("ways_per_bank");
     this->overflow_entries = cfg->get_int("overflow_entries");
@@ -1116,6 +1137,7 @@ GroupMshr::GroupMshr(vp::ComponentConf &config) : vp::Component(config)
     this->bypass_q_lane.resize(this->nb_lanes);
     this->resp_out_blocked.resize(this->nb_lanes, false);
     this->resp_out_held.resize(this->nb_lanes, nullptr);
+    this->resp_face_count.resize(this->nb_lanes);
     this->ldh_lane_cnt.resize(this->nb_lanes, 0);
     this->ldh_lanes_hist.resize(this->nb_lanes + 1, 0);
     // Sized over the whole table, pool included: these are indexed by entry id.
@@ -2439,8 +2461,16 @@ vp::IoReqStatus GroupMshr::resp_in(vp::Block *__this, vp::IoReq *req, int lane)
 
 vp::IoReqStatus GroupMshr::capture_response(L1NocFlit *flit, int lane)
 {
+    // The current RTL crossbar routes by hdr.tile_id, then each tile lane
+    // selects its row or column slice from the tag. The model's entry table is
+    // monolithic, but it retains the same owner tile and slice for validation.
+    const int face_tile = lane / this->nb_ports_per_tile;
+    if (this->resp_per_tile && flit->src_tile != face_tile)
+        this->trace.fatal("group_mshr: response tile %d entered tile %d lane %d\n",
+            flit->src_tile, face_tile, lane);
     if (flit->mshr_tag == 0)
     {
+        if (this->resp_per_tile) this->resp_face_count[lane].bypass++;
         // Bypass response: strict priority forward (no buffering, no deny).
         this->stat_resp_bypass++;
         if (flit->get_is_write()) this->stat_bypass_wr++;
@@ -2522,6 +2552,16 @@ vp::IoReqStatus GroupMshr::capture_response(L1NocFlit *flit, int lane)
     }
 
     Entry &e = this->entries[flit->mshr_tag - 1];
+    if (this->resp_per_tile && this->split)
+    {
+        const int row = face_tile / 4;
+        const int column = 4 + face_tile % 4;
+        if (e.slice != row && e.slice != column)
+            this->trace.fatal("group_mshr: tile %d response tag %d names slice %d, expected %d or %d\n",
+                face_tile, flit->mshr_tag, e.slice, row, column);
+        if (e.slice == row) this->resp_face_count[lane].row++;
+        else this->resp_face_count[lane].column++;
+    }
     if (!e.valid || (e.state != ST_WAIT_RESP && e.state != ST_DRAIN_RESP))
     {
         this->trace.fatal("group_mshr: response for invalid entry (tag=%d)\n",

@@ -151,7 +151,8 @@ class TeranocGroup(st.Component):
                 auto_probe_window=int(os.environ.get('TERANOC_MSHR_AUTO_PROBE_WINDOW', 255)),
                 nb_groups=arch.nb_groups,
                 nb_x_groups=arch.nb_x_groups,
-                max_burst_words=arch.vlsu_burst.max_burst_words)
+                max_burst_words=arch.vlsu_burst.max_burst_words,
+                resp_per_tile=arch.group_mshr_resp_after_xbar)
 
         # Group fine-grained barrier (teranoc_spatz): a held-response slave on
         # the intra-group LIC, diverting barrier-window addresses (within-tile

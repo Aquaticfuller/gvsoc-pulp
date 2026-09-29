@@ -714,6 +714,10 @@ TERAPOOL_SPATZ4_FPU = TeranocConfig(
     l2_size                  = 0x20000000,
     nb_l2_banks              = 16,
     dma_posted_writes        = True,
+    # RTL fa097164 defaults the fall-through response-local FIFO to 2+6
+    # and routes the local response crossbar to tile lanes before the MSHR.
+    l1_noc_resp_local_extra_fifo_depth = 6,
+    group_mshr_resp_after_xbar = True,
     # September RTL remaps requests and responses (mode 3). The older
     # August profile remapped responses only; keep it explicitly selectable.
     l1_noc_remap_mode        = int(os.environ.get('TERANOC_L1_REMAP_MODE', 2 if _LEGACY_RTL_CONFIG else 3)),
@@ -798,10 +802,15 @@ CONFIGS = {
     'minpool_spatz4_fpu':   MINPOOL_SPATZ4_FPU,
     'mempool_spatz4_fpu':   MEMPOOL_SPATZ4_FPU,
     'terapool_spatz4_fpu':  TERAPOOL_SPATZ4_FPU,
+    # Reproduce the pre-fa097164 GVSoC calibration baseline.
+    'terapool_spatz4_fpu_legacy_resp': replace(TERAPOOL_SPATZ4_FPU,
+        l1_noc_resp_local_extra_fifo_depth=0,
+        group_mshr_resp_after_xbar=False),
+    # Same per-tile response face with the optional local FIFO disabled.
     'terapool_spatz4_fpu_resp_xbar': replace(TERAPOOL_SPATZ4_FPU,
+        l1_noc_resp_local_extra_fifo_depth=0,
         group_mshr_resp_after_xbar=True),
-    # Optional RTL 9ee08804 response-ejection experiment: response router
-    # output depth 2, plus a fall-through six-entry local output FIFO.
+    # Compatibility name for the former optional 2+6 profile, now the default.
     'terapool_spatz4_fpu_resp_fifo6': replace(TERAPOOL_SPATZ4_FPU,
         l1_noc_resp_router_output_fifo_depth=2,
         l1_noc_resp_local_extra_fifo_depth=6,
@@ -827,10 +836,17 @@ CONFIGS = {
         nb_x_groups=8, nb_y_groups=8,
         nb_l2_banks=32, l2_axi_interleave=None,
         axi_wide_routing='yx', l2_placement='linkload'),
+    'terapool_spatz4_fpu_8x8_legacy_resp': replace(TERAPOOL_SPATZ4_FPU,
+        nb_x_groups=8, nb_y_groups=8,
+        nb_l2_banks=32, l2_axi_interleave=None,
+        axi_wide_routing='yx', l2_placement='linkload',
+        l1_noc_resp_local_extra_fifo_depth=0,
+        group_mshr_resp_after_xbar=False),
     'terapool_spatz4_fpu_8x8_resp_xbar': replace(TERAPOOL_SPATZ4_FPU,
         nb_x_groups=8, nb_y_groups=8,
         nb_l2_banks=32, l2_axi_interleave=None,
         axi_wide_routing='yx', l2_placement='linkload',
+        l1_noc_resp_local_extra_fifo_depth=0,
         group_mshr_resp_after_xbar=True),
     'terapool_spatz4_fpu_8x8_resp_fifo6': replace(TERAPOOL_SPATZ4_FPU,
         nb_x_groups=8, nb_y_groups=8,
