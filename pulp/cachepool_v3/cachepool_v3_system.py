@@ -289,8 +289,10 @@ class CachepoolV3SoC(st.Component):
         dram_target = None          # set when DRAMSys is on; everything then maps here instead
         if _DRAMSYS:
             nb_dram = cluster.nb_channels or 1
+            # DRAMSys retains denied requests. Owned, asynchronous stripe
+            # requests avoid mutating/retrying a child still in its queue.
             dram_ico = interleaver.Interleaver(self, 'dram_ico', nb_slaves=nb_dram,
-                                               interleaving_bits=10)
+                                               interleaving_bits=10, asynchronous=True)
             for c in range(nb_dram):
                 dram = dramsys_model.Dramsys(self, f'dram_ch{c}')
                 dram.add_properties({'dram-type': _DRAM_TYPE})
