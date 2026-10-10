@@ -85,7 +85,7 @@ class L1_subsystem(gvsoc.systree.Component):
             nb_superbanks=nb_banks_per_tile // banks_per_superbank, narrow_width=bandwidth,
             wide_width=axi_data_width, total_banks=total_banks,
             start_bank_id=global_tile_id * nb_banks_per_tile,
-            posted_writes=dma_posted_writes)
+            posted_writes=dma_posted_writes, remote_input_start=nb_local_ports)
 
         # RTL i_remote_req_interco + i_remote_resp_interco. Lane choice per
         # requester is mempool_tile_remote_req_router.sv, so it lives in the
@@ -127,7 +127,9 @@ class L1_subsystem(gvsoc.systree.Component):
                 shim.o_SOC(gvsoc.systree.SlaveItf(self, f'soc_out_{i}', signature=IoV2SingleReq()))
 
         # An incoming boundary lane only ever addresses this tile's own banks,
-        # so it needs no address demux -- it is a narrow xbar input directly.
+        # so it needs no address demux. The bank interconnect models the
+        # two-entry request spill after each expanded remote lane (RTL
+        # 513a52dd); local ports and wide DMA bypass those registers.
         # The bank interconnect rejects an out-of-tile address.
         for kind, base, count in (('intra_group', 0, nb_intra_group_ports),
                 ('inter_group', nb_intra_group_ports, nb_inter_group_ports)):

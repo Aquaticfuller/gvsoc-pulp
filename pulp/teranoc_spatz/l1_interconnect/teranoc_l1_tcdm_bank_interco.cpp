@@ -26,13 +26,26 @@ class TeranocL1TcdmBankInterco : public vp::Component {
   private:
     struct WideTransaction;
 
+    struct RemoteRequest {
+        vp::IoReq *req;
+        int bank;
+        int64_t ready_cycle;
+    };
+
     // One narrow requester: a tile-local port or a remote slave port. In RTL each
-    // is a single valid/ready stream into i_narrow_req_xbar, so it can hold at
-    // most one un-accepted request -- hence one slave port, not one per bank.
+    // is a single valid/ready stream into i_narrow_req_xbar. Local inputs keep
+    // one unaccepted request; remote inputs own the preceding two-slot spill.
+    // Both have one slave port, not one per bank.
     // The target bank is decoded here from the address, as the RTL xbar's sel is.
     struct NarrowInput {
         bool pending = false;
         int target_bank = -1;
+        // RTL gen_tcdm_registers_req_slv, after the burst expander.
+        // These slots hold requests only, not requests awaiting responses.
+        std::deque<RemoteRequest> spill;
+        int64_t capture_cycle = -1;
+        int64_t credit_cycle = 0;
+        bool retry_owed = false;
     };
 
     struct BankResponse {
@@ -93,11 +106,13 @@ class TeranocL1TcdmBankInterco : public vp::Component {
     bool wide_fifo_can_capture(int superbank, int64_t cycle) const;
     bool wide_response_ready(int superbank, int64_t cycle) const;
     bool has_work_requiring_tick(int64_t cycle) const;
+    bool remote_can_capture(int input, int64_t cycle) const;
 
     void schedule_now();
     void schedule_next();
     void prepare_async_response(vp::IoReq *req);
     void retry_narrow_input(int bank, int input);
+    void retry_remote_inputs(int64_t cycle);
     void try_capture_wide(int64_t cycle);
     void capture_wide(vp::IoReq *req, int superbank, bool partial);
     void accept_narrow(int bank, int input, vp::IoReq *req);
@@ -143,6 +158,7 @@ class TeranocL1TcdmBankInterco : public vp::Component {
     bool accepting_wide_consumed = false;
 
     int nb_narrow_inputs;
+    int remote_input_start;
     int nb_banks;
     int nb_superbanks;
     int banks_per_superbank;
@@ -173,6 +189,7 @@ TeranocL1TcdmBankInterco::TeranocL1TcdmBankInterco(vp::ComponentConf &config)
     this->traces.new_trace("trace", &this->trace, vp::DEBUG);
 
     this->nb_narrow_inputs = this->get_js_config()->get_int("nb_narrow_inputs");
+    this->remote_input_start = this->get_js_config()->get_int("remote_input_start");
     this->nb_banks = this->get_js_config()->get_int("nb_banks");
     this->nb_superbanks = this->get_js_config()->get_int("nb_superbanks");
     this->narrow_width = this->get_js_config()->get_int("narrow_width");
@@ -184,6 +201,9 @@ TeranocL1TcdmBankInterco::TeranocL1TcdmBankInterco(vp::ComponentConf &config)
 
     vp_assert_always(this->nb_narrow_inputs > 0 && this->nb_banks > 0 && this->nb_superbanks > 0,
         &this->trace, "invalid L1 TCDM interconnect dimensions\n");
+    vp_assert_always(this->remote_input_start >= 0 &&
+        this->remote_input_start <= this->nb_narrow_inputs, &this->trace,
+        "invalid remote input range\n");
     vp_assert_always(is_power_of_two(this->narrow_width) && is_power_of_two(this->wide_width) &&
         is_power_of_two(this->nb_banks) && is_power_of_two(this->total_banks),
         &this->trace, "widths and bank counts must be powers of two\n");
@@ -242,8 +262,8 @@ void TeranocL1TcdmBankInterco::reset(bool active) {
 
     this->fsm_event.cancel();
     for (NarrowInput &input : this->narrow_inputs) {
-        input.pending = false;
-        input.target_bank = -1;
+        // Request objects remain owned by their upstream initiators.
+        input = NarrowInput();
     }
     for (BankState &bank : this->banks) {
         bank.responses.clear();
@@ -325,7 +345,10 @@ int TeranocL1TcdmBankInterco::wide_rotation(uint64_t address, bool partial) {
 int TeranocL1TcdmBankInterco::pick_request_winner(int bank) {
     uint64_t requests = 0;
     for (int input = 0; input < this->nb_narrow_inputs; input++) {
-        if (this->narrow_inputs[input].pending && this->narrow_inputs[input].target_bank == bank) {
+        const NarrowInput &port = this->narrow_inputs[input];
+        bool registered_ready = input < this->remote_input_start ||
+            (!port.spill.empty() && port.spill.front().ready_cycle <= this->clock.get_cycles());
+        if (port.pending && port.target_bank == bank && registered_ready) {
             requests |= 1ULL << input;
         }
     }
@@ -420,6 +443,24 @@ vp::IoReqStatus TeranocL1TcdmBankInterco::narrow_req(vp::Block *__this, vp::IoRe
         (uint64_t)_this->narrow_width, &_this->trace,
         "narrow access crosses a bank word (input=%d addr=0x%lx size=%lu)\n",
         input_id, req->get_addr(), req->get_size());
+
+    if (input_id >= _this->remote_input_start) {
+        const auto cycle = _this->clock.get_cycles();
+        if (!_this->remote_can_capture(input_id, cycle)) {
+            input.retry_owed = true;
+            _this->schedule_next();
+            return vp::IO_REQ_DENIED;
+        }
+        input.spill.push_back({req, target_bank, cycle + 1});
+        input.capture_cycle = cycle;
+        input.pending = true;
+        input.target_bank = input.spill.front().bank;
+        _this->trace.msg(vp::Trace::LEVEL_TRACE,
+            "REMOTE_CAPTURE input=%d bank=%d addr=0x%lx fill=%zu\n",
+            input_id, target_bank, req->get_addr(), input.spill.size());
+        _this->schedule_next();
+        return vp::IO_REQ_GRANTED;
+    }
 
     if (!_this->accepting_consumed && _this->accepting_input == input_id &&
         _this->accepting_bank == target_bank) {
@@ -663,6 +704,27 @@ void TeranocL1TcdmBankInterco::try_capture_wide(int64_t cycle) {
 }
 
 void TeranocL1TcdmBankInterco::retry_narrow_input(int bank, int input_id) {
+    if (input_id >= this->remote_input_start) {
+        NarrowInput &input = this->narrow_inputs[input_id];
+        vp_assert_always(!input.spill.empty() && input.spill.front().bank == bank,
+            &this->trace, "remote spill lost its bank arbitration winner\n");
+        bool was_full = input.spill.size() == 2;
+        vp::IoReq *req = input.spill.front().req;
+        input.spill.pop_front();
+        // ready_o is independent of ready_i in spill_register: a full
+        // register cannot reuse the popped slot until the following edge.
+        if (was_full) input.credit_cycle = this->clock.get_cycles() + 1;
+        input.pending = !input.spill.empty();
+        if (input.pending) {
+            input.target_bank = input.spill.front().bank;
+            input.spill.front().ready_cycle = std::max(input.spill.front().ready_cycle,
+                this->clock.get_cycles() + 1);
+        } else {
+            input.target_bank = -1;
+        }
+        this->accept_narrow(bank, input_id, req);
+        return;
+    }
     this->narrow_inputs[input_id].pending = false;
     this->accepting_input = input_id;
     this->accepting_bank = bank;
@@ -672,6 +734,22 @@ void TeranocL1TcdmBankInterco::retry_narrow_input(int bank, int input_id) {
     this->accepting_bank = -1;
     vp_assert_always(this->accepting_consumed, &this->trace,
         "narrow input %d did not synchronously resend after retry\n", input_id);
+}
+
+bool TeranocL1TcdmBankInterco::remote_can_capture(int input_id, int64_t cycle) const {
+    const NarrowInput &input = this->narrow_inputs[input_id];
+    return input.spill.size() < 2 && input.capture_cycle != cycle && cycle >= input.credit_cycle;
+}
+
+void TeranocL1TcdmBankInterco::retry_remote_inputs(int64_t cycle) {
+    for (int input_id = this->remote_input_start; input_id < this->nb_narrow_inputs; input_id++) {
+        NarrowInput &input = this->narrow_inputs[input_id];
+        if (input.retry_owed && this->remote_can_capture(input_id, cycle)) {
+            // retry() synchronously resubmits the held word. Clear first.
+            input.retry_owed = false;
+            this->narrow_itfs[input_id]->retry();
+        }
+    }
 }
 
 void TeranocL1TcdmBankInterco::update_bank_after_pop(int bank, const BankResponse &response,
@@ -803,7 +881,7 @@ bool TeranocL1TcdmBankInterco::has_work_requiring_tick(int64_t cycle) const {
         return true;
     }
     for (const NarrowInput &input : this->narrow_inputs) {
-        if (input.pending) {
+        if (input.pending || input.retry_owed) {
             return true;
         }
     }
@@ -843,7 +921,8 @@ void TeranocL1TcdmBankInterco::fsm_handler(vp::Block *__this, vp::ClockEvent *) 
     for (int bank=0; bank<_this->nb_banks; ++bank) {
         bool demand=false;
         for (const auto &input : _this->narrow_inputs)
-            demand |= input.pending && input.target_bank==bank;
+            demand |= input.pending && input.target_bank==bank &&
+                (input.spill.empty() || input.spill.front().ready_cycle <= cycle);
         if (_this->active_wide) {
             int offset=bank-_this->active_wide->superbank*_this->banks_per_superbank;
             if (offset>=0 && offset<_this->banks_per_superbank)
@@ -900,6 +979,8 @@ void TeranocL1TcdmBankInterco::fsm_handler(vp::Block *__this, vp::ClockEvent *) 
         state.request_arb.grant(input);
         _this->input_accept_cycle[input] = cycle;
     }
+
+    _this->retry_remote_inputs(cycle);
 
     if (_this->has_work_requiring_tick(cycle)) {
         _this->schedule_next();

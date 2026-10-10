@@ -89,6 +89,7 @@ private:
     Ctx ctxs[2];
     int rr_ctx = 0;                   // round-robin issue cursor
     std::vector<bool> lane_blocked;
+    std::vector<int64_t> lane_issue_cycle;
     std::vector<vp::IoReq *> lane_parked;  // denied sub-read parked per lane
     std::unordered_map<vp::IoReq *, SubTrack> sub_map;
     bool input_retry_owed = false;
@@ -131,6 +132,7 @@ TeranocL1BurstExpander::TeranocL1BurstExpander(vp::ComponentConf &config)
 
     this->out.reserve(this->issue_width);
     this->lane_blocked.resize(this->issue_width, false);
+    this->lane_issue_cycle.assign(this->issue_width, -1);
     this->lane_parked.resize(this->issue_width, nullptr);
     for (int i = 0; i < this->issue_width; i++)
     {
@@ -227,7 +229,8 @@ void TeranocL1BurstExpander::pump()
     // attempt; the lane reopened).
     for (int lane = 0; lane < this->issue_width; lane++)
     {
-        if (this->lane_parked[lane] == nullptr || this->lane_blocked[lane])
+        if (this->lane_parked[lane] == nullptr || this->lane_blocked[lane] ||
+            this->lane_issue_cycle[lane] == this->clock.get_cycles())
         {
             continue;
         }
@@ -238,6 +241,7 @@ void TeranocL1BurstExpander::pump()
             this->lane_blocked[lane] = true;
             continue;
         }
+        this->lane_issue_cycle[lane] = this->clock.get_cycles();
         this->lane_parked[lane] = nullptr;
         // words_issued was already advanced when the sub-request was created.
         if (st == vp::IO_REQ_DONE)
@@ -270,7 +274,8 @@ void TeranocL1BurstExpander::pump()
         int lane = -1;
         for (int l = 0; l < this->issue_width; l++)
         {
-            if (!this->lane_blocked[l] && this->lane_parked[l] == nullptr)
+            if (!this->lane_blocked[l] && this->lane_parked[l] == nullptr &&
+                this->lane_issue_cycle[l] != this->clock.get_cycles())
             {
                 lane = l;
                 break;
@@ -339,6 +344,10 @@ void TeranocL1BurstExpander::pump()
             }
             continue;
         }
+        // Each RTL expanded output is one valid/ready stream. A registered
+        // consumer can grant immediately, but that does not permit a second
+        // word on the same lane in this cycle, including synchronous retries.
+        this->lane_issue_cycle[lane] = this->clock.get_cycles();
         if (st == vp::IO_REQ_DONE)
         {
             this->emit_beat(sub);
